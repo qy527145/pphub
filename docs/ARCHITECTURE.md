@@ -369,6 +369,14 @@ control 通道传 `{t:"chat", from, ts, text|html|imgBlobRef}`；图片/文件�
 - **私有白板**：board id 约定新增 `wb:<a>~<b>`（两端 peerId 字典序拼接）；绘制/指针消息按 board 路由——私板单播给对方，公板广播；新对端通道就绪时补发公板与对应私板的 `draw-state` 全量。屏幕共享新增 scope（`screen-start` 带 scope 字段，direct 只挂媒体轨到指定对端、迟到者不补挂）。
 - **验证**：`vue-tsc` + `vite build` + `cargo build` 通过；原 e2e-media.mjs 8 项全过（无回归）；新增 `web/scripts/e2e-network.mjs` 三端 E2E 13 项全过：组网 → 网络视图节点/连边/gossip 边 → 名片同步 → 私聊隔离 → 群聊广播 → 强制单播（C 无泄漏）→ 懒发送登记（零推送）→ B 按需下载（A 供块计数）→ **C 多源下载（2 源）** → 私有白板同步与隔离。后端信令继续**零改动**。
 
+### 中继路径的屏幕共享（WebCodecs）落地记录（2026-07-28）
+
+- **问题**：默认单端口部署下打不通的对端会降级到 WS 应用层中继，此时屏幕共享彻底不可用——WebRTC 媒体轨由浏览器内部 SRTP 栈收发，JS 拿不到编码帧，无法经应用层转发。原实现还会给这类对端照发 `screen-start`，对方于是挂出一个**永远黑屏**的画面条目；发起端即使一个对端都送不到也照样进入「共享中」。
+- **绕开媒体轨**：新增 `core/screencodec.ts`，中继路径改用 **WebCodecs 自编码**——`MediaStreamTrackProcessor` 取原始 `VideoFrame` → `VideoEncoder`（候选 `avc1.42E01F` / `vp8` / `vp09`，`latencyMode:'realtime'`，H.264 用 annexb 让每个关键帧自带 SPS/PPS）→ 编码字节走中继 → 对端 `VideoDecoder` → 画布 `captureStream()` 变回 `MediaStream`。**关键收益**：出口仍是 `MediaStream`，接收端的渲染、Tab 切换、批注/远程指针链路一行不用改。参数：≤1600 宽、15fps、1.8Mbps、4s 关键帧，128KiB 分片，编码队列 >2 帧或中继积压 >2MiB 时丢帧。
+- **通道与分流**：`relay-transport.ts` 增 `KIND_SCREEN=4`（与 control/file/swarm 并列，同一把 AES-GCM 密钥）；密钥未就绪时屏幕包**直接丢弃而非排队**——实时画面积压只会变成一堆过期帧，等就绪后补一个关键帧即可恢复。`mesh.ts` 按 `peer.transport` 分流：webrtc 走 `addTrack` + `screen-start{via:'track'}`；relay 走编码器 + `screen-start{via:'codec'}`。编码器全局唯一，按 `codecViewers` 扇出同一个 ArrayBuffer（`encryptAndSend` 在首个 await 前同步复制，可安全共享）。中途降级的对端由 `transport` 事件触发重新挂载，新观众到达时补一个关键帧。
+- **诚实降级**：`screenTargets()` 在开采集器**之前**预检每个对端可达性，一个都没有就不进入共享状态并给出原因；部分可达则照常共享但说明少了谁。对端解不了码时给明确提示而非黑屏条目，`ScreenView` 的共享按钮在不可用时禁用并用 `title` 说明原因。代价说清楚：**无音频**（系统音频轨没有对应的 AudioEncoder 路径）、无拥塞控制、需要安全上下文。
+- **验证**：`vue-tsc` + `vite build` + `cargo clippy` 通过；`e2e-relay.mjs` 扩到 13 项全过，新增 4 项覆盖本次改动：预检判定 → B 端解出 640×360 画面 → 画面**持续更新**（比对像素，证明不是只解出首帧）→ 无解码能力的节点只收到提示、不生成黑屏条目 → 停止共享后编解码器一并释放。`e2e-media` / `e2e-network` / 两个 smoke 无回归。修复一处漏判：拒绝黑屏条目的分支把「只提示一次」的去重条件写进了同一个 `if`，导致第二条 `screen-start` 直接落到正常分支——提示要去重，拒绝必须每次都拒。后端**零改动**。
+
 ---
 
 ## 十、关键风险与技术债

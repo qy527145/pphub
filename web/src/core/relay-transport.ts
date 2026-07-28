@@ -13,11 +13,11 @@
 //   [2+n..]    12 字节 IV + AES-GCM 密文
 //
 // 密文明文再分一层轻头部，用一条中继复用多个逻辑通道：
-//   [0]        kind：0=control(JSON) 1=swarm 2=file 数据 3=file 关闭
+//   [0]        kind：0=control(JSON) 1=swarm 2=file 数据 3=file 关闭 4=屏幕编码帧
 //   kind=2/3   [1] = id 字节长度，[2..] = id，其后为负载
 //
-// 局限（必须如实告知用户）：WebRTC **媒体轨**（屏幕共享）无法走应用层中继，
-// 它由浏览器内部的 SRTP 栈直接收发，JS 拿不到编码帧。屏幕共享仍需 WebRTC 通。
+// 屏幕共享（kind=4）走 WebCodecs 自编码的帧，见 screencodec.ts；WebRTC 的**媒体轨**
+// 仍然无法经此中继（SRTP 由浏览器内部收发，JS 拿不到编码帧），两者是不同的东西。
 
 import type { ChannelLike } from './channels'
 import { type Sas, computeSas } from './security'
@@ -26,6 +26,7 @@ const KIND_CONTROL = 0
 const KIND_SWARM = 1
 const KIND_FILE_DATA = 2
 const KIND_FILE_CLOSE = 3
+const KIND_SCREEN = 4
 
 /** 单帧明文上限；服务器侧 MAX_RELAY_FRAME 为 256KiB，此处留出头部与 GCM 余量。 */
 const MAX_PLAIN = 192 * 1024
@@ -62,6 +63,7 @@ export class RelayTransport {
   /** 事件回调，由 Peer 注入。 */
   onControl: ((msg: unknown) => void) | null = null
   onChunk: ((data: ArrayBuffer) => void) | null = null
+  onScreen: ((packet: ArrayBuffer) => void) | null = null
   onFileChannel: ((ev: { id: string; channel: ChannelLike }) => void) | null = null
   onReady: (() => void) | null = null
   onSas: ((sas: Sas) => void) | null = null
@@ -160,6 +162,15 @@ export class RelayTransport {
 
   sendChunk(frame: ArrayBuffer): boolean {
     return this.queue(KIND_SWARM, frame)
+  }
+
+  /**
+   * 发一个屏幕编码包。与其它通道不同：密钥未就绪时直接丢弃而非排队——
+   * 实时画面积压下来只会变成一堆过期帧，等就绪后的关键帧即可恢复。
+   */
+  sendScreen(packet: ArrayBuffer): boolean {
+    if (!this.key || this.closed) return false
+    return this.queue(KIND_SCREEN, packet)
   }
 
   /**
@@ -268,6 +279,9 @@ export class RelayTransport {
         break
       case KIND_SWARM:
         this.onChunk?.(detach(plain.subarray(1)))
+        break
+      case KIND_SCREEN:
+        this.onScreen?.(detach(plain.subarray(1)))
         break
       case KIND_FILE_DATA: {
         const at = 2 + plain[1]

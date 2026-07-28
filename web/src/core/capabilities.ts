@@ -1,6 +1,8 @@
 // 运行环境能力探测：所有特性检测集中于此，供 UI 做优雅降级提示。
 // 严格避免调用会触发权限弹窗的 API（如 getUserMedia），仅做存在性检查。
 
+import { canDecodeScreen, canEncodeScreen } from './screencodec'
+
 export interface Capabilities {
   /**
    * 是否安全上下文（https / localhost）。注意 RTCPeerConnection 本身**不**依赖它
@@ -14,6 +16,12 @@ export interface Capabilities {
   webCrypto: boolean
   /** 屏幕共享 getDisplayMedia 是否存在（移动端浏览器普遍缺失）。 */
   displayMedia: boolean
+  /**
+   * WebCodecs 视频编/解码是否可用。中继路径的屏幕共享靠它自行编码
+   * （媒体轨走不了应用层中继），走 WebRTC 直连/TURN 时用不到。
+   */
+  screenEncode: boolean
+  screenDecode: boolean
   /** 摄像头/麦克风 getUserMedia 是否存在。 */
   userMedia: boolean
   /** File System Access API（showSaveFilePicker，仅 Chromium）。 */
@@ -31,6 +39,8 @@ export function detectCapabilities(): Capabilities {
     webrtc: typeof RTCPeerConnection !== 'undefined',
     webCrypto: typeof crypto !== 'undefined' && typeof crypto.subtle !== 'undefined',
     displayMedia: !!md && typeof md.getDisplayMedia === 'function',
+    screenEncode: canEncodeScreen(),
+    screenDecode: canDecodeScreen(),
     userMedia: !!md && typeof md.getUserMedia === 'function',
     fileSystemAccess: typeof (window as unknown as { showSaveFilePicker?: unknown })
       .showSaveFilePicker === 'function',

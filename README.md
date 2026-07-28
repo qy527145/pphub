@@ -9,21 +9,24 @@
 降级到同一条 WebSocket 上的应用层中继。
 
 加 `--stun-turn` 会额外监听 UDP+TCP 3478 启用内置 STUN/TURN，换来真正的 NAT
-打洞与 ICE 层中继：跨网络场景下更可能直连，且**屏幕共享在任何网络下都可用**。
+打洞与 ICE 层中继：跨网络场景下更可能直连，屏幕共享也能带上音频。
 
 传输按以下顺序自动降级，无需其它配置：
 
 | 级别 | 通路 | 需要的端口 | 加密 | 屏幕共享 |
 |------|------|-----------|------|---------|
-| 1 | P2P 直连（同网段 host 候选） | 无 | DTLS/SRTP | ✅ |
-| 2 | P2P 直连（内置 STUN 打洞） | UDP 3478（`--stun-turn`） | DTLS/SRTP | ✅ |
-| 3 | 内置 TURN over UDP | UDP 3478（`--stun-turn`） | DTLS/SRTP | ✅ |
-| 4 | 内置 TURN over TCP | TCP 3478（`--stun-turn`） | DTLS/SRTP | ✅ |
-| 5 | WS 应用层中继 | 无（复用 HTTP 端口） | ECDH + AES-GCM | ❌ |
+| 1 | P2P 直连（同网段 host 候选） | 无 | DTLS/SRTP | ✅ 含音频 |
+| 2 | P2P 直连（内置 STUN 打洞） | UDP 3478（`--stun-turn`） | DTLS/SRTP | ✅ 含音频 |
+| 3 | 内置 TURN over UDP | UDP 3478（`--stun-turn`） | DTLS/SRTP | ✅ 含音频 |
+| 4 | 内置 TURN over TCP | TCP 3478（`--stun-turn`） | DTLS/SRTP | ✅ 含音频 |
+| 5 | WS 应用层中继 | 无（复用 HTTP 端口） | ECDH + AES-GCM | ✅ 仅视频 |
 
-最后一级是默认配置下的兜底，代价是屏幕共享不可用——WebRTC 媒体轨由浏览器内部
-的 SRTP 栈直接收发，JS 拿不到编码帧，无法经应用层转发。文字/文件/白板不受影响。
-要在跨网络环境下也能共享屏幕，就得用 `--stun-turn` 放行 3478。
+最后一级是默认配置下的兜底。WebRTC 媒体轨过不了应用层中继（SRTP 在浏览器
+内部收发，JS 拿不到编码帧），所以这条路径改用 **WebCodecs 自行编码**：画面
+编码成字节后混在同一条加密中继通道里走，对端解码回 `MediaStream`，渲染与
+批注链路完全不变。代价是**没有音频**、画质与延迟不如原生媒体轨，且两端都需要
+浏览器支持 WebCodecs（https/localhost 下的现代 Chromium 系；Safari 17+）。
+不支持时 pphub 会直说原因，而不是给一个永远黑屏的画面。
 
 ## 快速开始
 
@@ -35,7 +38,7 @@ cargo run
 cargo run -- --port 8848
 cargo run -- -H 127.0.0.1 -p 8848
 
-# 额外启用内置 STUN/TURN（多占 UDP+TCP 3478，换取跨网打洞与屏幕共享）
+# 额外启用内置 STUN/TURN（多占 UDP+TCP 3478，换取跨网打洞与带音频的屏幕共享）
 cargo run -- --stun-turn
 ```
 
@@ -64,9 +67,10 @@ SAS（emoji/数字），两端带外核对一致才代表未被中间人篡改�
   式多源分发），避免共享方单点负载过高。
 
 **屏幕共享**：桌面端浏览器可一键共享屏幕/窗口/标签页（`getDisplayMedia`，需
-https 或 localhost；移动端浏览器无此 API，只能观看）。画面走 WebRTC 媒体轨端
-到端直传，支持面向全网或仅共享给指定节点、多人同时共享、观看端切换画面与声
-音开关。
+https 或 localhost；移动端浏览器无此 API，只能观看）。直连时画面走 WebRTC 媒体
+轨端到端直传（含音频）；降级到 WS 中继的对端则改走 WebCodecs 自编码的视频流
+（无音频）——两条路径对上层一致，都支持面向全网或仅共享给指定节点、多人同时
+共享、观看端切换画面与声音开关。
 
 **屏幕控制（远程指挥）**：观看端可在对方画面上使用远程指针、点击提示与透明
 画笔批注，实时显示在共享端预览与所有观看端上。受浏览器安全模型限制（合成键
@@ -113,9 +117,11 @@ location /pphub/ {
 
 两个必须知道的限制：
 
-- **屏幕共享在中继路径上不可用**。WebRTC 媒体轨由浏览器内部 SRTP 栈收发，
-  JS 拿不到编码帧，无法经应用层转发；共享时会直接报错而非静默失败。
-  需要跨网络共享屏幕就得开 `--stun-turn`。
+- **中继路径上的屏幕共享没有音频**。WebRTC 媒体轨由浏览器内部 SRTP 栈收发，
+  JS 拿不到编码帧，无法经应用层转发；这条路径改由 WebCodecs 自行编码视频后
+  混进中继通道，因此只有画面，且画质/延迟不如原生媒体轨。两端浏览器都需要
+  WebCodecs（现代 Chromium 系、Safari 17+，且必须是安全上下文）；不支持时
+  界面会说明原因而不是黑屏。要音频与更好的画质就开 `--stun-turn`。
 - **中继需要安全上下文**。浏览器只在 https 或 localhost 下提供 `crypto.subtle`，
   以明文 http + 局域网 IP 访问时中继无法加密，此时 pphub 宁可拒绝降级也不
   明文转发，界面会提示改用 https 或放行 3478。详见下节。
@@ -130,6 +136,7 @@ location /pphub/ {
 | `RTCPeerConnection` / DataChannel | ✅ 可用 | 同网段直连、聊天、文件、白板全部正常 |
 | `crypto.subtle` | ❌ | **SAS 安全核验失效**；**WS 中继被拒绝**，打不通的对端彻底连不上 |
 | `getDisplayMedia` | ❌ | 无法发起屏幕共享（仍可观看他人共享） |
+| WebCodecs（`VideoEncoder`/`VideoDecoder`） | ❌ | 中继路径的屏幕共享不可用（直连路径不受影响） |
 | `navigator.clipboard` | ❌ | 自动退回 `execCommand('copy')`，复制功能仍可用 |
 | `crypto.randomUUID` | ❌ | 无影响，已用 `getRandomValues` 兜底 |
 | `showSaveFilePicker` / OPFS | ❌ | 无影响，收文件本就是内存 Blob，未用这两个 API |

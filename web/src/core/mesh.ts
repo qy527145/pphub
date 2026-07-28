@@ -20,6 +20,12 @@ import type {
 import { Peer, type PeerTransport } from './peer'
 import type { ChannelLike } from './channels'
 import type { BuiltinIce, IceServer } from './protocol'
+import {
+  ScreenDecoder,
+  ScreenEncoder,
+  canDecodeScreen,
+  canEncodeScreen,
+} from './screencodec'
 import type { Sas } from './security'
 import type { Signaling, SignalingState } from './signaling'
 import {
@@ -91,6 +97,14 @@ export interface ShareEntry {
   holders: Set<string>
 }
 
+/** 一次屏幕共享的可达性预检结果。 */
+export interface ScreenTargets {
+  /** 能收到画面的对端。 */
+  ok: string[]
+  /** 收不到的对端及原因（用于在开采集器之前就告诉用户）。 */
+  blocked: { peerId: string; reason: string }[]
+}
+
 export class Mesh extends Emitter<MeshEvents> {
   myId = ''
   room = ''
@@ -119,6 +133,13 @@ export class Mesh extends Emitter<MeshEvents> {
   private screenStream: MediaStream | null = null
   private screenScope: { scope: SendScope; to?: string } = { scope: 'all' }
   private readonly screenSenders = new Map<string, RTCRtpSender[]>()
+  // 中继对端走 WebCodecs 自编码：一个编码器，画面分发给所有中继观众。
+  private screenEncoder: ScreenEncoder | null = null
+  private encoderStarting: Promise<boolean> | null = null
+  private readonly codecViewers = new Set<string>()
+  private readonly screenDecoders = new Map<string, ScreenDecoder>()
+  /** 已就「本机无法解码」报过警的对端，避免每个包刷一条错误。 */
+  private readonly decodeWarned = new Set<string>()
 
   constructor(signaling: Signaling) {
     super()
@@ -218,24 +239,48 @@ export class Mesh extends Emitter<MeshEvents> {
   // —— 屏幕共享 ——
 
   /**
-   * 开始屏幕共享。scope=all 挂到所有对端；direct 只挂到指定对端。
+   * 某次共享的可达性预检，在打开采集器**之前**调用。
+   * 避免让用户选完屏幕、授完权，才发现根本没人收得到。
+   */
+  screenTargets(scope: SendScope = 'all', to?: string): ScreenTargets {
+    const candidates =
+      scope === 'direct' && to
+        ? [this.peers.get(to)].filter((p): p is Peer => !!p)
+        : [...this.peers.values()]
+
+    const out: ScreenTargets = { ok: [], blocked: [] }
+    for (const peer of candidates) {
+      const who = this.nicks.get(peer.remoteId) ?? peer.remoteId
+      if (peer.connectionState !== 'connected') {
+        out.blocked.push({ peerId: peer.remoteId, reason: `${who} 尚未连接` })
+      } else if (peer.transport === 'webrtc' || canEncodeScreen()) {
+        out.ok.push(peer.remoteId)
+      } else {
+        out.blocked.push({
+          peerId: peer.remoteId,
+          reason: `与 ${who} 走服务器中继，该路径需要 WebCodecs 编码画面，当前浏览器不支持`,
+        })
+      }
+    }
+    return out
+  }
+
+  /**
+   * 开始屏幕共享。scope=all 发给所有对端；direct 只发给指定对端。
    * 后续新加入的对端仅在 scope=all 时自动补挂。
    */
   startScreenShare(stream: MediaStream, scope: SendScope = 'all', to?: string): void {
     this.stopScreenShare()
     this.screenStream = stream
     this.screenScope = { scope, to }
-    if (scope === 'direct' && to) {
-      const peer = this.peers.get(to)
-      if (peer) this.attachScreen(peer)
-      this.sendTo(to, { kind: 'screen-start', scope })
-    } else {
-      for (const peer of this.peers.values()) this.attachScreen(peer)
-      this.broadcast({ kind: 'screen-start', scope: 'all' })
-    }
+    const targets =
+      scope === 'direct' && to
+        ? [this.peers.get(to)].filter((p): p is Peer => !!p)
+        : [...this.peers.values()]
+    for (const peer of targets) this.attachScreen(peer)
   }
 
-  /** 停止屏幕共享：移除各对端上的 senders 并停止本地轨道。 */
+  /** 停止屏幕共享：撤各对端的媒体轨、关编码器、停本地轨道。 */
   stopScreenShare(): void {
     if (!this.screenStream) return
     for (const [peerId, senders] of this.screenSenders) {
@@ -243,6 +288,10 @@ export class Mesh extends Emitter<MeshEvents> {
       if (peer) for (const s of senders) peer.removeTrack(s)
     }
     this.screenSenders.clear()
+    this.codecViewers.clear()
+    this.screenEncoder?.close()
+    this.screenEncoder = null
+    this.encoderStarting = null
     for (const track of this.screenStream.getTracks()) track.stop()
     this.screenStream = null
     this.broadcast({ kind: 'screen-stop' })
@@ -252,25 +301,112 @@ export class Mesh extends Emitter<MeshEvents> {
     return this.screenStream !== null
   }
 
+  /** 本次共享是否覆盖该对端（广播覆盖全部，单播只覆盖指定的那个）。 */
+  private sharedWith(peerId: string): boolean {
+    return this.screenScope.scope === 'all' || this.screenScope.to === peerId
+  }
+
   /**
-   * 把本端屏幕流挂到某个对端。
+   * 把本端屏幕挂到某个对端，并通知对方。幂等，可重复调用（对端通道就绪、
+   * 中途降级都会再调一次）。
    *
-   * 已降级到 WS 中继的对端收不到媒体：媒体轨由浏览器内部的 SRTP 栈直接收发，
-   * JS 拿不到编码帧，无法经应用层中继转发。这里明确报错，而不是静默失败。
+   * 两条路径：
+   *   - WebRTC 直连/TURN：原生媒体轨，画质与延迟最好，且带音频；
+   *   - 已降级为中继：媒体轨过不去（SRTP 在浏览器内部，JS 拿不到编码帧），
+   *     改用 WebCodecs 自行编码，编码字节走加密中继通道，仅视频。
    */
   private attachScreen(peer: Peer): void {
     const stream = this.screenStream
     if (!stream) return
-    if (peer.transport === 'relay') {
+
+    if (peer.transport === 'webrtc') {
+      if (!this.screenSenders.has(peer.remoteId)) {
+        const senders = stream.getTracks().map((t) => peer.addTrack(t, stream))
+        this.screenSenders.set(peer.remoteId, senders)
+      }
+      peer.sendControl({ kind: 'screen-start', scope: this.screenScope.scope, via: 'track' })
+      return
+    }
+
+    if (!canEncodeScreen()) {
       const who = this.nicks.get(peer.remoteId) ?? peer.remoteId
       this.emit('error', {
-        code: 'screen-relay-unsupported',
-        msg: `与 ${who} 的连接已降级为服务器中继，屏幕共享需要 P2P 直连或 TURN`,
+        code: 'screen-codec-unsupported',
+        msg: `与 ${who} 的连接走服务器中继，该路径需要 WebCodecs 编码画面，当前浏览器不支持`,
       })
       return
     }
-    const senders = stream.getTracks().map((t) => peer.addTrack(t, stream))
-    this.screenSenders.set(peer.remoteId, senders)
+
+    this.codecViewers.add(peer.remoteId)
+    peer.sendControl({ kind: 'screen-start', scope: this.screenScope.scope, via: 'codec' })
+    void this.ensureScreenEncoder().then((ok) => {
+      // 新观众要等到下一个关键帧才能出画面，这里立刻补一个。
+      if (ok) this.screenEncoder?.requestKeyFrame()
+    })
+  }
+
+  /** 惰性创建编码器；并发调用共用同一个启动 promise。 */
+  private ensureScreenEncoder(): Promise<boolean> {
+    if (this.encoderStarting) return this.encoderStarting
+    const track = this.screenStream?.getVideoTracks()[0]
+    if (!track) return Promise.resolve(false)
+
+    const encoder = new ScreenEncoder(track, {
+      send: (packet) => this.fanoutScreen(packet),
+      // 中继最终压在信令 WebSocket 的发送缓冲上，编码器据此丢帧。
+      buffered: () => this.signaling.bufferedAmount,
+    })
+    this.encoderStarting = encoder.start().then((ok) => {
+      // 启动期间可能已经停止共享了。
+      if (!ok || !this.screenStream) {
+        encoder.close()
+        if (!ok) {
+          this.emit('error', {
+            code: 'screen-codec-unsupported',
+            msg: '本机没有可用的视频编码器，无法向走中继的对端共享屏幕',
+          })
+        }
+        return false
+      }
+      this.screenEncoder = encoder
+      return true
+    })
+    return this.encoderStarting
+  }
+
+  /** 编码一次，分发给所有中继观众（中继内部会立即复制载荷，可复用同一份）。 */
+  private fanoutScreen(packet: ArrayBuffer): void {
+    for (const peerId of this.codecViewers) {
+      this.peers.get(peerId)?.sendScreen(packet)
+    }
+  }
+
+  /** 中继屏幕包到达：交给该对端的解码器，首帧解出后当作一条媒体流上报。 */
+  private handleScreenPacket(from: string, packet: ArrayBuffer): void {
+    let decoder = this.screenDecoders.get(from)
+    if (!decoder) {
+      if (!canDecodeScreen()) {
+        if (!this.decodeWarned.has(from)) {
+          this.decodeWarned.add(from)
+          const who = this.nicks.get(from) ?? from
+          this.emit('error', {
+            code: 'screen-codec-unsupported',
+            msg: `${who} 正经中继共享屏幕，但当前浏览器不支持 WebCodecs 解码，无法观看`,
+          })
+        }
+        return
+      }
+      decoder = new ScreenDecoder()
+      decoder.onReady = (stream) => this.emit('screen-stream', { peerId: from, stream })
+      this.screenDecoders.set(from, decoder)
+    }
+    decoder.push(packet)
+  }
+
+  private dropScreenDecoder(peerId: string): void {
+    this.screenDecoders.get(peerId)?.close()
+    this.screenDecoders.delete(peerId)
+    this.decodeWarned.delete(peerId)
   }
 
   // —— 强制发送（推模型，保留原有逐字节流式路径）——
@@ -450,6 +586,13 @@ export class Mesh extends Emitter<MeshEvents> {
       this.screenStream = null
     }
     this.screenSenders.clear()
+    this.codecViewers.clear()
+    this.screenEncoder?.close()
+    this.screenEncoder = null
+    this.encoderStarting = null
+    for (const d of this.screenDecoders.values()) d.close()
+    this.screenDecoders.clear()
+    this.decodeWarned.clear()
     for (const { handle } of this.activeSends.values()) handle.cancel()
     for (const { handle } of this.activeRecvs.values()) handle.cancel()
     for (const d of this.downloads.values()) d.cancel()
@@ -490,29 +633,37 @@ export class Mesh extends Emitter<MeshEvents> {
     peer.on('control', (msg) => this.handleControl(remoteId, msg))
     peer.on('filechannel', ({ id, channel }) => this.handleFileChannel(remoteId, id, channel))
     peer.on('chunk', (frame) => this.handleChunkFrame(remoteId, frame))
+    peer.on('screenpacket', (packet) => this.handleScreenPacket(remoteId, packet))
     peer.on('sas', (sas) => this.emit('peer-sas', { peerId: remoteId, sas }))
-    peer.on('transport', (transport) => this.emit('peer-transport', { peerId: remoteId, transport }))
+    peer.on('transport', (transport) => {
+      this.emit('peer-transport', { peerId: remoteId, transport })
+      // 共享进行中的对端刚降级为中继：原生媒体轨已作废，改挂自编码路径。
+      if (transport === 'relay' && this.screenStream && this.sharedWith(remoteId)) {
+        this.screenSenders.delete(remoteId)
+        this.attachScreen(peer)
+      }
+    })
     peer.on('relayblocked', (msg) => this.emit('error', { code: 'relay-blocked', msg }))
     peer.on('track', ({ streams }) => {
       if (streams[0]) this.emit('screen-stream', { peerId: remoteId, stream: streams[0] })
     })
     peer.on('channelopen', () => {
-      // 通道就绪：互换名片、邻接表、共享目录；迟到者补 screen-start。
+      // 通道就绪：互换名片、邻接表、共享目录；迟到者补挂屏幕。
       peer.sendControl({ kind: 'profile', profile: this.profile })
       peer.sendControl({ kind: 'link-state', links: this.linkStates() })
       const visible = [...this.shares.values()]
         .filter((e) => e.local && e.meta.scope === 'all')
         .map((e) => e.meta)
       if (visible.length > 0) peer.sendControl({ kind: 'share-list', files: visible })
-      if (this.screenStream && this.screenScope.scope === 'all') {
-        peer.sendControl({ kind: 'screen-start', scope: 'all' })
-      }
+      // attachScreen 幂等：这里既补发 screen-start，也让中继观众拿到关键帧
+      // （中继的 channelopen 正好在密钥协商完成时触发）。
+      if (this.screenStream && this.sharedWith(remoteId)) this.attachScreen(peer)
       this.emit('peer-channel-open', remoteId)
     })
 
     this.peers.set(remoteId, peer)
-    // 本端正在向全网共享屏幕：给新对端补挂媒体轨。
-    if (this.screenScope.scope === 'all') this.attachScreen(peer)
+    // 本端正在向全网共享屏幕：给新对端补挂画面。
+    if (this.screenStream && this.screenScope.scope === 'all') this.attachScreen(peer)
     this.emit('peer-added', { peerId: remoteId, nick: this.nicks.get(remoteId) })
     // 构造期就可能已降级（如强制中继开关），此时 'transport' 事件早于上面的
     // 订阅发出，补一次同步；之后的变化由事件驱动。必须在 peer-added 之后，
@@ -539,9 +690,22 @@ export class Mesh extends Emitter<MeshEvents> {
         this.emit('peer-links', { peerId: from, links: msg.links })
         break
       case 'screen-start':
+        // 对方经中继共享（WebCodecs 自编码），而本机解不了：明确告知，
+        // 否则只会看到一个永远黑屏的画面条目。提示只发一次，但拒绝要每次都拒。
+        if (msg.via === 'codec' && !canDecodeScreen()) {
+          if (!this.decodeWarned.has(from)) {
+            this.decodeWarned.add(from)
+            this.emit('error', {
+              code: 'screen-codec-unsupported',
+              msg: `${this.nicks.get(from) ?? from} 正经中继共享屏幕，但当前浏览器不支持 WebCodecs 解码，无法观看`,
+            })
+          }
+          break
+        }
         this.emit('screen-start', from)
         break
       case 'screen-stop':
+        this.dropScreenDecoder(from)
         this.emit('screen-stop', from)
         break
       case 'draw-begin':
@@ -551,6 +715,7 @@ export class Mesh extends Emitter<MeshEvents> {
       case 'draw-polyline':
       case 'draw-text':
       case 'draw-image':
+      case 'draw-update':
       case 'draw-remove':
       case 'draw-clear':
       case 'draw-state':
@@ -727,6 +892,8 @@ export class Mesh extends Emitter<MeshEvents> {
     this.peers.delete(remoteId)
     this.nicks.delete(remoteId)
     this.screenSenders.delete(remoteId)
+    this.codecViewers.delete(remoteId)
+    this.dropScreenDecoder(remoteId)
     // 该对端的未决 offer 不会再有数据通道了，直接清理。
     for (const [id, p] of this.pendingOffers) {
       if (p.peerId === remoteId) {

@@ -1,3 +1,8 @@
+<script lang="ts">
+// 同屏可能挂多层（屏幕共享多画面平铺），模块级计数用于粘贴归属判定。
+let mountedLayers = 0
+</script>
+
 <script setup lang="ts">
 // 绘制叠加层：铺在视频内容区（屏幕批注）或白板面上，负责
 //   1) 按 boardRev 全量重绘该画面的元素（DPR 感知）；
@@ -17,7 +22,7 @@ import {
   normalizeRect,
   LOGICAL_WIDTH,
 } from '@/core/draw'
-import type { DrawMode } from '@/core/messages'
+import type { DrawMode, WbImage } from '@/core/messages'
 
 const props = withDefaults(
   defineProps<{
@@ -41,10 +46,12 @@ const layerEl = ref<HTMLDivElement | null>(null)
 // —— 笔画重绘 ——
 // 挂载时先按当前状态画一遍：笔画可能早于本层挂载就已同步到达。
 onMounted(() => {
+  mountedLayers++
   redraw()
   // 贴图解码是异步的，解码完成后需要重绘本层
   setImageReadyHandler(() => redraw())
   window.addEventListener('keydown', onKeyDown)
+  window.addEventListener('paste', onPaste)
 })
 watch(
   () => [store.boardRev, props.width, props.height, props.board] as const,
@@ -95,12 +102,24 @@ function onPointerDown(ev: PointerEvent): void {
     return
   }
 
+  if (props.tool === 'select') {
+    // 点中图片则直接进入拖动；否则拉框选
+    const img = imageAt(p)
+    if (img) {
+      selectedIds.value = [img.id]
+      beginXform(img, 'move', p)
+      return
+    }
+    shapeStart = p
+    previewShape.value = { x1: p.x, y1: p.y, x2: p.x, y2: p.y }
+    return
+  }
+
   if (
     props.tool === 'line' ||
     props.tool === 'arrow' ||
     props.tool === 'rect' ||
-    props.tool === 'ellipse' ||
-    props.tool === 'select'
+    props.tool === 'ellipse'
   ) {
     shapeStart = p
     previewShape.value = { x1: p.x, y1: p.y, x2: p.x, y2: p.y }
@@ -231,9 +250,153 @@ function deleteSelection(): void {
   selectedIds.value = []
 }
 
+// —— 图片变换（select 工具）：拖动 / 旋转 / 缩放 ——
+// 旋转/缩放都以图片中心为锚点；角度与距离在 aspect 折算空间计算，
+// 与像素空间的渲染旋转保持角度一致。
+interface XformState {
+  type: 'move' | 'scale' | 'rotate'
+  id: string
+  startX: number
+  startY: number
+  orig: { x: number; y: number; width: number; height: number; rotation: number }
+}
+let xform: XformState | null = null
+
+const aspect = computed(() => (props.width > 0 ? props.height / props.width : 1))
+
+/** 命中最上层的图片（旋转感知）。 */
+function imageAt(p: { x: number; y: number }): WbImage | null {
+  const items = store.getBoard(props.board)
+  const a = aspect.value
+  for (let i = items.length - 1; i >= 0; i--) {
+    const it = items[i]
+    if (it.mode !== 'image') continue
+    const cx = it.x + it.width / 2
+    const cyS = (it.y + it.height / 2) * a
+    const dx = p.x - cx
+    const dy = p.y * a - cyS
+    const rot = it.rotation ?? 0
+    const cos = Math.cos(-rot)
+    const sin = Math.sin(-rot)
+    const lx = dx * cos - dy * sin
+    const ly = dx * sin + dy * cos
+    if (Math.abs(lx) <= it.width / 2 && Math.abs(ly) <= (it.height / 2) * a) return it
+  }
+  return null
+}
+
+/** 唯一选中且是图片时才显示变换手柄。 */
+const activeImage = computed<WbImage | null>(() => {
+  if (props.tool !== 'select' || selectedIds.value.length !== 1) return null
+  const it = store.getBoard(props.board).find((i) => i.id === selectedIds.value[0])
+  return it && it.mode === 'image' ? it : null
+})
+
+const xformStyle = computed(() => {
+  const img = activeImage.value
+  if (!img) return {}
+  return {
+    left: `${img.x * props.width}px`,
+    top: `${img.y * props.height}px`,
+    width: `${img.width * props.width}px`,
+    height: `${img.height * props.height}px`,
+    transform: `rotate(${img.rotation ?? 0}rad)`,
+  }
+})
+
+function beginXform(img: WbImage, type: XformState['type'], p: { x: number; y: number }): void {
+  xform = {
+    type,
+    id: img.id,
+    startX: p.x,
+    startY: p.y,
+    orig: {
+      x: img.x,
+      y: img.y,
+      width: img.width,
+      height: img.height,
+      rotation: img.rotation ?? 0,
+    },
+  }
+}
+
+function startHandle(ev: PointerEvent, type: 'scale' | 'rotate'): void {
+  const img = activeImage.value
+  const p = norm(ev)
+  if (!img || !p) return
+  layerEl.value?.setPointerCapture(ev.pointerId)
+  beginXform(img, type, p)
+}
+
+function applyXform(p: { x: number; y: number }): void {
+  if (!xform) return
+  const o = xform.orig
+  if (xform.type === 'move') {
+    store.updateImage(props.board, xform.id, {
+      x: o.x + (p.x - xform.startX),
+      y: o.y + (p.y - xform.startY),
+      width: o.width,
+      height: o.height,
+      rotation: o.rotation,
+    })
+    return
+  }
+  const a = aspect.value
+  const cx = o.x + o.width / 2
+  const cy = o.y + o.height / 2
+  const dx = p.x - cx
+  const dy = (p.y - cy) * a
+  const sdx = xform.startX - cx
+  const sdy = (xform.startY - cy) * a
+  if (xform.type === 'scale') {
+    const d0 = Math.hypot(sdx, sdy)
+    if (d0 <= 0) return
+    const k = Math.max(0.15, Math.hypot(dx, dy) / d0)
+    const w = o.width * k
+    const h = o.height * k
+    store.updateImage(props.board, xform.id, {
+      x: cx - w / 2,
+      y: cy - h / 2,
+      width: w,
+      height: h,
+      rotation: o.rotation,
+    })
+    return
+  }
+  store.updateImage(props.board, xform.id, {
+    x: o.x,
+    y: o.y,
+    width: o.width,
+    height: o.height,
+    rotation: o.rotation + (Math.atan2(dy, dx) - Math.atan2(sdy, sdx)),
+  })
+}
+
+function endXform(): void {
+  const xf = xform
+  if (!xf) return
+  xform = null
+  const it = store.getBoard(props.board).find((i) => i.id === xf.id)
+  if (it && it.mode === 'image') {
+    store.updateImage(
+      props.board,
+      xf.id,
+      { x: it.x, y: it.y, width: it.width, height: it.height, rotation: it.rotation },
+      true,
+    )
+  }
+}
+
 function onPointerMove(ev: PointerEvent): void {
   const p = norm(ev)
   if (!p) return
+  lastPos = p
+  pointerInside = true
+
+  if (xform) {
+    applyXform(p)
+    return
+  }
 
   if (shapeStart && previewShape.value) {
     previewShape.value.x2 = p.x
@@ -270,6 +433,11 @@ function flushPoints(): void {
 
 function onPointerUp(): void {
   erasing = false
+
+  if (xform) {
+    endXform()
+    return
+  }
 
   if (shapeStart && previewShape.value) {
     const box = previewShape.value
@@ -308,52 +476,83 @@ function promptText(x: number, y: number): void {
 const IMG_MAX_PX = 720
 const IMG_MAX_BYTES = 48 * 1024
 
+/** 压缩并插入一张图片；centered=true 时 (x,y) 为图片中心（粘贴场景）。 */
+function insertImageFile(file: Blob, x: number, y: number, centered = false): void {
+  const url = URL.createObjectURL(file)
+  const img = new Image()
+  img.onload = () => {
+    const scale = Math.min(1, IMG_MAX_PX / Math.max(img.width, img.height))
+    const cw = Math.max(1, Math.round(img.width * scale))
+    const ch = Math.max(1, Math.round(img.height * scale))
+    const off = document.createElement('canvas')
+    off.width = cw
+    off.height = ch
+    const octx = off.getContext('2d')
+    URL.revokeObjectURL(url)
+    if (!octx) return
+    octx.drawImage(img, 0, 0, cw, ch)
+
+    let dataUrl = off.toDataURL('image/jpeg', 0.8)
+    for (let q = 0.6; dataUrl.length > IMG_MAX_BYTES && q >= 0.3; q -= 0.15) {
+      dataUrl = off.toDataURL('image/jpeg', q)
+    }
+    if (dataUrl.length > IMG_MAX_BYTES) {
+      window.alert('图片太大，请换一张更小的图片')
+      return
+    }
+
+    const ratio = cw / ch
+    let w = 0.3
+    let h = w / ratio
+    if (h > 0.3) {
+      h = 0.3
+      w = h * ratio
+    }
+    const px = centered ? Math.min(Math.max(x - w / 2, 0), Math.max(0, 1 - w)) : x
+    const py = centered ? Math.min(Math.max(y - h / 2, 0), Math.max(0, 1 - h)) : y
+    store.addImage(props.board, px, py, w, h, dataUrl)
+  }
+  img.onerror = () => URL.revokeObjectURL(url)
+  img.src = url
+}
+
 function selectImage(x: number, y: number): void {
   const input = document.createElement('input')
   input.type = 'file'
   input.accept = 'image/*'
   input.onchange = () => {
     const file = input.files?.[0]
-    if (!file) return
-    const url = URL.createObjectURL(file)
-    const img = new Image()
-    img.onload = () => {
-      const scale = Math.min(1, IMG_MAX_PX / Math.max(img.width, img.height))
-      const cw = Math.max(1, Math.round(img.width * scale))
-      const ch = Math.max(1, Math.round(img.height * scale))
-      const off = document.createElement('canvas')
-      off.width = cw
-      off.height = ch
-      const octx = off.getContext('2d')
-      URL.revokeObjectURL(url)
-      if (!octx) return
-      octx.drawImage(img, 0, 0, cw, ch)
-
-      let dataUrl = off.toDataURL('image/jpeg', 0.8)
-      for (let q = 0.6; dataUrl.length > IMG_MAX_BYTES && q >= 0.3; q -= 0.15) {
-        dataUrl = off.toDataURL('image/jpeg', q)
-      }
-      if (dataUrl.length > IMG_MAX_BYTES) {
-        window.alert('图片太大，请换一张更小的图片')
-        return
-      }
-
-      const aspect = cw / ch
-      let w = 0.3
-      let h = w / aspect
-      if (h > 0.3) {
-        h = 0.3
-        w = h * aspect
-      }
-      store.addImage(props.board, x, y, w, h, dataUrl)
-    }
-    img.onerror = () => URL.revokeObjectURL(url)
-    img.src = url
+    if (file) insertImageFile(file, x, y)
   }
   input.click()
 }
 
+// —— 粘贴贴图 ——
+// 任意工具下 Ctrl/Cmd+V 剪贴板图片直接落图，跟随最近的指针位置（没有则居中）。
+// 同屏多层时（多画面平铺）只有指针所在的那一层接收粘贴。
+let lastPos: { x: number; y: number } | null = null
+let pointerInside = false
+
+function onPaste(ev: ClipboardEvent): void {
+  const target = ev.target as HTMLElement | null
+  if (target?.closest('input, textarea, [contenteditable]')) return
+  if (mountedLayers > 1 && !pointerInside) return
+  const items = ev.clipboardData?.items
+  if (!items) return
+  for (const it of items) {
+    if (!it.type.startsWith('image/')) continue
+    const file = it.getAsFile()
+    if (file) {
+      ev.preventDefault()
+      const at = lastPos ?? { x: 0.5, y: 0.5 }
+      insertImageFile(file, at.x, at.y, true)
+    }
+    return
+  }
+}
+
 function onPointerLeave(): void {
+  pointerInside = false
   hoverPos.value = null
   store.hidePointer(props.board)
 }
@@ -368,6 +567,7 @@ defineExpose({
 })
 
 onBeforeUnmount(() => {
+  mountedLayers--
   onPointerUp()
   store.hidePointer(props.board)
   if (flushTimer !== null) window.clearTimeout(flushTimer)
@@ -377,6 +577,7 @@ onBeforeUnmount(() => {
   selectedIds.value = []
   setImageReadyHandler(null)
   window.removeEventListener('keydown', onKeyDown)
+  window.removeEventListener('paste', onPaste)
 })
 
 // 切换工具时收掉未完成的折线与选区，避免残留预览
@@ -385,6 +586,7 @@ watch(
   () => {
     cancelPolyline()
     selectedIds.value = []
+    xform = null
   },
 )
 
@@ -510,7 +712,7 @@ function getArrowPoints(): string {
         class="marquee"
       />
       <rect
-        v-else-if="selectionBox"
+        v-else-if="selectionBox && !activeImage"
         :x="selectionBox.x1 * width - 3"
         :y="selectionBox.y1 * height - 3"
         :width="(selectionBox.x2 - selectionBox.x1) * width + 6"
@@ -598,6 +800,13 @@ function getArrowPoints(): string {
       />
     </svg>
 
+    <!-- 图片变换手柄：框体拖动、上方旋转、右下角缩放 -->
+    <div v-if="activeImage" class="img-xform" :style="xformStyle">
+      <span class="rot-line" />
+      <span class="handle rot" title="旋转" @pointerdown.stop.prevent="startHandle($event, 'rotate')" />
+      <span class="handle scale" title="缩放" @pointerdown.stop.prevent="startHandle($event, 'scale')" />
+    </div>
+
     <!-- 远端鼠标轨迹尾迹（SVG 渐隐线段） -->
     <svg class="trail-layer" :style="{ width: `${width}px`, height: `${height}px` }">
       <template v-for="p in remotePointers" :key="p.key + '-trail'">
@@ -678,6 +887,49 @@ function getArrowPoints(): string {
   stroke: #4084ff;
   stroke-width: 1.5;
   stroke-dasharray: 6 4;
+}
+
+.img-xform {
+  position: absolute;
+  z-index: 2;
+  box-sizing: border-box;
+  border: 1.5px dashed #4084ff;
+  transform-origin: center;
+  pointer-events: none;
+}
+
+.img-xform .handle {
+  position: absolute;
+  width: 12px;
+  height: 12px;
+  background: #fff;
+  border: 2px solid #4084ff;
+  border-radius: 50%;
+  box-sizing: border-box;
+  pointer-events: auto;
+  cursor: grab;
+}
+
+.img-xform .handle.rot {
+  left: 50%;
+  top: -26px;
+  transform: translateX(-50%);
+}
+
+.img-xform .rot-line {
+  position: absolute;
+  left: 50%;
+  top: -14px;
+  width: 1.5px;
+  height: 14px;
+  background: #4084ff;
+  pointer-events: none;
+}
+
+.img-xform .handle.scale {
+  right: -7px;
+  bottom: -7px;
+  cursor: nwse-resize;
 }
 
 .eraser-ring {

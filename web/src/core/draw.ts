@@ -247,7 +247,18 @@ export function drawImage(
     image.src = img.dataUrl
   }
   if (image.complete && image.naturalWidth > 0) {
-    ctx.drawImage(image, img.x * w, img.y * h, img.width * w, img.height * h)
+    const rot = img.rotation ?? 0
+    if (!rot) {
+      ctx.drawImage(image, img.x * w, img.y * h, img.width * w, img.height * h)
+      return
+    }
+    const cx = (img.x + img.width / 2) * w
+    const cy = (img.y + img.height / 2) * h
+    ctx.save()
+    ctx.translate(cx, cy)
+    ctx.rotate(rot)
+    ctx.drawImage(image, (-img.width * w) / 2, (-img.height * h) / 2, img.width * w, img.height * h)
+    ctx.restore()
   }
 }
 
@@ -294,7 +305,18 @@ export function itemBounds(item: WbItem, aspect = 1): NormRect {
     return normalizeRect(item)
   }
   if (item.mode === 'image') {
-    return { x1: item.x, y1: item.y, x2: item.x + item.width, y2: item.y + item.height }
+    const rot = item.rotation ?? 0
+    if (!rot) {
+      return { x1: item.x, y1: item.y, x2: item.x + item.width, y2: item.y + item.height }
+    }
+    // 旋转发生在像素空间，在 aspect 折算空间求旋转后四角的 AABB
+    const cx = item.x + item.width / 2
+    const cyS = (item.y + item.height / 2) * aspect
+    const hw = item.width / 2
+    const hh = (item.height / 2) * aspect
+    const ex = hw * Math.abs(Math.cos(rot)) + hh * Math.abs(Math.sin(rot))
+    const ey = hw * Math.abs(Math.sin(rot)) + hh * Math.abs(Math.cos(rot))
+    return { x1: cx - ex, y1: (cyS - ey) / aspect, x2: cx + ex, y2: (cyS + ey) / aspect }
   }
   if (item.mode === 'text') {
     // 宽度按平均字宽 0.6em 估算
@@ -389,6 +411,21 @@ export function itemHitByCircle(
     if (t === 0) return Math.min(rx, ry) <= radius
     const len = Math.hypot(dx, dy)
     return Math.abs(len - len / t) <= radius
+  }
+  if (item.mode === 'image' && item.rotation) {
+    // 把点逆旋转回图片本地系（aspect 折算空间），再按 bbox+radius 判定
+    const cx = item.x + item.width / 2
+    const cyS = (item.y + item.height / 2) * aspect
+    const dx = px - cx
+    const dy = py * aspect - cyS
+    const cos = Math.cos(-item.rotation)
+    const sin = Math.sin(-item.rotation)
+    const lx = dx * cos - dy * sin
+    const ly = dx * sin + dy * cos
+    return (
+      Math.abs(lx) <= item.width / 2 + radius &&
+      Math.abs(ly) <= (item.height / 2) * aspect + radius
+    )
   }
   // 文本 / 图片：按包围盒膨胀 radius 判定
   const b = itemBounds(item, aspect)

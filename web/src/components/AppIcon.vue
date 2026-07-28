@@ -48,6 +48,14 @@ const ICONS: Record<string, string> = {
     '<rect x="3.6" y="3.6" width="16.8" height="16.8" rx="5.2"/><rect x="9" y="9" width="6" height="6" rx="1.6"/>',
   sun: '<circle cx="12" cy="12" r="4"/><path d="M12 3.2v2.2"/><path d="M12 18.6v2.2"/><path d="M3.2 12h2.2"/><path d="M18.6 12h2.2"/><path d="M5.9 5.9l1.55 1.55"/><path d="M16.55 16.55L18.1 18.1"/><path d="M18.1 5.9l-1.55 1.55"/><path d="M7.45 16.55L5.9 18.1"/>',
   moon: '<path d="M20 14.2A8.4 8.4 0 0 1 9.8 4a8.4 8.4 0 1 0 10.2 10.2z"/>',
+  // 屏幕共享多画面布局
+  'layout-focus': '<rect x="3.6" y="5" width="16.8" height="14" rx="2.4"/>',
+  'layout-split':
+    '<rect x="3.4" y="5" width="7.7" height="14" rx="2"/><rect x="12.9" y="5" width="7.7" height="14" rx="2"/>',
+  'layout-grid':
+    '<rect x="3.4" y="3.4" width="7.7" height="7.7" rx="2"/><rect x="12.9" y="3.4" width="7.7" height="7.7" rx="2"/><rect x="3.4" y="12.9" width="7.7" height="7.7" rx="2"/><rect x="12.9" y="12.9" width="7.7" height="7.7" rx="2"/>',
+  expand:
+    '<path d="M13.8 4.6h5.6v5.6"/><path d="M10.2 19.4H4.6v-5.6"/><path d="M19.4 4.6l-6.2 6.2"/><path d="M4.6 19.4l6.2-6.2"/>',
 }
 
 defineProps<{ name: string; size?: number }>()

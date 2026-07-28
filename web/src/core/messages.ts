@@ -116,7 +116,7 @@ export interface WbText extends WbElement {
 }
 
 /**
- * 图片元素。
+ * 图片元素。rotation 为绕中心的弧度（像素空间），缺省 0。
  */
 export interface WbImage extends WbElement {
   mode: 'image'
@@ -124,6 +124,7 @@ export interface WbImage extends WbElement {
   y: number
   width: number
   height: number
+  rotation?: number
   dataUrl: string
 }
 
@@ -169,8 +170,12 @@ export type ControlMessage =
   /** 无法提供该分块（已取消共享/尚未持有）。 */
   | { kind: 'chunk-nak'; reqId: number; reason: string }
   // —— 屏幕共享 ——
-  /** 本端开始/停止屏幕共享（媒体轨随重协商到达，此消息驱动 UI 状态）。 */
-  | { kind: 'screen-start'; scope: SendScope }
+  /**
+   * 本端开始/停止屏幕共享，此消息驱动对端 UI 状态。
+   * via 标明画面走哪条路：track=WebRTC 原生媒体轨（随重协商到达）；
+   * codec=已降级为中继，画面由 WebCodecs 自编码后经中继通道到达（无音频）。
+   */
+  | { kind: 'screen-start'; scope: SendScope; via?: 'track' | 'codec' }
   | { kind: 'screen-stop' }
   // —— 绘制（白板 / 屏幕批注共用）——
   | { kind: 'draw-begin'; board: BoardId; id: string; color: string; size: number; mode: 'pen' | 'eraser'; x: number; y: number }
@@ -185,6 +190,8 @@ export type ControlMessage =
   | { kind: 'draw-text'; board: BoardId; id: string; color: string; x: number; y: number; text: string; fontSize: number }
   /** 添加图片元素。 */
   | { kind: 'draw-image'; board: BoardId; id: string; x: number; y: number; width: number; height: number; dataUrl: string }
+  /** 更新既有图片元素的几何（拖动/缩放/旋转）。 */
+  | { kind: 'draw-update'; board: BoardId; id: string; x: number; y: number; width: number; height: number; rotation?: number }
   /** 撤销：按 id 移除若干元素（仅撤自己画的）。 */
   | { kind: 'draw-remove'; board: BoardId; ids: string[] }
   | { kind: 'draw-clear'; board: BoardId }

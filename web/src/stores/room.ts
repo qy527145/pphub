@@ -265,6 +265,17 @@ export const useRoomStore = defineStore('room', () => {
   const connectedPeers = computed(() => memberList.value.filter((m) => m.state === 'connected'))
   /** 正在共享屏幕的远端成员。 */
   const sharers = computed(() => memberList.value.filter((m) => m.sharing))
+
+  /**
+   * 屏幕共享可达性（供 UI 决定按钮是否可点）。与 mesh.screenTargets 同一套判据：
+   * 直连/TURN 的对端走原生媒体轨；降级为中继的对端要靠 WebCodecs 自编码。
+   */
+  const screenReach = computed(() => {
+    const ok = connectedPeers.value.filter(
+      (m) => m.transport !== 'relay' || capabilities.screenEncode,
+    ).length
+    return { total: connectedPeers.value.length, ok }
+  })
   /** 在自己短码的房间里等待别人连入。 */
   const listening = computed(() => status.value === 'online' && room.value === myCode.value)
   /** 分享链接：对方打开即加入我所在的房间（未上线则指向我的短码）。 */
@@ -639,6 +650,18 @@ export const useRoomStore = defineStore('room', () => {
         bumpBoard()
         break
       }
+      case 'draw-update': {
+        const item = getBoard(msg.board).find((i) => i.id === msg.id)
+        if (item && item.mode === 'image') {
+          item.x = msg.x
+          item.y = msg.y
+          item.width = msg.width
+          item.height = msg.height
+          item.rotation = msg.rotation
+          bumpBoard()
+        }
+        break
+      }
       case 'draw-remove': {
         const arr = boards.get(msg.board)
         if (arr) {
@@ -715,10 +738,18 @@ export const useRoomStore = defineStore('room', () => {
   /**
    * 采集屏幕并共享。scope=all 给网络内所有节点；direct 只给指定节点。
    * 用户在选择器里取消不算错误。
+   *
+   * 采集之前先做可达性预检：一个能收到画面的节点都没有时直接拒绝，
+   * 免得用户选完屏幕、授完权，才发现是白忙一场。
    */
   async function startShare(scope: SendScope = 'all', to?: string): Promise<boolean> {
     if (!mesh || status.value !== 'online') {
       lastError.value = '请先连接设备再共享屏幕'
+      return false
+    }
+    const targets = mesh.screenTargets(scope, to)
+    if (targets.ok.length === 0) {
+      lastError.value = targets.blocked[0]?.reason ?? '当前没有可以接收画面的节点'
       return false
     }
     let stream: MediaStream
@@ -736,6 +767,8 @@ export const useRoomStore = defineStore('room', () => {
     sharing.value = true
     sharingScope.value = { scope, to }
     mesh.startScreenShare(stream, scope, to)
+    // 部分节点收不到：共享照常进行，但要说清楚少了谁。
+    if (targets.blocked.length > 0) lastError.value = targets.blocked[0].reason
     // 浏览器原生「停止共享」按钮 → 轨道 ended → 同步收尾。
     const videoTrack = stream.getVideoTracks()[0]
     if (videoTrack) videoTrack.onended = () => stopShare()
@@ -886,6 +919,31 @@ export const useRoomStore = defineStore('room', () => {
     sendDraw(board, { kind: 'draw-image', board, id, x, y, width, height, dataUrl })
     bumpBoard()
     return id
+  }
+
+  /** 图片几何更新的网络限流时间戳（拖动中高频调用）。 */
+  let lastImgUpdateSent = 0
+
+  /** 更新图片几何（拖动/缩放/旋转）。flush=true 时强制发送（拖动结束）。 */
+  function updateImage(
+    board: string,
+    id: string,
+    patch: { x: number; y: number; width: number; height: number; rotation?: number },
+    flush = false,
+  ): void {
+    const item = getBoard(board).find((i) => i.id === id)
+    if (!item || item.mode !== 'image') return
+    item.x = patch.x
+    item.y = patch.y
+    item.width = patch.width
+    item.height = patch.height
+    item.rotation = patch.rotation
+    bumpBoard()
+    const now = Date.now()
+    if (flush || now - lastImgUpdateSent > 50) {
+      lastImgUpdateSent = now
+      sendDraw(board, { kind: 'draw-update', board, id, ...patch })
+    }
   }
 
   /** 撤销本端在该画面的最后一个元素。 */
@@ -1372,6 +1430,7 @@ export const useRoomStore = defineStore('room', () => {
     peerCount,
     connectedPeers,
     sharers,
+    screenReach,
     listening,
     shareLink,
     sharing,
@@ -1418,6 +1477,7 @@ export const useRoomStore = defineStore('room', () => {
     addPolyline,
     addText,
     addImage,
+    updateImage,
     removeItems,
     undoStroke,
     clearBoard,

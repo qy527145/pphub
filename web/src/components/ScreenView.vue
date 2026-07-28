@@ -2,16 +2,16 @@
 // 屏幕共享：本端 getDisplayMedia 采集 → 媒体轨经各对端连接直传；
 // 观看端在视频上叠加 DrawLayer——远程指针 / 点击提示 / 透明画笔批注，
 // 同样的叠加也渲染在共享端预览上，形成「远程指挥」闭环。
+// 多人共享时支持三种视图：单画面（页签切换）/ 并列一行 / 平铺网格。
 // 注：浏览器安全模型不允许网页向对端操作系统注入键鼠事件（Captured
 // Surface Control 亦仅转发本机可信事件），故不存在纯浏览器的完整远控。
 
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, ref, shallowReactive } from 'vue'
 import { useRoomStore } from '@/stores/room'
-import { containRect } from '@/core/draw'
 import type { DrawMode } from '@/core/messages'
 import AppIcon from './AppIcon.vue'
-import DrawLayer from './DrawLayer.vue'
 import DrawToolbar from './DrawToolbar.vue'
+import ScreenTile from './ScreenTile.vue'
 
 const store = useRoomStore()
 
@@ -21,8 +21,6 @@ const color = ref('#e5484d')
 const size = ref(6)
 const muted = ref(true)
 const polylineArrow = ref(false)
-const layerRef = ref<InstanceType<typeof DrawLayer> | null>(null)
-const selectedCount = computed(() => layerRef.value?.selectedCount ?? 0)
 
 // 切换工具时把粗细落到该工具的可选档位上
 function setTool(next: 'pointer' | DrawMode): void {
@@ -52,63 +50,84 @@ const feeds = computed<Feed[]>(() => {
   return list
 })
 
-const activeStream = computed<MediaStream | null>(() => {
-  if (store.watching === 'self') return store.localScreen
-  if (store.watching) return store.remoteScreens.get(store.watching) ?? null
-  return null
-})
-
-/** 当前画面对应的批注层 board id。 */
-const activeBoard = computed(() =>
-  store.watching === 'self' ? `screen:${store.myId}` : `screen:${store.watching}`,
-)
-
-const hasAudio = computed(
-  () => store.watching !== 'self' && (activeStream.value?.getAudioTracks().length ?? 0) > 0,
-)
-
-// —— 视频几何：object-fit contain 的内容区，供 DrawLayer 对齐 ——
-const stageEl = ref<HTMLDivElement | null>(null)
-const videoEl = ref<HTMLVideoElement | null>(null)
-const stageW = ref(0)
-const stageH = ref(0)
-const videoW = ref(0)
-const videoH = ref(0)
-
-const content = computed(() => containRect(stageW.value, stageH.value, videoW.value, videoH.value))
-
-let resizeObs: ResizeObserver | null = null
-
-onMounted(() => {
-  resizeObs = new ResizeObserver(() => {
-    if (!stageEl.value) return
-    stageW.value = stageEl.value.clientWidth
-    stageH.value = stageEl.value.clientHeight
-  })
-  if (stageEl.value) resizeObs.observe(stageEl.value)
-})
-
-onBeforeUnmount(() => resizeObs?.disconnect())
-
-function onVideoMeta(): void {
-  const v = videoEl.value
-  if (!v) return
-  videoW.value = v.videoWidth
-  videoH.value = v.videoHeight
+function streamOf(id: string): MediaStream | null {
+  return id === 'self' ? store.localScreen : (store.remoteScreens.get(id) ?? null)
 }
 
-watch(
-  [activeStream, videoEl],
-  () => {
-    const v = videoEl.value
-    if (!v) return
-    if (v.srcObject !== activeStream.value) {
-      videoW.value = 0
-      videoH.value = 0
-      v.srcObject = activeStream.value
-    }
-  },
-  { flush: 'post' },
+function boardOf(id: string): string {
+  return `screen:${id === 'self' ? store.myId : id}`
+}
+
+// —— 视图布局 ——
+// focus=单画面（页签切换）；split=并列一行；grid=平铺网格。
+const layout = ref<'focus' | 'split' | 'grid'>('focus')
+const effLayout = computed(() => (feeds.value.length > 1 ? layout.value : 'focus'))
+
+/** 平铺列数：并列一行铺开；网格取接近正方形的列数。 */
+const tileCols = computed(() => {
+  const n = feeds.value.length
+  return effLayout.value === 'split' ? n : Math.ceil(Math.sqrt(n))
+})
+
+/** 从多画面点「放大」回到单画面焦点视图。 */
+function focusFeed(id: string): void {
+  store.watching = id
+  layout.value = 'focus'
+}
+
+const activeStream = computed<MediaStream | null>(() =>
+  store.watching ? streamOf(store.watching) : null,
+)
+
+/** 多画面下工具条作用的那一路：最近指针经过的，缺省第一路。 */
+const activeFeedId = ref<string | null>(null)
+const multiActiveId = computed<string | null>(() => {
+  const id = activeFeedId.value
+  if (id && feeds.value.some((f) => f.id === id)) return id
+  return feeds.value[0]?.id ?? null
+})
+
+/** 撤销 / 清空 / 删除选中作用的批注层 board id。 */
+const activeBoard = computed(() =>
+  effLayout.value === 'focus'
+    ? boardOf(store.watching ?? '')
+    : boardOf(multiActiveId.value ?? ''),
+)
+
+// —— 画面实例引用（选中数 / 删除选中要透传到对应那一路的 DrawLayer）——
+const tileRefs = shallowReactive(new Map<string, InstanceType<typeof ScreenTile>>())
+
+function setTileRef(id: string, el: unknown): void {
+  if (el) tileRefs.set(id, el as InstanceType<typeof ScreenTile>)
+  else tileRefs.delete(id)
+}
+
+const activeTileKey = computed(() =>
+  effLayout.value === 'focus' ? 'focus' : multiActiveId.value,
+)
+
+const selectedCount = computed(() =>
+  activeTileKey.value ? (tileRefs.get(activeTileKey.value)?.selectedCount ?? 0) : 0,
+)
+
+function deleteSelection(): void {
+  if (activeTileKey.value) tileRefs.get(activeTileKey.value)?.deleteSelection()
+}
+
+const hasAudio = computed(() => {
+  if (effLayout.value === 'focus') {
+    return store.watching !== 'self' && (activeStream.value?.getAudioTracks().length ?? 0) > 0
+  }
+  return feeds.value.some(
+    (f) => f.id !== 'self' && (store.remoteScreens.get(f.id)?.getAudioTracks().length ?? 0) > 0,
+  )
+})
+
+/** 工具条何时显示：焦点模式有画面 / 多画面至少一路已就绪。 */
+const toolsVisible = computed(() =>
+  effLayout.value === 'focus'
+    ? activeStream.value !== null
+    : feeds.value.some((f) => streamOf(f.id) !== null),
 )
 
 // —— 操作 ——
@@ -127,7 +146,20 @@ function clearAnno(): void {
   store.clearBoard(activeBoard.value)
 }
 
-const canShare = computed(() => store.capabilities.displayMedia && store.status === 'online')
+const canShare = computed(
+  () => store.capabilities.displayMedia && store.status === 'online' && store.screenReach.ok > 0,
+)
+
+/** 按钮禁用时的原因，避免用户点了没反应又不知为何。 */
+const shareHint = computed(() => {
+  if (!store.capabilities.displayMedia) return '当前浏览器不支持屏幕采集（需 https 且为桌面端）'
+  if (store.status !== 'online') return '请先连接设备'
+  if (store.screenReach.total === 0) return '还没有已连接的节点'
+  if (store.screenReach.ok === 0) {
+    return '已连接的节点都走服务器中继，该路径需要 WebCodecs 编码画面，当前浏览器不支持'
+  }
+  return ''
+})
 </script>
 
 <template>
@@ -155,96 +187,160 @@ const canShare = computed(() => store.capabilities.displayMedia && store.status 
             仅 {{ store.displayName(p.peerId) }}
           </option>
         </select>
-        <button class="primary sharebtn" :disabled="!canShare" @click="share">
+        <button
+          class="primary sharebtn"
+          :disabled="!canShare"
+          :title="shareHint"
+          @click="share"
+        >
           <AppIcon name="monitor" :size="15" /> 共享我的屏幕
         </button>
       </template>
     </header>
 
-    <div v-if="feeds.length > 1" class="tabs">
-      <button
-        v-for="f in feeds"
-        :key="f.id"
-        class="tab"
-        :class="{ on: store.watching === f.id }"
-        @click="store.watching = f.id"
-      >
-        {{ f.label }}
-        <span v-if="!f.live" class="pending">连接中</span>
-      </button>
+    <div v-if="feeds.length > 1" class="viewbar">
+      <div v-if="effLayout === 'focus'" class="tabs">
+        <button
+          v-for="f in feeds"
+          :key="f.id"
+          class="tab"
+          :class="{ on: store.watching === f.id }"
+          @click="store.watching = f.id"
+        >
+          {{ f.label }}
+          <span v-if="!f.live" class="pending">连接中</span>
+        </button>
+      </div>
+      <span v-else class="feedcount">{{ feeds.length }} 路画面</span>
+      <div class="layouts">
+        <button
+          class="lay"
+          :class="{ on: effLayout === 'focus' }"
+          title="单画面（页签切换）"
+          @click="layout = 'focus'"
+        >
+          <AppIcon name="layout-focus" :size="15" />
+        </button>
+        <button
+          class="lay"
+          :class="{ on: effLayout === 'split' }"
+          title="并列"
+          @click="layout = 'split'"
+        >
+          <AppIcon name="layout-split" :size="15" />
+        </button>
+        <button
+          class="lay"
+          :class="{ on: effLayout === 'grid' }"
+          title="平铺"
+          @click="layout = 'grid'"
+        >
+          <AppIcon name="layout-grid" :size="15" />
+        </button>
+      </div>
     </div>
 
-    <div ref="stageEl" class="stage">
-      <template v-if="activeStream">
-        <video
-          ref="videoEl"
-          autoplay
-          playsinline
-          :muted="store.watching === 'self' || muted"
-          @loadedmetadata="onVideoMeta"
-          @resize="onVideoMeta"
-        />
-        <DrawLayer
-          v-if="content.width > 0"
-          ref="layerRef"
-          class="overlay"
-          :style="{ left: `${content.left}px`, top: `${content.top}px` }"
+    <div class="stage" :class="{ multi: effLayout !== 'focus' }">
+      <template v-if="effLayout === 'focus'">
+        <ScreenTile
+          v-if="activeStream"
+          :ref="(el) => setTileRef('focus', el)"
+          class="focus-tile"
+          :stream="activeStream"
           :board="activeBoard"
           :tool="tool"
           :color="color"
           :size="size"
           :polyline-arrow="polylineArrow"
-          :width="content.width"
-          :height="content.height"
+          :muted="store.watching === 'self' || muted"
         />
-        <div class="tools">
-          <DrawToolbar
-            :tool="tool"
-            :color="color"
-            :size="size"
-            :polyline-arrow="polylineArrow"
-            :selected-count="selectedCount"
-            pointer-label="远程指针（点击可提示对方）"
-            @update:tool="setTool"
-            @update:color="color = $event"
-            @update:size="size = $event"
-            @update:polyline-arrow="polylineArrow = $event"
-            @undo="store.undoStroke(activeBoard)"
-            @clear="clearAnno"
-            @delete-selection="layerRef?.deleteSelection()"
-          >
-            <template v-if="hasAudio">
-              <span class="sep" />
-              <button
-                class="tool"
-                :title="muted ? '播放共享的声音' : '静音'"
-                @click="muted = !muted"
-              >
-                <AppIcon :name="muted ? 'volume-off' : 'volume'" :size="16" />
-              </button>
-            </template>
-          </DrawToolbar>
+
+        <div v-else-if="store.watching && store.watching !== 'self'" class="empty">
+          <AppIcon name="monitor" :size="36" />
+          <p>正在建立画面连接…</p>
+        </div>
+
+        <div v-else class="empty">
+          <AppIcon name="monitor" :size="36" />
+          <template v-if="store.status !== 'online' || store.connectedPeers.length === 0">
+            <p>先连接设备，再共享屏幕或观看对方画面。</p>
+            <button class="ghost" @click="store.setView('network')">去组网</button>
+          </template>
+          <template v-else>
+            <p>还没有人共享屏幕。</p>
+            <button v-if="canShare" class="primary" @click="share">
+              <AppIcon name="monitor" :size="15" /> 共享我的屏幕
+            </button>
+            <p v-else class="warn">当前浏览器不支持屏幕采集（移动端普遍不支持），但可以观看他人共享。</p>
+          </template>
         </div>
       </template>
 
-      <div v-else-if="store.watching && store.watching !== 'self'" class="empty">
-        <AppIcon name="monitor" :size="36" />
-        <p>正在建立画面连接…</p>
+      <div
+        v-else
+        class="tiles"
+        :style="{ gridTemplateColumns: `repeat(${tileCols}, minmax(0, 1fr))` }"
+      >
+        <div
+          v-for="f in feeds"
+          :key="f.id"
+          class="cell"
+          @pointerenter="activeFeedId = f.id"
+        >
+          <div class="cell-head">
+            <span class="dot" :class="{ live: f.live }" />
+            <span class="cell-label">{{ f.label }}</span>
+            <button class="cell-btn" title="放大到单画面" @click="focusFeed(f.id)">
+              <AppIcon name="expand" :size="13" />
+            </button>
+          </div>
+          <div class="cell-body">
+            <ScreenTile
+              v-if="streamOf(f.id)"
+              :ref="(el) => setTileRef(f.id, el)"
+              :stream="streamOf(f.id)!"
+              :board="boardOf(f.id)"
+              :tool="tool"
+              :color="color"
+              :size="size"
+              :polyline-arrow="polylineArrow"
+              :muted="f.id === 'self' || muted"
+            />
+            <div v-else class="cell-empty">
+              <AppIcon name="monitor" :size="22" />
+              <span>连接中…</span>
+            </div>
+          </div>
+        </div>
       </div>
 
-      <div v-else class="empty">
-        <AppIcon name="monitor" :size="36" />
-        <template v-if="store.status !== 'online' || store.connectedPeers.length === 0">
-          <p>先连接设备，再共享屏幕或观看对方画面。</p>
-          <button class="ghost" @click="store.setView('network')">去组网</button>
-        </template>
-        <template v-else>
-          <p>还没有人共享屏幕。</p>
-          <button v-if="canShare" class="primary" @click="share">
-            <AppIcon name="monitor" :size="15" /> 共享我的屏幕
-          </button>
-          <p v-else class="warn">当前浏览器不支持屏幕采集（移动端普遍不支持），但可以观看他人共享。</p>
-        </template>
+      <div v-if="toolsVisible" class="tools">
+        <DrawToolbar
+          :tool="tool"
+          :color="color"
+          :size="size"
+          :polyline-arrow="polylineArrow"
+          :selected-count="selectedCount"
+          pointer-label="远程指针（点击可提示对方）"
+          @update:tool="setTool"
+          @update:color="color = $event"
+          @update:size="size = $event"
+          @update:polyline-arrow="polylineArrow = $event"
+          @undo="store.undoStroke(activeBoard)"
+          @clear="clearAnno"
+          @delete-selection="deleteSelection"
+        >
+          <template v-if="hasAudio">
+            <span class="sep" />
+            <button
+              class="tool"
+              :title="muted ? '播放共享的声音' : '静音'"
+              @click="muted = !muted"
+            >
+              <AppIcon :name="muted ? 'volume-off' : 'volume'" :size="16" />
+            </button>
+          </template>
+        </DrawToolbar>
       </div>
     </div>
 
@@ -317,10 +413,58 @@ const canShare = computed(() => store.capabilities.displayMedia && store.status 
   color: #fff;
 }
 
+.viewbar {
+  display: flex;
+  align-items: flex-end;
+  gap: 12px;
+  padding: 10px 24px 0;
+}
+
 .tabs {
+  flex: 1;
   display: flex;
   gap: 8px;
-  padding: 10px 24px 0;
+  min-width: 0;
+  overflow-x: auto;
+}
+
+.feedcount {
+  flex: 1;
+  font-size: 12px;
+  color: var(--muted);
+  padding-bottom: 7px;
+}
+
+.layouts {
+  display: flex;
+  gap: 2px;
+  padding: 2px;
+  margin-bottom: 5px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+
+.lay {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 22px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  border-radius: 5px;
+  color: var(--muted);
+}
+
+.lay:hover {
+  color: var(--text);
+}
+
+.lay.on {
+  background: var(--panel);
+  color: var(--accent);
 }
 
 .tab {
@@ -333,6 +477,7 @@ const canShare = computed(() => store.capabilities.displayMedia && store.status 
   display: inline-flex;
   align-items: center;
   gap: 6px;
+  white-space: nowrap;
 }
 
 .tab.on {
@@ -357,21 +502,94 @@ const canShare = computed(() => store.capabilities.displayMedia && store.status 
   overflow: hidden;
 }
 
-.tabs + .stage {
+.viewbar + .stage {
   border-top-left-radius: 0;
 }
 
-.stage video {
+.focus-tile {
   position: absolute;
   inset: 0;
-  width: 100%;
-  height: 100%;
-  object-fit: contain;
 }
 
-.overlay {
+.tiles {
   position: absolute;
-  z-index: 2;
+  inset: 0;
+  display: grid;
+  grid-auto-rows: minmax(0, 1fr);
+  gap: 10px;
+  padding: 10px;
+}
+
+.cell {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  border: 1px solid rgb(255 255 255 / 14%);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+
+.cell-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  font-size: 12px;
+  color: #cfcbe0;
+  background: rgb(255 255 255 / 7%);
+}
+
+.dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--warn);
+  flex: none;
+}
+
+.dot.live {
+  background: #2ecc71;
+}
+
+.cell-label {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cell-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 3px;
+  border: none;
+  background: transparent;
+  color: inherit;
+  border-radius: 4px;
+}
+
+.cell-btn:hover {
+  background: rgb(255 255 255 / 12%);
+}
+
+.cell-body {
+  flex: 1;
+  min-height: 0;
+  position: relative;
+}
+
+.cell-empty {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  color: #8d88a8;
+  font-size: 12px;
 }
 
 .tools {

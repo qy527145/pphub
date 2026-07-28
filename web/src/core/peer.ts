@@ -51,6 +51,8 @@ type PeerEvents = {
   filechannel: { id: string; channel: ChannelLike }
   /** swarm 通道上到达的分块帧（4 字节 reqId + 负载）。 */
   chunk: ArrayBuffer
+  /** 中继路径上到达的屏幕编码包（见 screencodec.ts）。 */
+  screenpacket: ArrayBuffer
   /** 对端加入了媒体轨（屏幕共享等），streams[0] 为其所属流。 */
   track: { track: MediaStreamTrack; streams: readonly MediaStream[] }
   sas: Sas
@@ -281,6 +283,19 @@ export class Peer extends Emitter<PeerEvents> {
     return this.swarm?.readyState === 'open' ? this.swarm.bufferedAmount : 0
   }
 
+  /**
+   * 经中继发一个屏幕编码包。仅中继路径有效——WebRTC 路径用原生媒体轨
+   * （addTrack），画质与延迟都更好，没必要走自编码。
+   */
+  sendScreen(packet: ArrayBuffer): boolean {
+    return this.relay?.sendScreen(packet) ?? false
+  }
+
+  /** 中继是否已就绪到可以承载屏幕流（密钥协商完成）。 */
+  get relayReady(): boolean {
+    return this.relay?.ready ?? false
+  }
+
   get swarmReady(): boolean {
     if (this.relay) return this.relay.ready
     return this.swarm?.readyState === 'open'
@@ -297,8 +312,9 @@ export class Peer extends Emitter<PeerEvents> {
   /**
    * 降级到 WS 中继。幂等：超时、连接失败、对端先行降级三条路径都会调用。
    *
-   * 注意媒体轨（屏幕共享）无法经此路径传输——SRTP 由浏览器内部收发，
-   * JS 拿不到编码帧。降级后该对端只有聊天、白板、文件可用。
+   * WebRTC 的**媒体轨**仍然过不去（SRTP 由浏览器内部收发，JS 拿不到编码帧），
+   * 但屏幕共享另有一条路：mesh 会改用 WebCodecs 自行编码，编码字节经本通道的
+   * KIND_SCREEN 转发（见 screencodec.ts）。代价是只有视频没有音频。
    */
   private enableRelay(reason: string): void {
     if (this.relay || this.closed) return
@@ -330,6 +346,7 @@ export class Peer extends Emitter<PeerEvents> {
     })
     relay.onControl = (msg) => this.emit('control', msg as ControlMessage)
     relay.onChunk = (data) => this.emit('chunk', data)
+    relay.onScreen = (packet) => this.emit('screenpacket', packet)
     relay.onFileChannel = (ev) => this.emit('filechannel', ev)
     relay.onSas = (sas) => {
       this.sasDone = true
