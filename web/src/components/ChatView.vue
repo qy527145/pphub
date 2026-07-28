@@ -3,7 +3,7 @@
 // 私聊经 control 通道只发给对方；群聊广播给全网。
 import { computed, nextTick, ref, watch } from 'vue'
 import { useRoomStore } from '@/stores/room'
-import { fmtTime } from '@/utils/format'
+import { fmtBytes, fmtTime } from '@/utils/format'
 import AppIcon from './AppIcon.vue'
 import PeerAvatar from './PeerAvatar.vue'
 
@@ -12,6 +12,7 @@ const store = useRoomStore()
 const draft = ref('')
 const logEl = ref<HTMLElement | null>(null)
 const copiedId = ref<number | null>(null)
+const fileInput = ref<HTMLInputElement | null>(null)
 
 const channelMessages = computed(() =>
   store.messages.filter((m) => m.channel === store.activeChannel),
@@ -51,6 +52,20 @@ async function sendClipboard() {
   } catch {
     store.lastError = '无法读取剪贴板（需 https 且授予权限）'
   }
+}
+
+function pickFile() {
+  fileInput.value?.click()
+}
+
+function onFilePicked(ev: Event) {
+  const input = ev.target as HTMLInputElement
+  if (!input.files?.length) return
+  const files = [...input.files]
+  // 懒发送：挂共享，对方在接收页下载；scope 跟随当前频道（私聊=单播，群聊=广播）。
+  const target = store.activeChannel === 'all' ? 'all' : store.activeChannel
+  store.shareFiles(files, target)
+  input.value = ''
 }
 
 async function copyMessage(id: number, text: string) {
@@ -138,7 +153,24 @@ function pickChannel(ch: 'all' | string) {
             <span class="who">{{ msg.fromNick }}</span>
             <span class="time">{{ fmtTime(msg.ts) }}</span>
           </div>
-          <div class="bubble-row">
+          <!-- 文件卡片 -->
+          <div v-if="msg.file" class="bubble file-card" :class="{ 'mine-bubble': msg.self }">
+            <AppIcon name="file" :size="20" />
+            <div class="fc-info">
+              <span class="fc-name">{{ msg.file.name }}</span>
+              <span class="fc-size">{{ fmtBytes(msg.file.size) }}</span>
+            </div>
+            <button
+              v-if="!msg.self"
+              class="ghost fc-dl"
+              title="下载"
+              @click="store.downloadShare(msg.file.fileId)"
+            >
+              <AppIcon name="download" :size="15" />
+            </button>
+          </div>
+          <!-- 普通文本气泡 -->
+          <div v-else class="bubble-row">
             <div class="bubble">{{ msg.text }}</div>
             <button
               class="copy"
@@ -160,6 +192,15 @@ function pickChannel(ch: 'all' | string) {
         >
           <AppIcon name="clipboard" :size="18" />
         </button>
+        <button
+          class="ghost clip"
+          title="发送文件（懒发送，对方在接收页下载）"
+          :disabled="!channelReachable"
+          @click="pickFile"
+        >
+          <AppIcon name="upload" :size="18" />
+        </button>
+        <input ref="fileInput" type="file" multiple hidden @change="onFilePicked" />
         <input
           v-model="draft"
           :placeholder="channelReachable ? '输入消息或粘贴长文本，回车发送…' : '对方不可达，暂不能发送'"
@@ -354,6 +395,61 @@ function pickChannel(ch: 'all' | string) {
   white-space: pre-wrap;
   word-break: break-word;
   box-shadow: var(--shadow-soft);
+}
+
+.file-card {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 13px;
+  border-radius: 12px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow-soft);
+  min-width: 200px;
+  max-width: 280px;
+  color: var(--accent);
+}
+
+.file-card.mine-bubble {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--on-accent);
+}
+
+.fc-info {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.fc-name {
+  font-weight: 600;
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+}
+
+.file-card.mine-bubble .fc-name {
+  color: var(--on-accent);
+}
+
+.fc-size {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.file-card.mine-bubble .fc-size {
+  color: color-mix(in srgb, var(--on-accent) 70%, transparent);
+}
+
+.fc-dl {
+  padding: 4px 6px;
+  flex: none;
 }
 
 .msg .bubble {

@@ -72,6 +72,8 @@ export interface ChatEntry {
   ts: number
   self: boolean
   channel: ChatChannel
+  /** 文件卡片（消息中发文件时附带）。 */
+  file?: { fileId: string; name: string; size: number }
 }
 
 export interface Transfer {
@@ -461,7 +463,18 @@ export const useRoomStore = defineStore('room', () => {
     m.on('share-added', ({ peerId, file }) => {
       registerShare(file, false)
       if (activeView.value !== 'receive') unseenRecv.value++
-      void peerId
+      // 在对应频道插入文件卡片（私有共享 → 私聊频道；广播 → 群聊频道）。
+      const channel: ChatChannel = file.scope === 'direct' ? peerId : 'all'
+      pushMessage({
+        from: peerId,
+        fromNick: displayName(peerId),
+        text: '',
+        ts: file.ts,
+        self: false,
+        channel,
+        file: { fileId: file.fileId, name: file.name, size: file.size },
+      })
+      bumpUnread(channel)
     })
     m.on('share-removed', ({ fileId }) => {
       const item = shares.get(fileId)
@@ -1010,6 +1023,17 @@ export const useRoomStore = defineStore('room', () => {
       )
       const item = registerShare(meta, true)
       item.state = 'idle'
+      // 在对应频道插入文件卡片消息（自己发的）。
+      const channel: ChatChannel = target === 'all' ? 'all' : target
+      pushMessage({
+        from: myId.value,
+        fromNick: myProfile.value.nick || '我',
+        text: '',
+        ts: meta.ts,
+        self: true,
+        channel,
+        file: { fileId: meta.fileId, name: meta.name, size: meta.size },
+      })
     }
   }
 

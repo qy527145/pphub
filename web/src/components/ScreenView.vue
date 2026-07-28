@@ -101,8 +101,14 @@ watch(
 )
 
 // —— 操作 ——
+/** 共享目标：all=全网，否则为指定对端 peerId。 */
+const shareTarget = ref<'all' | string>('all')
+
 async function share(): Promise<void> {
-  const ok = await store.startShare()
+  const ok = await store.startShare(
+    shareTarget.value === 'all' ? 'all' : 'direct',
+    shareTarget.value === 'all' ? undefined : shareTarget.value,
+  )
   if (ok) store.watching = 'self'
 }
 
@@ -131,9 +137,17 @@ const canShare = computed(() => store.capabilities.displayMedia && store.status 
       <button v-if="store.sharing" class="danger-btn" @click="store.stopShare()">
         <AppIcon name="stop-circle" :size="15" /> 停止共享
       </button>
-      <button v-else class="primary sharebtn" :disabled="!canShare" @click="share">
-        <AppIcon name="monitor" :size="15" /> 共享我的屏幕
-      </button>
+      <template v-else>
+        <select v-if="store.connectedPeers.length > 0" v-model="shareTarget" class="target-sel">
+          <option value="all">全网广播</option>
+          <option v-for="p in store.connectedPeers" :key="p.peerId" :value="p.peerId">
+            仅 {{ store.displayName(p.peerId) }}
+          </option>
+        </select>
+        <button class="primary sharebtn" :disabled="!canShare" @click="share">
+          <AppIcon name="monitor" :size="15" /> 共享我的屏幕
+        </button>
+      </template>
     </header>
 
     <div v-if="feeds.length > 1" class="tabs">
@@ -258,6 +272,17 @@ const canShare = computed(() => store.capabilities.displayMedia && store.status 
   display: inline-flex;
   align-items: center;
   gap: 6px;
+}
+
+.target-sel {
+  font: inherit;
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 7px 10px;
+  font-size: 13px;
+  cursor: pointer;
 }
 
 .danger-btn {

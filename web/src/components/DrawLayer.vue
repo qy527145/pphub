@@ -6,7 +6,7 @@
 //   3) 渲染远程成员光标与点击涟漪。
 // 坐标一律归一化到本层尺寸（父组件保证本层与内容区对齐）。
 
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { useRoomStore } from '@/stores/room'
 import { renderStrokes } from '@/core/draw'
 import type { DrawMode } from '@/core/messages'
@@ -119,6 +119,10 @@ onBeforeUnmount(() => {
 })
 
 // —— 远程光标 / 点击涟漪 ——
+/** 每个远端节点的最近轨迹点（最多保留 TRAIL_LEN 个）。 */
+const TRAIL_LEN = 18
+const trails = reactive(new Map<string, { x: number; y: number }[]>())
+
 const remotePointers = computed(() => {
   const prefix = `${props.board}|`
   const out: { key: string; x: number; y: number; color: string; nick: string }[] = []
@@ -133,6 +137,19 @@ const remotePointers = computed(() => {
     })
   }
   return out
+})
+
+watch(remotePointers, (cur) => {
+  for (const p of cur) {
+    const pts = trails.get(p.key) ?? []
+    pts.push({ x: p.x, y: p.y })
+    if (pts.length > TRAIL_LEN) pts.splice(0, pts.length - TRAIL_LEN)
+    trails.set(p.key, pts)
+  }
+  // 清理已离开的光标。
+  for (const key of trails.keys()) {
+    if (!cur.some((p) => p.key === key)) trails.delete(key)
+  }
 })
 
 const boardClicks = computed(() => store.clicks.filter((c) => c.board === props.board))
@@ -154,6 +171,24 @@ const cursorStyle = computed(() =>
     @pointerleave="onPointerLeave"
   >
     <canvas ref="canvasEl" class="strokes" :style="{ width: `${width}px`, height: `${height}px` }" />
+
+    <!-- 远端鼠标轨迹尾迹（SVG 渐隐线段） -->
+    <svg class="trail-layer" :style="{ width: `${width}px`, height: `${height}px` }">
+      <template v-for="p in remotePointers" :key="p.key + '-trail'">
+        <line
+          v-for="(pt, i) in (trails.get(p.key) ?? []).slice(0, -1)"
+          :key="i"
+          :x1="pt.x * width"
+          :y1="pt.y * height"
+          :x2="(trails.get(p.key)![i + 1].x) * width"
+          :y2="(trails.get(p.key)![i + 1].y) * height"
+          :stroke="p.color"
+          :stroke-width="2.5"
+          :stroke-opacity="(i + 1) / TRAIL_LEN * 0.7"
+          stroke-linecap="round"
+        />
+      </template>
+    </svg>
 
     <div
       v-for="p in remotePointers"
@@ -188,6 +223,13 @@ const cursorStyle = computed(() =>
   position: absolute;
   inset: 0;
   pointer-events: none;
+}
+
+.trail-layer {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  overflow: visible;
 }
 
 .cursor {
