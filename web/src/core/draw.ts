@@ -34,6 +34,8 @@ export function renderStrokes(
       drawStroke(ctx, item as WbStroke, w, h)
     } else if (item.mode === 'line' || item.mode === 'arrow') {
       drawLine(ctx, item as WbLine, w, h)
+    } else if (item.mode === 'rect' || item.mode === 'ellipse') {
+      drawShape(ctx, item as WbLine, w, h)
     } else if (item.mode === 'polyline') {
       drawPolyline(ctx, item as WbPolyline, w, h)
     } else if (item.mode === 'text') {
@@ -122,6 +124,32 @@ export function drawLine(
     ctx.fill()
   }
 
+  ctx.restore()
+}
+
+/** 画矩形/椭圆框线（两角点定界，不填充）。 */
+export function drawShape(
+  ctx: CanvasRenderingContext2D,
+  shape: WbLine,
+  w: number,
+  h: number,
+): void {
+  const r = normalizeRect(shape)
+  const x = r.x1 * w
+  const y = r.y1 * h
+  const rw = (r.x2 - r.x1) * w
+  const rh = (r.y2 - r.y1) * h
+  ctx.save()
+  ctx.strokeStyle = shape.color
+  ctx.lineWidth = Math.max(1, (shape.size * w) / LOGICAL_WIDTH)
+  ctx.lineJoin = 'round'
+  ctx.beginPath()
+  if (shape.mode === 'rect') {
+    ctx.rect(x, y, rw, rh)
+  } else {
+    ctx.ellipse(x + rw / 2, y + rh / 2, rw / 2, rh / 2, 0, 0, Math.PI * 2)
+  }
+  ctx.stroke()
   ctx.restore()
 }
 
@@ -257,7 +285,12 @@ export function itemBounds(item: WbItem, aspect = 1): NormRect {
     }
     return { x1, y1, x2, y2 }
   }
-  if (item.mode === 'line' || item.mode === 'arrow') {
+  if (
+    item.mode === 'line' ||
+    item.mode === 'arrow' ||
+    item.mode === 'rect' ||
+    item.mode === 'ellipse'
+  ) {
     return normalizeRect(item)
   }
   if (item.mode === 'image') {
@@ -331,6 +364,31 @@ export function itemHitByCircle(
   }
   if (item.mode === 'line' || item.mode === 'arrow') {
     return distToSegment(px, py, item.x1, item.y1, item.x2, item.y2, aspect) <= radius
+  }
+  if (item.mode === 'rect') {
+    // 只命中框线：逐条边算距离，避免擦到框内的其他元素时误删矩形
+    const r = normalizeRect(item)
+    return (
+      distToSegment(px, py, r.x1, r.y1, r.x2, r.y1, aspect) <= radius ||
+      distToSegment(px, py, r.x2, r.y1, r.x2, r.y2, aspect) <= radius ||
+      distToSegment(px, py, r.x2, r.y2, r.x1, r.y2, aspect) <= radius ||
+      distToSegment(px, py, r.x1, r.y2, r.x1, r.y1, aspect) <= radius
+    )
+  }
+  if (item.mode === 'ellipse') {
+    // 只命中轮廓：在 aspect 折算后的尺度里沿圆心射线近似到轮廓的距离
+    const r = normalizeRect(item)
+    const cx = (r.x1 + r.x2) / 2
+    const cy = ((r.y1 + r.y2) / 2) * aspect
+    const rx = (r.x2 - r.x1) / 2
+    const ry = ((r.y2 - r.y1) / 2) * aspect
+    if (rx <= 0 || ry <= 0) return Math.hypot(px - cx, py * aspect - cy) <= radius
+    const dx = px - cx
+    const dy = py * aspect - cy
+    const t = Math.sqrt((dx / rx) ** 2 + (dy / ry) ** 2)
+    if (t === 0) return Math.min(rx, ry) <= radius
+    const len = Math.hypot(dx, dy)
+    return Math.abs(len - len / t) <= radius
   }
   // 文本 / 图片：按包围盒膨胀 radius 判定
   const b = itemBounds(item, aspect)

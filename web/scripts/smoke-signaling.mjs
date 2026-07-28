@@ -3,6 +3,11 @@
 
 const URL = process.env.PPHUB_WS ?? 'ws://127.0.0.1:8090/ws'
 const ROOM = 'smoke-' + Math.random().toString(36).slice(2, 7)
+// 被测服务器是否以 --stun-turn 启动。默认（不加）为单端口模式：不该有任何
+// ICE 服务器，跨网连通完全交给 WS 应用层中继（见 smoke-relay.mjs）。
+const STUN_TURN = ['1', 'true', 'yes', 'on'].includes(
+  (process.env.PPHUB_STUN_TURN ?? '').toLowerCase(),
+)
 
 function open(name) {
   return new Promise((resolve, reject) => {
@@ -43,11 +48,16 @@ const b = await open('B')
 send(a, { t: 'turn-creds' })
 const creds = await waitFor(a, (m) => m.t === 'turn-creds')
 // 内置 STUN/TURN 经 builtin 字段下发（端口+临时凭证）；外部 iceServers 列表可为空。
-check(
-  (creds.builtin && creds.builtin.udpPort > 0 && !!creds.builtin.credential) ||
-    (Array.isArray(creds.iceServers) && creds.iceServers.length > 0),
-  'A 收到可用的 ICE 服务器（内置或外部）',
-)
+if (STUN_TURN) {
+  check(
+    (creds.builtin && creds.builtin.udpPort > 0 && !!creds.builtin.credential) ||
+      (Array.isArray(creds.iceServers) && creds.iceServers.length > 0),
+    'A 收到可用的 ICE 服务器（内置或外部）',
+  )
+} else {
+  check(!creds.builtin, '默认单端口模式下不下发内置 STUN/TURN')
+  check(creds.iceServers.length === 0, '默认单端口模式下 ICE 服务器列表为空')
+}
 check(!JSON.stringify(creds).includes('PPHUB_TURN_SECRET'), 'ICE 凭证不含明文密钥名')
 
 send(a, { t: 'join', room: ROOM, peerId: 'peer-a', nick: 'Alice' })

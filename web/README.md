@@ -40,22 +40,22 @@ src/
 ```bash
 npm install
 npm run build                 # 产出 web/dist，会被 cargo 嵌入
-cargo run -- -p 8089          # 在仓库根目录执行
+cargo run -- -p 8848          # 在仓库根目录执行
 ```
 
-打开 `http://localhost:8089`，两个标签页填**相同房间名**即可端到端聊天。
+打开 `http://localhost:8848`，两个标签页填**相同房间名**即可端到端聊天。
 
 **方式二：前端热更新（开发）**
 
 ```bash
-# 终端 1（仓库根目录）：信令服务器，默认 0.0.0.0:8080
+# 终端 1（仓库根目录）：信令服务器，默认 0.0.0.0:8848
 cargo run
 
 # 终端 2：Vite 开发服务器，http://localhost:5173
 cd web && npm install && npm run dev
 ```
 
-Vite 已把 `/ws` 代理到 `ws://localhost:8080`，因此前端始终用同源 `ws://<host>/ws`，
+Vite 已把 `/ws` 代理到 `ws://localhost:8848`，因此前端始终用同源 `ws://<host>/ws`，
 与一体化部署一致；也可用 `.env` 里的 `VITE_SIGNALING_URL` 覆盖。
 
 > WebRTC 与 SAS 指纹校验依赖「安全上下文」。`localhost` 天然算安全上下文；
@@ -63,14 +63,21 @@ Vite 已把 `/ws` 代理到 `ws://localhost:8080`，因此前端始终用同源 
 
 ## 脚本
 
-- `npm run dev` —— 开发服务器（/ws 代理到 8080）
+- `npm run dev` —— 开发服务器（/ws 代理到 8848）
 - `npm run build` —— 类型检查（vue-tsc）+ 生产构建（产出 web/dist）
 - `npm run typecheck` —— 仅类型检查
 - `node scripts/smoke-signaling.mjs` —— 信令协议端到端冒烟测试。默认连 `ws://127.0.0.1:8090/ws`，
-  可用 `PPHUB_WS=ws://127.0.0.1:8089/ws node scripts/smoke-signaling.mjs` 指向任意实例
+  可用 `PPHUB_WS=ws://127.0.0.1:8848/ws node scripts/smoke-signaling.mjs` 指向任意实例；
+  被测服务器若以 `--stun-turn` 启动，需同时设 `PPHUB_STUN_TURN=1` 以断言下发了 ICE 服务器
+- `node scripts/smoke-relay.mjs` —— WS 应用层中继的线格式冒烟测试（帧头改写、
+  载荷透传、非法帧与超限帧丢弃）。同样用 `PPHUB_WS` 指向实例
 - `node scripts/e2e-media.mjs` —— 屏幕共享/批注/白板三端 E2E（需先 `cargo build` +
   `npm run build`；用 playwright-core 驱动本机缓存的 Chromium，`getDisplayMedia` 以
   canvas 假流注入，WebRTC 协商与媒体轨/DataChannel 全走真实路径）
+- `node scripts/e2e-network.mjs` —— 网络视图/名片/单播广播/多源下载/私有白板三端 E2E
+- `node scripts/e2e-relay.mjs` —— 单端口降级路径 E2E：服务器按默认方式启动
+  （不加 `--stun-turn`，只监听 HTTP 端口），浏览器打开 `pphub:force:relay`
+  跳过 WebRTC，验证中继下的 SAS 一致性、聊天、白板、文件与分块下载
 
 ## 安全模型（务必理解）
 

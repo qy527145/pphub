@@ -1,7 +1,8 @@
 // 信令 WebSocket 客户端。
 //
-// 职责边界（安全约束）：只负责与信令服务器交换 SDP/ICE 与领取 TURN 凭证，
-// 绝不承载任何业务数据（聊天、文件、媒体都走 P2P 数据/媒体通道）。
+// 职责边界（安全约束）：文本帧只承载 SDP/ICE 与 TURN 凭证；二进制帧是
+// WS 中继（fallback）载荷，已由 relay-transport.ts 端到端加密，服务器与
+// 本模块都不解析其内容，只按帧头的 peerId 路由。
 
 import { Emitter } from './emitter'
 import type {
@@ -28,6 +29,8 @@ type SignalingEvents = {
   'peer-join': PeerInfo
   'peer-left': string
   signal: { from: string; data: SignalData }
+  /** WS 中继二进制帧（帧头 peerId 已被服务器改写为来源）。 */
+  relay: ArrayBuffer
   error: { code: string; msg: string }
 }
 
@@ -74,6 +77,7 @@ export class Signaling extends Emitter<SignalingEvents> {
       return
     }
     this.ws = ws
+    ws.binaryType = 'arraybuffer'
 
     ws.onopen = () => {
       this.reconnectAttempts = 0
@@ -81,6 +85,10 @@ export class Signaling extends Emitter<SignalingEvents> {
     }
 
     ws.onmessage = (ev) => {
+      if (ev.data instanceof ArrayBuffer) {
+        this.emit('relay', ev.data)
+        return
+      }
       let msg: ServerMsg
       try {
         msg = JSON.parse(ev.data as string) as ServerMsg
@@ -146,6 +154,23 @@ export class Signaling extends Emitter<SignalingEvents> {
     if (this.ws && this._state === 'open') {
       this.ws.send(JSON.stringify(msg))
     }
+  }
+
+  /** 发一帧 WS 中继数据（调用方已封好帧头并加密）。 */
+  sendRelay(frame: ArrayBuffer): void {
+    if (this.ws && this._state === 'open') {
+      this.ws.send(frame)
+    }
+  }
+
+  /**
+   * 底层 WebSocket 的发送积压字节数。
+   *
+   * 中继路径没有 RTCDataChannel 的 bufferedAmount 可用，文件传输的背压
+   * 就靠这个值：服务器投递不动时会停止读取，TCP 窗口收紧，积压在此显现。
+   */
+  get bufferedAmount(): number {
+    return this.ws?.bufferedAmount ?? 0
   }
 
   /** 领取 TURN/STUN 凭证；返回在收到服务端 turn-creds 时兑现的 Promise。 */

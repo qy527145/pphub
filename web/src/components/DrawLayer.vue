@@ -95,7 +95,13 @@ function onPointerDown(ev: PointerEvent): void {
     return
   }
 
-  if (props.tool === 'line' || props.tool === 'arrow' || props.tool === 'select') {
+  if (
+    props.tool === 'line' ||
+    props.tool === 'arrow' ||
+    props.tool === 'rect' ||
+    props.tool === 'ellipse' ||
+    props.tool === 'select'
+  ) {
     shapeStart = p
     previewShape.value = { x1: p.x, y1: p.y, x2: p.x, y2: p.y }
     return
@@ -272,7 +278,7 @@ function onPointerUp(): void {
     } else {
       store.addLine(
         props.board,
-        props.tool as 'line' | 'arrow',
+        props.tool as 'line' | 'arrow' | 'rect' | 'ellipse',
         props.color,
         props.size,
         box.x1,
@@ -560,6 +566,36 @@ function getArrowPoints(): string {
           opacity="0.5"
         />
       </template>
+    </svg>
+
+    <!-- 矩形/椭圆预览 -->
+    <svg
+      v-if="previewShape && (tool === 'rect' || tool === 'ellipse')"
+      class="preview-layer"
+      :style="{ width: `${width}px`, height: `${height}px` }"
+    >
+      <rect
+        v-if="tool === 'rect'"
+        :x="Math.min(previewShape.x1, previewShape.x2) * width"
+        :y="Math.min(previewShape.y1, previewShape.y2) * height"
+        :width="Math.abs(previewShape.x2 - previewShape.x1) * width"
+        :height="Math.abs(previewShape.y2 - previewShape.y1) * height"
+        fill="none"
+        :stroke="color"
+        :stroke-width="Math.max(1, (size * width) / 1280)"
+        stroke-dasharray="5,5"
+      />
+      <ellipse
+        v-else
+        :cx="((previewShape.x1 + previewShape.x2) / 2) * width"
+        :cy="((previewShape.y1 + previewShape.y2) / 2) * height"
+        :rx="(Math.abs(previewShape.x2 - previewShape.x1) / 2) * width"
+        :ry="(Math.abs(previewShape.y2 - previewShape.y1) / 2) * height"
+        fill="none"
+        :stroke="color"
+        :stroke-width="Math.max(1, (size * width) / 1280)"
+        stroke-dasharray="5,5"
+      />
     </svg>
 
     <!-- 远端鼠标轨迹尾迹（SVG 渐隐线段） -->

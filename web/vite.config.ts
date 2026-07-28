@@ -14,11 +14,11 @@ export default defineConfig({
   server: {
     port: 5173,
     host: true,
-    // 开发期把 /ws 代理到本地信令服务器（cargo run -- -p 8080），
+    // 开发期把 /ws 代理到本地信令服务器（cargo run -- -p 8848），
     // 使前端可用同源 ws://<host>/ws，与嵌入式生产部署保持一致。
     proxy: {
       '/ws': {
-        target: 'ws://localhost:8080',
+        target: 'ws://localhost:8848',
         ws: true,
       },
     },

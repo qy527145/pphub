@@ -8,7 +8,7 @@
 // 落盘策略（MVP）：内存累积 Blob 后导出——桌面 ≤1GB 可用；流式落盘
 // (FSA/OPFS) 见 ARCHITECTURE 6.1，后续增强。
 
-import { BUFFERED_HIGH, BUFFERED_LOW, CHUNK_SIZE, waitForFlush } from './channels'
+import { BUFFERED_HIGH, BUFFERED_LOW, CHUNK_SIZE, type ChannelLike, waitForFlush } from './channels'
 import type { FileOffer } from './messages'
 import type { Peer } from './peer'
 
@@ -87,7 +87,7 @@ export interface ReceiveHandle {
 
 /** 在对端新开的 file-<id> 通道上接收文件。 */
 export function receiveFile(
-  channel: RTCDataChannel,
+  channel: ChannelLike,
   offer: FileOffer,
   cb: ReceiveCallbacks,
 ): ReceiveHandle {
@@ -139,7 +139,7 @@ export function receiveFile(
   }
 }
 
-function waitOpen(channel: RTCDataChannel): Promise<void> {
+function waitOpen(channel: ChannelLike): Promise<void> {
   if (channel.readyState === 'open') return Promise.resolve()
   return new Promise((resolve, reject) => {
     channel.onopen = () => resolve()
@@ -153,7 +153,7 @@ function waitOpen(channel: RTCDataChannel): Promise<void> {
  * 主路径靠 bufferedamountlow 事件；辅以低频轮询兜底，
  * 避免对端中途关闭通道导致事件永不触发而挂起。
  */
-function waitDrainOrDead(channel: RTCDataChannel, isCanceled: () => boolean): Promise<void> {
+function waitDrainOrDead(channel: ChannelLike, isCanceled: () => boolean): Promise<void> {
   if (channel.bufferedAmount <= BUFFERED_HIGH) return Promise.resolve()
   return new Promise((resolve) => {
     channel.bufferedAmountLowThreshold = BUFFERED_LOW

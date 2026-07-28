@@ -141,6 +141,26 @@ function hasStyleControls(tool: 'pointer' | DrawMode): boolean {
     </button>
     <button
       class="tool"
+      :class="{ on: tool === 'rect' }"
+      title="矩形"
+      @click="emit('update:tool', 'rect')"
+    >
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor">
+        <rect x="2.5" y="3.5" width="11" height="9" stroke-width="1.8" rx="1" />
+      </svg>
+    </button>
+    <button
+      class="tool"
+      :class="{ on: tool === 'ellipse' }"
+      title="椭圆"
+      @click="emit('update:tool', 'ellipse')"
+    >
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor">
+        <ellipse cx="8" cy="8" rx="5.5" ry="4.5" stroke-width="1.8" />
+      </svg>
+    </button>
+    <button
+      class="tool"
       :class="{ on: tool === 'text' }"
       title="文本"
       @click="emit('update:tool', 'text')"

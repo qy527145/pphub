@@ -50,13 +50,15 @@ export interface SharedFileMeta {
   scope: SendScope
 }
 
-/** 画笔模式：普通笔、橡皮、直线、箭头、折线、文本、图片、框选。 */
+/** 画笔模式：普通笔、橡皮、直线、箭头、折线、矩形、椭圆、文本、图片、框选。 */
 export type DrawMode =
   | 'pen'
   | 'eraser'
   | 'line'
   | 'arrow'
   | 'polyline'
+  | 'rect'
+  | 'ellipse'
   | 'text'
   | 'image'
   | 'select'
@@ -81,10 +83,10 @@ export interface WbStroke extends WbElement {
 }
 
 /**
- * 直线/箭头元素。
+ * 两角点形状元素：直线/箭头按端点连线，矩形/椭圆按对角框线。
  */
 export interface WbLine extends WbElement {
-  mode: 'line' | 'arrow'
+  mode: 'line' | 'arrow' | 'rect' | 'ellipse'
   size: number
   x1: number
   y1: number
@@ -175,8 +177,8 @@ export type ControlMessage =
   /** 追加一批采样点（扁平化 x,y 序列，发送端按 ~25fps 批量）。 */
   | { kind: 'draw-points'; board: BoardId; id: string; pts: number[] }
   | { kind: 'draw-end'; board: BoardId; id: string }
-  /** 添加直线/箭头元素。 */
-  | { kind: 'draw-line'; board: BoardId; id: string; color: string; size: number; mode: 'line' | 'arrow'; x1: number; y1: number; x2: number; y2: number }
+  /** 添加两角点形状元素（直线/箭头/矩形/椭圆）。 */
+  | { kind: 'draw-line'; board: BoardId; id: string; color: string; size: number; mode: 'line' | 'arrow' | 'rect' | 'ellipse'; x1: number; y1: number; x2: number; y2: number }
   /** 添加折线元素。 */
   | { kind: 'draw-polyline'; board: BoardId; id: string; color: string; size: number; points: number[]; arrow?: boolean }
   /** 添加文本元素。 */

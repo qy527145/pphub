@@ -127,7 +127,7 @@ pphub/
     └── ARCHITECTURE.md        # 本文
 ```
 
-> 运行：`cargo run -- -p 8089`（默认 `-H 0.0.0.0 -p 8080`）。前端改动后需
+> 运行：`cargo run -- -p 8848`（默认 `-H 0.0.0.0 -p 8848`）。前端改动后需
 > `npm --prefix web run build` 重新产出 `web/dist` 再编译。
 
 ---
@@ -336,7 +336,7 @@ control 通道传 `{t:"chat", from, ts, text|html|imgBlobRef}`；图片/文件�
 
 ### 1a 落地记录（2026-07-27）
 
-- **后端** 单 crate `pphub`（`src/`）：axum 0.8 + tokio，前端经 `rust-embed` 编译期嵌入、同端口托管。CLI 用 clap（`-H/--host` 默认 `0.0.0.0`、`-p/--port` 默认 `8080`）。房间注册表为 `Mutex<HashMap>` + 非阻塞 `try_send`（不跨 await 持锁）；`/ws` 走 WebSocket，`/healthz` 健康检查，其余路径回退到嵌入的前端；`turn.rs` 以 coturn `use-auth-secret` 模式签发 HMAC-SHA1 临时凭证，共享密钥仅存服务端。
+- **后端** 单 crate `pphub`（`src/`）：axum 0.8 + tokio，前端经 `rust-embed` 编译期嵌入、同端口托管。CLI 用 clap（`-H/--host` 默认 `0.0.0.0`、`-p/--port` 默认 `8848`）。房间注册表为 `Mutex<HashMap>` + 非阻塞 `try_send`（不跨 await 持锁）；`/ws` 走 WebSocket，`/healthz` 健康检查，其余路径回退到嵌入的前端；`turn.rs` 以 coturn `use-auth-secret` 模式签发 HMAC-SHA1 临时凭证，共享密钥仅存服务端。
 - **前端** `web/`：Vue 3 + TS + Vite。`core/` 为与 UI 解耦的 P2P 底座（signaling / peer / mesh / security(SAS) / channels / capabilities）；Pinia store 把 Mesh 事件映射为响应式 UI；`LobbyView` + `RoomView` 打通进房、成员列表、SAS 带外校对、端到端文本聊天。
 - **验证**：`vue-tsc` 类型检查 + `vite build` 通过；`web/scripts/smoke-signaling.mjs` 双客户端冒烟测试 10 项全过（joined / peer-join / signal 透传 / peer-left，且 TURN 密钥不外泄）。
 - **工具链留坑**：TypeScript 7（Go 原生编译器）移除了 `./lib/tsc` 子路径导出，当前 `vue-tsc@3.3.8` 不兼容，已固定 `typescript@~5.9.3`；待 vue-tsc 支持 TS7 后再升。

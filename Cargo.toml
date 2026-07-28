@@ -22,10 +22,11 @@ tower-http = { version = "0.6", features = ["cors", "trace"] }
 clap = { version = "4", features = ["derive", "env"] }
 rust-embed = { version = "8", features = ["mime-guess"] }
 mime_guess = "2"
-# 内置 STUN/TURN 服务器（同一 UDP 端口同时应答 Binding 与 Allocate）
+# 内置 STUN/TURN 服务器（UDP 打洞 + TURN over TCP 中继）
 turn = "0.17"
 getrandom = "0.2"
 webrtc-util = "0.17"
+async-trait = "0.1"
 
 [profile.release]
 opt-level = 3

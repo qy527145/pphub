@@ -4,6 +4,7 @@ import { defineStore } from 'pinia'
 import { peerColor } from '@/core/draw'
 import { Mesh } from '@/core/mesh'
 import type { DrawMessage } from '@/core/mesh'
+import type { PeerTransport } from '@/core/peer'
 import type {
   Avatar,
   Profile,
@@ -38,6 +39,8 @@ export interface Member {
   peerId: string
   nick?: string
   state: RTCPeerConnectionState | 'new'
+  /** 实际通路：'relay' 表示 WebRTC 打不通、数据经服务器中继（屏幕共享不可用）。 */
+  transport: PeerTransport
   sas?: Sas
   /** 用户已带外核对 SAS 一致。 */
   verified: boolean
@@ -368,7 +371,13 @@ export const useRoomStore = defineStore('room', () => {
       myId.value = id
     })
     m.on('peer-added', ({ peerId, nick: n }) => {
-      members.set(peerId, { peerId, nick: n, state: 'new', verified: false })
+      members.set(peerId, {
+        peerId,
+        nick: n,
+        state: 'new',
+        transport: 'webrtc',
+        verified: false,
+      })
     })
     m.on('peer-removed', (peerId) => {
       members.delete(peerId)
@@ -381,6 +390,10 @@ export const useRoomStore = defineStore('room', () => {
     m.on('peer-state', ({ peerId, state }) => {
       const member = members.get(peerId)
       if (member) member.state = state
+    })
+    m.on('peer-transport', ({ peerId, transport }) => {
+      const member = members.get(peerId)
+      if (member) member.transport = transport
     })
     m.on('peer-sas', ({ peerId, sas }) => {
       const member = members.get(peerId)
@@ -777,10 +790,10 @@ export const useRoomStore = defineStore('room', () => {
     sendDraw(board, { kind: 'draw-end', board, id })
   }
 
-  /** 添加直线或箭头。 */
+  /** 添加两角点形状（直线/箭头/矩形/椭圆）。 */
   function addLine(
     board: string,
-    mode: 'line' | 'arrow',
+    mode: 'line' | 'arrow' | 'rect' | 'ellipse',
     color: string,
     size: number,
     x1: number,

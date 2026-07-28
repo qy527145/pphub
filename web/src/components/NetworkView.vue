@@ -234,6 +234,12 @@ const STATE_LABEL: Record<string, string> = {
   failed: '连接失败',
   closed: '已关闭',
 }
+
+/** 已连接但走服务器中继时，把状态标成「中继」以示区别（屏幕共享不可用）。 */
+function stateLabel(m: { state: string; transport: string }): string {
+  if (m.transport === 'relay') return '中继'
+  return STATE_LABEL[m.state] ?? m.state
+}
 </script>
 
 <template>
@@ -319,7 +325,11 @@ const STATE_LABEL: Record<string, string> = {
             </i>
           </span>
           <span class="name">{{ store.displayName(n.member.peerId) }}</span>
-          <span class="state">{{ STATE_LABEL[n.member.state] ?? n.member.state }}</span>
+          <span
+            class="state"
+            :class="{ relay: n.member.transport === 'relay' }"
+            :title="n.member.transport === 'relay' ? '无法 P2P 直连，数据经服务器中继（屏幕共享不可用）' : ''"
+          >{{ stateLabel(n.member) }}</span>
           <span
             v-if="(store.unread.get(n.member.peerId) ?? 0) > 0"
             class="nbadge"
@@ -342,7 +352,7 @@ const STATE_LABEL: Record<string, string> = {
             />
             <div class="who">
               <strong>{{ store.displayName(menuNode.member.peerId) }}</strong>
-              <span>{{ STATE_LABEL[menuNode.member.state] ?? menuNode.member.state }}</span>
+              <span>{{ stateLabel(menuNode.member) }}</span>
             </div>
           </header>
           <button @click="act('chat', menuNode.member.peerId)">
@@ -730,6 +740,11 @@ const STATE_LABEL: Record<string, string> = {
 .node .state {
   font-size: 10.5px;
   color: var(--muted);
+}
+
+/* 中继：已连通但绕经服务器，用暖色与直连区分。 */
+.node .state.relay {
+  color: var(--warn, #d08a2c);
 }
 
 .node .live,

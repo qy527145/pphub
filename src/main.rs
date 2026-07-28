@@ -3,14 +3,20 @@
 //! 本进程同时承担三个角色：
 //!   1. 托管嵌入的前端静态资源（`web/dist`）；
 //!   2. 信令服务器：交换 SDP / ICE candidate、签发 TURN 凭证；
+//!      并在 WebRTC 完全打不通时，经同一条 WebSocket 中继端到端密文（ws.rs）；
 //!   3. 内置 STUN/TURN（relay.rs）：帮客户端打洞，打洞失败时中继 DTLS 密文。
-//!      数据优先 P2P 直传，仅在直连不可能的网络下走中继。
+//!
+//! 传输优先级：直连打洞 → 内置 TURN（UDP/TCP）→ WS 应用层中继。
+//! 默认只监听 HTTP 端口——放在 nginx 之后无需额外开放任何端口，打不通的对端
+//! 走 WS 应用层中继，代价是屏幕共享（WebRTC 媒体轨）在这些对端之间不可用。
+//! `--stun-turn` 额外监听 3478（UDP+TCP），换来 ICE 层打洞/中继与全功能屏幕共享。
 
 mod assets;
 mod config;
 mod protocol;
 mod relay;
 mod room;
+mod tcp_turn;
 mod turn;
 mod ws;
 
@@ -37,6 +43,17 @@ struct Cli {
     /// 监听端口
     #[arg(short = 'p', long, default_value_t = 8848, env = "PPHUB_PORT")]
     port: u16,
+    /// 额外启动内置 STUN/TURN（监听 UDP+TCP 3478），用于 NAT 打洞与 ICE 层中继。
+    /// 不加此参数时只监听 HTTP 端口，打不通的对端改走 WebSocket 应用层中继
+    /// （载荷端到端加密，但屏幕共享不可用）。
+    #[arg(
+        long,
+        env = "PPHUB_STUN_TURN",
+        action = clap::ArgAction::SetTrue,
+        // 环境变量写 1 / yes / on 也算开（默认只认 true/false，对部署脚本不友好）。
+        value_parser = clap::builder::BoolishValueParser::new(),
+    )]
+    stun_turn: bool,
 }
 
 /// 通过 axum `State` 共享的应用状态。
@@ -59,18 +76,20 @@ async fn main() {
         )
         .init();
 
-    let config = Config::from_env();
+    let config = Config::from_env(cli.stun_turn);
     let bind = format!("{}:{}", cli.host, cli.port);
     tracing::info!(
         %bind,
         max_peers = config.max_peers,
         udp_port = config.udp_port,
+        tcp_port = config.tcp_port,
         extra_stun = ?config.stun_urls,
         extra_turn = ?config.turn_urls,
         "启动 pphub"
     );
 
     // 内置 STUN/TURN：与 HTTP 服务同进程，客户端能开网页就能用它打洞/中继。
+    // 未开启（默认）时返回 None，信令层不下发 ICE 服务器。
     let relay = BuiltinRelay::start(&config).await;
 
     let state = AppState {

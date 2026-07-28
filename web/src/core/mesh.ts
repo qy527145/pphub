@@ -17,7 +17,8 @@ import type {
   SendScope,
   SharedFileMeta,
 } from './messages'
-import { Peer } from './peer'
+import { Peer, type PeerTransport } from './peer'
+import type { ChannelLike } from './channels'
 import type { BuiltinIce, IceServer } from './protocol'
 import type { Sas } from './security'
 import type { Signaling, SignalingState } from './signaling'
@@ -37,6 +38,8 @@ type MeshEvents = {
   'peer-added': { peerId: string; nick?: string }
   'peer-removed': string
   'peer-state': { peerId: string; state: RTCPeerConnectionState }
+  /** 该对端实际走的通路；'relay' 表示 WebRTC 打不通、已降级为服务器中继。 */
+  'peer-transport': { peerId: string; transport: PeerTransport }
   'peer-sas': { peerId: string; sas: Sas }
   /** 对端的名片到达/更新。 */
   'peer-profile': { peerId: string; profile: Profile }
@@ -100,7 +103,7 @@ export class Mesh extends Emitter<MeshEvents> {
 
   // 强制发送（推）登记表（按传输 id 索引；id 全局随机，跨 peer 不冲突）。
   private readonly pendingOffers = new Map<string, { peerId: string; offer: FileOffer }>()
-  private readonly pendingChannels = new Map<string, RTCDataChannel>()
+  private readonly pendingChannels = new Map<string, ChannelLike>()
   private readonly activeSends = new Map<string, { peerId: string; handle: SendHandle }>()
   private readonly activeRecvs = new Map<string, { peerId: string; handle: ReceiveHandle }>()
 
@@ -148,6 +151,14 @@ export class Mesh extends Emitter<MeshEvents> {
 
     this.signaling.on('error', (e) => this.emit('error', e))
     this.signaling.on('state', (s) => this.emit('signaling-state', s))
+
+    // WS 中继帧：帧头里的 peerId 已被服务器改写为来源，据此路由到对应 Peer。
+    this.signaling.on('relay', (frame) => {
+      const from = relayFrameSource(frame)
+      if (!from) return
+      const peer = this.peers.get(from) ?? this.addPeer(from)
+      peer.handleRelayFrame(frame)
+    })
   }
 
   /** 加入房间：连接 → 领取 ICE 凭证 → 发送 join。 */
@@ -241,9 +252,23 @@ export class Mesh extends Emitter<MeshEvents> {
     return this.screenStream !== null
   }
 
+  /**
+   * 把本端屏幕流挂到某个对端。
+   *
+   * 已降级到 WS 中继的对端收不到媒体：媒体轨由浏览器内部的 SRTP 栈直接收发，
+   * JS 拿不到编码帧，无法经应用层中继转发。这里明确报错，而不是静默失败。
+   */
   private attachScreen(peer: Peer): void {
     const stream = this.screenStream
     if (!stream) return
+    if (peer.transport === 'relay') {
+      const who = this.nicks.get(peer.remoteId) ?? peer.remoteId
+      this.emit('error', {
+        code: 'screen-relay-unsupported',
+        msg: `与 ${who} 的连接已降级为服务器中继，屏幕共享需要 P2P 直连或 TURN`,
+      })
+      return
+    }
     const senders = stream.getTracks().map((t) => peer.addTrack(t, stream))
     this.screenSenders.set(peer.remoteId, senders)
   }
@@ -453,6 +478,8 @@ export class Mesh extends Emitter<MeshEvents> {
       polite: !initiator,
       iceServers: this.iceServers,
       sendSignal: (data) => this.signaling.send({ t: 'signal', to: remoteId, data }),
+      sendRelay: (frame) => this.signaling.sendRelay(frame),
+      relayBuffered: () => this.signaling.bufferedAmount,
     })
 
     peer.on('connectionstate', (state) => {
@@ -464,6 +491,8 @@ export class Mesh extends Emitter<MeshEvents> {
     peer.on('filechannel', ({ id, channel }) => this.handleFileChannel(remoteId, id, channel))
     peer.on('chunk', (frame) => this.handleChunkFrame(remoteId, frame))
     peer.on('sas', (sas) => this.emit('peer-sas', { peerId: remoteId, sas }))
+    peer.on('transport', (transport) => this.emit('peer-transport', { peerId: remoteId, transport }))
+    peer.on('relayblocked', (msg) => this.emit('error', { code: 'relay-blocked', msg }))
     peer.on('track', ({ streams }) => {
       if (streams[0]) this.emit('screen-stream', { peerId: remoteId, stream: streams[0] })
     })
@@ -485,6 +514,12 @@ export class Mesh extends Emitter<MeshEvents> {
     // 本端正在向全网共享屏幕：给新对端补挂媒体轨。
     if (this.screenScope.scope === 'all') this.attachScreen(peer)
     this.emit('peer-added', { peerId: remoteId, nick: this.nicks.get(remoteId) })
+    // 构造期就可能已降级（如强制中继开关），此时 'transport' 事件早于上面的
+    // 订阅发出，补一次同步；之后的变化由事件驱动。必须在 peer-added 之后，
+    // 否则 store 里还没有这个成员可更新。
+    if (peer.transport !== 'webrtc') {
+      this.emit('peer-transport', { peerId: remoteId, transport: peer.transport })
+    }
     return peer
   }
 
@@ -655,7 +690,7 @@ export class Mesh extends Emitter<MeshEvents> {
     }
   }
 
-  private handleFileChannel(from: string, id: string, channel: RTCDataChannel): void {
+  private handleFileChannel(from: string, id: string, channel: ChannelLike): void {
     const pending = this.pendingOffers.get(id)
     if (pending && pending.peerId === from) {
       this.pendingOffers.delete(id)
@@ -666,7 +701,7 @@ export class Mesh extends Emitter<MeshEvents> {
     }
   }
 
-  private startReceive(peerId: string, offer: FileOffer, channel: RTCDataChannel): void {
+  private startReceive(peerId: string, offer: FileOffer, channel: ChannelLike): void {
     const handle = receiveFile(channel, offer, {
       onProgress: (bytes) => this.emit('file-progress', { id: offer.id, bytes }),
       onDone: (blob) => {
@@ -716,6 +751,18 @@ function genId(): string {
   return Math.random().toString(36).slice(2, 10)
 }
 
+/**
+ * 读出 WS 中继帧头里的来源 peerId：[0]=版本, [1]=id 长度, [2..]=id。
+ * 帧的其余部分是端到端密文，路由层不碰。
+ */
+function relayFrameSource(frame: ArrayBuffer): string | null {
+  const buf = new Uint8Array(frame)
+  if (buf.length < 2 || buf[0] !== 1) return null
+  const len = buf[1]
+  if (len === 0 || buf.length < 2 + len) return null
+  return new TextDecoder().decode(buf.subarray(2, 2 + len))
+}
+
 function toRtcIceServer(s: IceServer): RTCIceServer {
   const out: RTCIceServer = { urls: s.urls }
   if (s.username) out.username = s.username
@@ -727,16 +774,27 @@ function toRtcIceServer(s: IceServer): RTCIceServer {
  * 由内置 STUN/TURN 的端口与凭证拼出 ICE 服务器条目。
  * 主机名取 location.hostname：客户端既然能打开本页面，该主机必然可达，
  * 因此 pphub 自身就是最可靠的打洞/中继服务器。
+ * UDP 优先（打洞 + 低延迟中继）；TURN over TCP 兜底（穿越禁 UDP 的网络，
+ * 服务端可只暴露 TCP 并置于 nginx stream 之后）。
  */
 function builtinIceServers(builtin: BuiltinIce | null | undefined): RTCIceServer[] {
   if (!builtin) return []
   const host = location.hostname
-  return [
-    { urls: [`stun:${host}:${builtin.udpPort}`] },
-    {
+  const out: RTCIceServer[] = []
+  if (builtin.udpPort > 0) {
+    out.push({ urls: [`stun:${host}:${builtin.udpPort}`] })
+    out.push({
       urls: [`turn:${host}:${builtin.udpPort}?transport=udp`],
       username: builtin.username,
       credential: builtin.credential,
-    },
-  ]
+    })
+  }
+  if (builtin.tcpPort > 0) {
+    out.push({
+      urls: [`turn:${host}:${builtin.tcpPort}?transport=tcp`],
+      username: builtin.username,
+      credential: builtin.credential,
+    })
+  }
+  return out
 }

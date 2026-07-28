@@ -31,7 +31,10 @@ pub struct IceServer {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BuiltinIce {
+    /// 内置 STUN/TURN 的 UDP 端口；0 表示未启用。
     pub udp_port: u16,
+    /// 内置 TURN over TCP 端口；0 表示未启用。
+    pub tcp_port: u16,
     pub username: String,
     pub credential: String,
 }
@@ -56,6 +59,11 @@ pub enum ClientMsg {
     /// 请求 TURN/STUN 临时凭证。
     TurnCreds,
 }
+
+/// WS 中继（fallback 传输）的二进制帧头长度：1 字节版本 + 1 字节 peerId 长度。
+pub const RELAY_HDR: usize = 2;
+/// peerId 的最大字节长度（前端 genId 产出 8 字符，留裕量）。
+pub const PEER_ID_MAX: usize = 32;
 
 /// 服务器 → 客户端。
 #[derive(Debug, Clone, Serialize)]

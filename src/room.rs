@@ -12,10 +12,24 @@ use tokio::sync::mpsc;
 
 use crate::protocol::{PeerInfo, ServerMsg};
 
+/// 投递给某个客户端的一条出站数据：控制消息（JSON）或中继载荷（二进制）。
+#[derive(Debug, Clone)]
+pub enum Out {
+    Msg(ServerMsg),
+    /// 已封装完整帧头的二进制中继数据，原样写入 WebSocket。
+    Bin(Vec<u8>),
+}
+
+impl From<ServerMsg> for Out {
+    fn from(m: ServerMsg) -> Self {
+        Out::Msg(m)
+    }
+}
+
 /// 单个房间成员的投递槽。
 struct PeerSlot {
     nick: Option<String>,
-    tx: mpsc::Sender<ServerMsg>,
+    tx: mpsc::Sender<Out>,
 }
 
 /// 一个房间。
@@ -55,7 +69,7 @@ impl Rooms {
         room: &str,
         peer_id: &str,
         nick: Option<String>,
-        tx: mpsc::Sender<ServerMsg>,
+        tx: mpsc::Sender<Out>,
     ) -> Result<Vec<PeerInfo>, JoinError> {
         let mut rooms = self.inner.lock().unwrap();
         let room = rooms.entry(room.to_string()).or_default();
@@ -84,7 +98,7 @@ impl Rooms {
             },
         };
         for slot in room.peers.values() {
-            let _ = slot.tx.try_send(announce.clone());
+            let _ = slot.tx.try_send(announce.clone().into());
         }
 
         room.peers.insert(peer_id.to_string(), PeerSlot { nick, tx });
@@ -97,11 +111,25 @@ impl Rooms {
         if let Some(room) = rooms.get(room)
             && let Some(slot) = room.peers.get(to)
         {
-            let _ = slot.tx.try_send(ServerMsg::Signal {
-                from: from.to_string(),
-                data,
-            });
+            let _ = slot.tx.try_send(
+                ServerMsg::Signal {
+                    from: from.to_string(),
+                    data,
+                }
+                .into(),
+            );
         }
+    }
+
+    /// 取出房间内某个对端的投递句柄（用于二进制中继的**阻塞式**投递）。
+    ///
+    /// 与 `relay` 的 `try_send` 不同：中继承载的是文件分块等大流量数据，
+    /// 丢帧会直接损坏传输，因此调用方需要 `send().await` 以形成背压——
+    /// 队列满时发送端的 WebSocket 读取暂停，TCP 窗口自然收紧。
+    /// 锁在函数返回时释放，await 发生在临界区之外。
+    pub fn sender_of(&self, room: &str, peer_id: &str) -> Option<mpsc::Sender<Out>> {
+        let rooms = self.inner.lock().unwrap();
+        Some(rooms.get(room)?.peers.get(peer_id)?.tx.clone())
     }
 
     /// 离开房间；向其余成员广播 `peer-left`，房间空则销毁。
@@ -117,7 +145,7 @@ impl Rooms {
             peer_id: peer_id.to_string(),
         };
         for slot in r.peers.values() {
-            let _ = slot.tx.try_send(msg.clone());
+            let _ = slot.tx.try_send(msg.clone().into());
         }
         if r.peers.is_empty() {
             rooms.remove(room);

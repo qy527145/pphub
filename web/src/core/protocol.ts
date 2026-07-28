@@ -23,7 +23,10 @@ export interface IceServer {
  * 主机名由前端取 location.hostname 拼接（客户端能开网页 ⇒ 该主机可达）。
  */
 export interface BuiltinIce {
+  /** 内置 STUN/TURN 的 UDP 端口；0 表示未启用。 */
   udpPort: number
+  /** 内置 TURN over TCP 端口；0 表示未启用。 */
+  tcpPort: number
   username: string
   credential: string
 }
@@ -46,8 +49,10 @@ export type ServerMsg =
 
 /**
  * 端到端信令负载：服务端仅透传，不解析。
- * 采用 MDN「完美协商」示例的形状：description 或 candidate 二选一。
+ * 前两种取自 MDN「完美协商」示例；relayKey 是降级到 WS 中继时交换的
+ * ECDH 公钥——收到它同时意味着「对端已降级」，本端应一并切到中继。
  */
 export type SignalData =
-  | { description: RTCSessionDescriptionInit; candidate?: undefined }
-  | { candidate: RTCIceCandidateInit | null; description?: undefined }
+  | { description: RTCSessionDescriptionInit; candidate?: undefined; relayKey?: undefined }
+  | { candidate: RTCIceCandidateInit | null; description?: undefined; relayKey?: undefined }
+  | { relayKey: JsonWebKey; description?: undefined; candidate?: undefined }

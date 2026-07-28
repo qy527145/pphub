@@ -2,21 +2,44 @@
 
 免安装、纯浏览器的 P2P 直连协作系统。基于 WebRTC，**单二进制**：前端在编译期
 嵌入 Rust 服务，运行后一个进程同时提供网页、信令服务器（交换 SDP/ICE）与
-**内置 STUN/TURN**（NAT 打洞 + 打洞失败时的中继兜底）。数据优先端到端直传；
-仅在直连不可能的网络下经内置 TURN 中继，且中继的也只是 DTLS 密文。
+数据中继。数据优先端到端直传；仅在直连不可能的网络下走中继，且中继的始终是密文。
+
+**默认只监听一个 HTTP 端口**——直接放到 nginx 后面就能用，不需要开放任何额外
+端口。同网段的节点用 host 候选直接打通（不经服务器）；跨网络打不通的节点自动
+降级到同一条 WebSocket 上的应用层中继。
+
+加 `--stun-turn` 会额外监听 UDP+TCP 3478 启用内置 STUN/TURN，换来真正的 NAT
+打洞与 ICE 层中继：跨网络场景下更可能直连，且**屏幕共享在任何网络下都可用**。
+
+传输按以下顺序自动降级，无需其它配置：
+
+| 级别 | 通路 | 需要的端口 | 加密 | 屏幕共享 |
+|------|------|-----------|------|---------|
+| 1 | P2P 直连（同网段 host 候选） | 无 | DTLS/SRTP | ✅ |
+| 2 | P2P 直连（内置 STUN 打洞） | UDP 3478（`--stun-turn`） | DTLS/SRTP | ✅ |
+| 3 | 内置 TURN over UDP | UDP 3478（`--stun-turn`） | DTLS/SRTP | ✅ |
+| 4 | 内置 TURN over TCP | TCP 3478（`--stun-turn`） | DTLS/SRTP | ✅ |
+| 5 | WS 应用层中继 | 无（复用 HTTP 端口） | ECDH + AES-GCM | ❌ |
+
+最后一级是默认配置下的兜底，代价是屏幕共享不可用——WebRTC 媒体轨由浏览器内部
+的 SRTP 栈直接收发，JS 拿不到编码帧，无法经应用层转发。文字/文件/白板不受影响。
+要在跨网络环境下也能共享屏幕，就得用 `--stun-turn` 放行 3478。
 
 ## 快速开始
 
 ```bash
-# 直接跑（默认监听 0.0.0.0:8080）
+# 直接跑（默认监听 0.0.0.0:8848，只占这一个端口）
 cargo run
 
 # 指定主机/端口
-cargo run -- --port 8089
-cargo run -- -H 127.0.0.1 -p 8089
+cargo run -- --port 8848
+cargo run -- -H 127.0.0.1 -p 8848
+
+# 额外启用内置 STUN/TURN（多占 UDP+TCP 3478，换取跨网打洞与屏幕共享）
+cargo run -- --stun-turn
 ```
 
-启动后浏览器打开 `http://localhost:8089`。左侧为功能导航（网络 / 发送文件 /
+启动后浏览器打开 `http://localhost:8848`。左侧为功能导航（网络 / 发送文件 /
 接收文件 / 消息 / 屏幕共享 / 互动白板），底部可切换日间/夜间两套主题
 （默认跟随系统）。三种方式任选其一即可直连——
 
@@ -59,41 +82,151 @@ https 或 localhost；移动端浏览器无此 API，只能观看）。画面走
 | 参数 | 说明 | 默认 | 环境变量 |
 |------|------|------|---------|
 | `-H, --host` | 监听主机 | `0.0.0.0` | `PPHUB_HOST` |
-| `-p, --port` | 监听端口 | `8080` | `PPHUB_PORT` |
+| `-p, --port` | 监听端口 | `8848` | `PPHUB_PORT` |
+| `--stun-turn` | 额外启用内置 STUN/TURN（UDP+TCP 3478） | 关闭 | `PPHUB_STUN_TURN` |
 
-## 内置 STUN/TURN（NAT 穿透，零配置）
+## 默认：单端口（只暴露 nginx 的 80/443）
+
+```bash
+cargo run                       # 只监听 8848 这一个端口
+```
+
+不监听 UDP/TCP 3478，nginx 只需代理 HTTP + WebSocket：
+
+```nginx
+location /pphub/ {
+    proxy_pass http://127.0.0.1:8848/;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade    $http_upgrade;   # WebSocket 升级必需
+    proxy_set_header Connection "upgrade";
+    proxy_set_header Host       $host;
+    proxy_read_timeout 3600s;                    # 长连接，别让 nginx 掐断
+}
+```
+
+同一局域网内的节点仍会用 host 候选直连（不经服务器）；跨网络节点在 WebRTC
+失败后自动改走 **WS 应用层中继**：数据经 `/ws` 的二进制帧由服务器转发，
+但先在浏览器里用 **ECDH(P-256) 协商的 AES-GCM** 加密，服务器只看得到密文和
+路由用的 peerId。两端可核对 SAS（由双方公钥派生）确认没有中间人。
+
+降级发生时网络视图会把该节点标为「**中继**」而非「已连接」，不伪装成直连。
+
+两个必须知道的限制：
+
+- **屏幕共享在中继路径上不可用**。WebRTC 媒体轨由浏览器内部 SRTP 栈收发，
+  JS 拿不到编码帧，无法经应用层转发；共享时会直接报错而非静默失败。
+  需要跨网络共享屏幕就得开 `--stun-turn`。
+- **中继需要安全上下文**。浏览器只在 https 或 localhost 下提供 `crypto.subtle`，
+  以明文 http + 局域网 IP 访问时中继无法加密，此时 pphub 宁可拒绝降级也不
+  明文转发，界面会提示改用 https 或放行 3478。
+
+## 内置 STUN/TURN（`--stun-turn`，NAT 穿透）
+
+```bash
+cargo run -- --stun-turn        # 额外监听 UDP 3478 + TCP 3478
+```
 
 客户端既然能打开 pphub 的网页，就必然能连到 pphub 所在主机——因此 pphub
-**自带 STUN/TURN 服务器**，随进程在同一台机器的 UDP 端口（默认 3478）启动，
-不依赖任何第三方公共服务：
+**自带 STUN/TURN 服务器**，随进程启动，不依赖任何第三方公共服务。开启后：
 
 1. **P2P 直连（优先）**：内置 STUN 应答 Binding 请求，帮两端发现各自的
    公网映射地址并打洞；打洞成功后所有数据端到端直传，服务器只承担信令。
-2. **TURN 中继（自动兜底）**：对称型 NAT、严格防火墙等打洞必败的环境下，
+2. **TURN/UDP 中继（自动兜底）**：对称型 NAT、严格防火墙等打洞必败的环境下，
    浏览器 ICE 自动改走内置 TURN 中继。中继发生在 ICE 层，对上层完全透明，
    数据通道与屏幕共享媒体流全都可用；DTLS 端到端加密不变，服务器只见密文。
+3. **TURN/TCP 中继（最终兜底）**：连 UDP 都被禁的网络下，客户端到服务器
+   全程走 TCP。两端都经 TURN 时中继腿在服务器进程内部完成，**对外只需
+   HTTP 端口 + 这一个 TCP 端口**，不需要任何 UDP 端口可达。
 
 TURN 凭证走 REST API 规则（username=过期时间戳，credential=HMAC-SHA1），
 共享密钥进程启动时随机生成、只存在内存，无需也无法配置泄露。前端用
-`location.hostname` + 下发的 UDP 端口拼出 `stun:`/`turn:` URL。
+`location.hostname` + 下发的端口拼出 `stun:`/`turn:`/`turn:…?transport=tcp` URL，
+浏览器 ICE 按 直连 > UDP 中继 > TCP 中继 的优先级自动择优。
 
 **部署要点**：
 
-- 客户端需能访问服务器的 **UDP 端口 3478**（防火墙放行；nginx 只代理 HTTP/WS，
-  UDP 流量是客户端直连主机的，不经过 nginx）；
-- 服务器多网卡/容器环境下自动探测的 IP 不对时，用 `PPHUB_PUBLIC_IP` 显式指定
-  中继宣告地址；服务器在 NAT 后对公网服务时同样需要设置公网 IP 并做端口映射；
-- `PPHUB_UDP_PORT` 更换 UDP 端口；端口被占用时内置中继跳过启动、其余功能不受影响。
+- 最佳体验放行 UDP 3478；受限环境只放行 **TCP 3478** 也能全功能互通
+  （消息/文件/白板/屏幕共享，走 TURN/TCP 中继），用
+  `--stun-turn` + `PPHUB_UDP_PORT=0` 即可；
+- nginx 只代理 HTTP/WS。TURN/TCP 是原始 TCP 流，不能挂在 HTTP `location`
+  下（这是浏览器 ICE 栈的限制：JS 无法把 WebSocket 塞进 RTCPeerConnection
+  的传输层），但可用 nginx `stream` 模块四层转发，使对外统一由 nginx 承接：
 
-环境变量一览：`PPHUB_UDP_PORT`（内置 STUN/TURN 端口，默认 3478）、
-`PPHUB_PUBLIC_IP`（中继宣告 IP，默认自动探测）、`PPHUB_TURN_TTL`（凭证有效期，
-默认 3600 秒）、`PPHUB_MAX_PEERS`（房间上限，默认 6）。仍可通过
-`PPHUB_STUN_URLS` / `PPHUB_TURN_URLS` / `PPHUB_TURN_SECRET` 追加外部
-STUN/coturn 作为补充（默认为空，通常不需要）。
+  ```nginx
+  # /etc/nginx/nginx.conf 顶层（与 http {} 平级）
+  stream {
+      server {
+          listen 3478;            # 对外 TURN/TCP
+          proxy_pass 127.0.0.1:3478;
+      }
+  }
+  ```
 
-**连接诊断**：浏览器控制台执行 `localStorage.setItem('pphub:debug:ice', 'true')`
-后刷新，可看到 ICE 候选收集与最终选中的连接路径（host 直连 / srflx 打洞 /
-relay 中继）。
+- 经 nginx stream 转发（或其它代理/NAT）时，TURN 看到的客户端源地址是代理
+  地址，属正常情况，不影响中继；
+- 服务器多网卡/容器/VPN 环境下自动探测的 IP 不对时，用 `PPHUB_PUBLIC_IP`
+  显式指定中继宣告地址（应为服务器本机已配置的 IP，如局域网部署用其内网
+  IP）；
+- 端口被占用时对应监听自动跳过，其余功能不受影响（退回 WS 应用层中继）。
+
+环境变量一览：`PPHUB_STUN_TURN=1`（等价于 `--stun-turn`）、`PPHUB_UDP_PORT`
+（STUN+TURN/UDP 端口，开启时默认 3478，设 0 单独关闭）、`PPHUB_TCP_PORT`
+（TURN/TCP 端口，同上）、`PPHUB_PUBLIC_IP`（中继宣告 IP，默认自动探测）、
+`PPHUB_TURN_TTL`（凭证有效期，默认 3600 秒）、`PPHUB_MAX_PEERS`（房间上限，
+默认 6）。仍可通过 `PPHUB_STUN_URLS` / `PPHUB_TURN_URLS` / `PPHUB_TURN_SECRET`
+追加外部 STUN/coturn 作为补充（默认为空，通常不需要）。
+
+## 连不上时看哪里的日志
+
+问题几乎总能在两侧之一定位，**先看客户端**：那里才有 ICE 的真实结果。
+
+**客户端（浏览器）**
+
+1. **ICE 详情**——控制台执行后刷新页面：
+   ```js
+   localStorage.setItem('pphub:debug:ice', 'true')
+   ```
+   随后控制台会打印每个候选（host / srflx / relay）、收集与连接状态变化，
+   以及最终选中的候选对，并标出路径类型：直连 / STUN 穿透 / TURN 中继。
+   - 只有 `host` 候选，且对端不同网段 ⇒ 默认单端口模式下这是预期结果，
+     应当看到随后降级为 WS 中继；想直连就加 `--stun-turn`；
+   - 开了 `--stun-turn` 仍只有 `host` ⇒ 没连上内置 STUN，检查 UDP 3478 可达性；
+   - 有 `srflx` 但状态停在 `checking`/`failed` ⇒ 打洞失败，看是否降级到了
+     `relay`（内置 TURN）；
+   - 控制台出现 `[peer] <id> 降级到 WS 中继：…` ⇒ 已走最后一级，冒号后是原因。
+
+2. **浏览器原生面板**（信息最全）：Chrome/Edge 打开 `chrome://webrtc-internals`，
+   在连接建立**之前**打开该页，然后再进房；里面有完整的 ICE 候选对表格、
+   选中路径、收发字节数。
+
+3. **强制走中继**（验证降级链路本身是否可用）：
+   ```js
+   localStorage.setItem('pphub:force:relay', 'true')   // 刷新后生效，删除即恢复
+   ```
+
+**服务端**
+
+用 `RUST_LOG` 调整级别（默认 `info`）：
+
+```bash
+RUST_LOG=pphub=debug cargo run
+RUST_LOG=pphub=debug,tower_http=debug ./pphub      # 连 HTTP 请求也打
+```
+
+关键行：
+
+- `启动 pphub … udp_port=… tcp_port=…`：确认监听模式，两者都是 0 即单端口模式；
+- `单端口模式：未启用内置 STUN/TURN…`：默认启动会打这一行，属正常；
+- `内置 STUN/TURN 已启动: udp/3478 tcp/3478 中继地址 192.168.x.x`（加了
+  `--stun-turn` 才有）：末尾这个**中继地址必须是客户端能访问到的 IP**。
+  多网卡 / 容器 / **开着 VPN** 的机器容易探测成虚拟网卡地址（如 `198.18.x.x`），
+  此时局域网对端根本连不上，需显式指定 `PPHUB_PUBLIC_IP=192.168.x.x`；
+- `内置 STUN/TURN 无可用监听端口，未启动`：加了 `--stun-turn` 但端口被占用；
+- `peer joined` / `peer left`：信令层进出房间；
+- `peer 降级为 WS 中继（WebRTC 未连通）`：该客户端已走最后一级中继。
+
+nginx 反代时还需看 nginx 的 `error.log`——WebSocket 升级头没配对时，
+`/ws` 会以 400/426 失败，页面表现为一直「连接中」。
 
 ## 项目结构
 
@@ -106,9 +239,10 @@ src/
   config.rs         环境变量配置（UDP 端口/公网 IP/上限等）
   protocol.rs       信令线格式（serde）
   room.rs           房间注册表 + 信令中继
-  relay.rs          内置 STUN/TURN 服务器（打洞 + 中继兜底）
+  relay.rs          内置 STUN/TURN 服务器（UDP 打洞 + UDP/TCP 中继兜底）
+  tcp_turn.rs       TURN over TCP 适配器（RFC 5766 §5.1 流式分帧）
   turn.rs           TURN 临时凭证（HMAC-SHA1，REST API 规则）
-  ws.rs             WebSocket 连接生命周期
+  ws.rs             WebSocket 连接生命周期 + WS 应用层中继转发
 web/                前端源码（Vue 3 + TS + Vite），详见 web/README.md
   dist/             前端构建产物，随仓库提交并被嵌入二进制
 ```
@@ -120,13 +254,13 @@ web/                前端源码（Vue 3 + TS + Vite），详见 web/README.md
 ```bash
 npm --prefix web install
 npm --prefix web run build     # 产出 web/dist（会被 cargo 嵌入）
-cargo run -- -p 8089
+cargo run -- -p 8848
 ```
 
 或前后端分离热更新（Vite 通过 /ws 代理到本地信令服务器）：
 
 ```bash
-cargo run -- -p 8080           # 终端 1：信令
+cargo run -- -p 8848           # 终端 1：信令
 npm --prefix web run dev       # 终端 2：http://localhost:5173
 ```
 
