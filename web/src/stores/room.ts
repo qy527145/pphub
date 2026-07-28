@@ -6,12 +6,16 @@ import { Mesh } from '@/core/mesh'
 import type { DrawMessage } from '@/core/mesh'
 import type {
   Avatar,
-  DrawMode,
   Profile,
   SendScope,
   SharedFileMeta,
   TransferMode,
+  WbItem,
   WbStroke,
+  WbLine,
+  WbPolyline,
+  WbText,
+  WbImage,
 } from '@/core/messages'
 import { type Capabilities, detectCapabilities } from '@/core/capabilities'
 import { imageToAvatar, loadProfile, saveProfile } from '@/core/profile'
@@ -117,6 +121,7 @@ export interface ShareItem {
 const LS_ALLOW_INCOMING = 'pphub.allowIncoming'
 const LS_DEVICE_NAME = 'pphub.deviceName'
 const SS_MY_CODE = 'pphub.myCode'
+const SS_CURRENT_ROOM = 'pphub.currentRoom'
 
 function defaultSignalingUrl(): string {
   const fromEnv = import.meta.env.VITE_SIGNALING_URL
@@ -222,14 +227,14 @@ export const useRoomStore = defineStore('room', () => {
   const watching = ref<string | null>(null)
 
   // —— 白板 / 屏幕批注 ——
-  // 笔画本体不做响应式（高频追加 + canvas 直读），以 boardRev 驱动重绘。
-  const boards = new Map<string, WbStroke[]>()
+  // 元素本体不做响应式（高频追加 + canvas 直读），以 boardRev 驱动重绘。
+  const boards = new Map<string, WbItem[]>()
   const boardRev = ref(0)
   /** 白板页当前打开的画板：'wb' 公共，或 dmBoardId(peer) 私有。 */
   const activeBoard = ref('wb')
   /** 正在绘制中的远端笔画：strokeId → { board, stroke }。 */
   const liveStrokes = new Map<string, { board: string; stroke: WbStroke }>()
-  /** 本端各画面的笔画 id 栈（撤销用）。 */
+  /** 本端各画面的元素 id 栈（撤销用）。 */
   const myStrokes = new Map<string, string[]>()
   /** 远程成员光标：`${board}|${peerId}` → RemotePointer。 */
   const pointers = reactive(new Map<string, RemotePointer>())
@@ -308,8 +313,8 @@ export const useRoomStore = defineStore('room', () => {
     return pair.find((p) => p !== myId.value) ?? null
   }
 
-  /** 取画面的笔画数组（惰性创建）。canvas 组件配合 boardRev 直读。 */
-  function getBoard(board: string): WbStroke[] {
+  /** 取画面的元素数组（惰性创建）。canvas 组件配合 boardRev 直读。 */
+  function getBoard(board: string): WbItem[] {
     let arr = boards.get(board)
     if (!arr) {
       arr = []
@@ -322,7 +327,7 @@ export const useRoomStore = defineStore('room', () => {
     boardRev.value++
   }
 
-  /** 清掉某画面的全部本地状态（笔画/光标/涟漪）。 */
+  /** 清掉某画面的全部本地状态（元素/光标/涟漪）。 */
   function dropBoard(board: string): void {
     boards.delete(board)
     myStrokes.delete(board)
@@ -401,11 +406,11 @@ export const useRoomStore = defineStore('room', () => {
       // 新对端通道就绪：补发公共白板与和它的私有白板全量状态（对方按 id 去重合并）。
       const wb = boards.get('wb')
       if (wb && wb.length > 0) {
-        m.sendTo(peerId, { kind: 'draw-state', board: 'wb', strokes: wb })
+        m.sendTo(peerId, { kind: 'draw-state', board: 'wb', items: wb })
       }
       const dm = boards.get(dmBoardId(peerId))
       if (dm && dm.length > 0) {
-        m.sendTo(peerId, { kind: 'draw-state', board: dmBoardId(peerId), strokes: dm })
+        m.sendTo(peerId, { kind: 'draw-state', board: dmBoardId(peerId), items: dm })
       }
     })
 
@@ -564,6 +569,63 @@ export const useRoomStore = defineStore('room', () => {
       case 'draw-end':
         liveStrokes.delete(msg.id)
         break
+      case 'draw-line': {
+        const line: WbLine = {
+          id: msg.id,
+          color: msg.color,
+          mode: msg.mode,
+          size: msg.size,
+          x1: msg.x1,
+          y1: msg.y1,
+          x2: msg.x2,
+          y2: msg.y2,
+        }
+        getBoard(msg.board).push(line)
+        bumpBoard()
+        break
+      }
+      case 'draw-polyline': {
+        const pl: WbPolyline = {
+          id: msg.id,
+          color: msg.color,
+          mode: 'polyline',
+          size: msg.size,
+          points: msg.points,
+          arrow: msg.arrow,
+        }
+        getBoard(msg.board).push(pl)
+        bumpBoard()
+        break
+      }
+      case 'draw-text': {
+        const text: WbText = {
+          id: msg.id,
+          color: msg.color,
+          mode: 'text',
+          x: msg.x,
+          y: msg.y,
+          text: msg.text,
+          fontSize: msg.fontSize,
+        }
+        getBoard(msg.board).push(text)
+        bumpBoard()
+        break
+      }
+      case 'draw-image': {
+        const image: WbImage = {
+          id: msg.id,
+          color: '#000',
+          mode: 'image',
+          x: msg.x,
+          y: msg.y,
+          width: msg.width,
+          height: msg.height,
+          dataUrl: msg.dataUrl,
+        }
+        getBoard(msg.board).push(image)
+        bumpBoard()
+        break
+      }
       case 'draw-remove': {
         const arr = boards.get(msg.board)
         if (arr) {
@@ -582,8 +644,8 @@ export const useRoomStore = defineStore('room', () => {
       case 'draw-state': {
         const arr = getBoard(msg.board)
         const have = new Set(arr.map((s) => s.id))
-        for (const s of msg.strokes) {
-          if (!have.has(s.id)) arr.push(s)
+        for (const item of msg.items) {
+          if (!have.has(item.id)) arr.push(item)
         }
         bumpBoard()
         break
@@ -683,7 +745,7 @@ export const useRoomStore = defineStore('room', () => {
 
   function beginStroke(
     board: string,
-    mode: DrawMode,
+    mode: 'pen' | 'eraser',
     color: string,
     size: number,
     x: number,
@@ -715,7 +777,105 @@ export const useRoomStore = defineStore('room', () => {
     sendDraw(board, { kind: 'draw-end', board, id })
   }
 
-  /** 撤销本端在该画面的最后一笔。 */
+  /** 添加直线或箭头。 */
+  function addLine(
+    board: string,
+    mode: 'line' | 'arrow',
+    color: string,
+    size: number,
+    x1: number,
+    y1: number,
+    x2: number,
+    y2: number,
+  ): string {
+    const id = `${myId.value || 'me'}-${strokeSeq++}-${Date.now().toString(36)}`
+    const line: WbLine = { id, color, mode, size, x1, y1, x2, y2 }
+    getBoard(board).push(line)
+    const stack = myStrokes.get(board) ?? []
+    stack.push(id)
+    myStrokes.set(board, stack)
+    sendDraw(board, { kind: 'draw-line', board, id, color, size, mode, x1, y1, x2, y2 })
+    bumpBoard()
+    return id
+  }
+
+  /** 添加折线（points 为扁平化归一化坐标，arrow 决定末段是否画箭头）。 */
+  function addPolyline(
+    board: string,
+    color: string,
+    size: number,
+    points: number[],
+    arrow: boolean,
+  ): string {
+    const id = `${myId.value || 'me'}-${strokeSeq++}-${Date.now().toString(36)}`
+    const pl: WbPolyline = { id, color, mode: 'polyline', size, points: [...points], arrow }
+    getBoard(board).push(pl)
+    const stack = myStrokes.get(board) ?? []
+    stack.push(id)
+    myStrokes.set(board, stack)
+    sendDraw(board, { kind: 'draw-polyline', board, id, color, size, points: [...points], arrow })
+    bumpBoard()
+    return id
+  }
+
+  /** 按 id 批量删除元素（对象橡皮 / 框选删除，可删他人元素）。 */
+  function removeItems(board: string, ids: string[]): void {
+    if (ids.length === 0) return
+    const arr = boards.get(board)
+    if (!arr) return
+    const drop = new Set(ids)
+    boards.set(
+      board,
+      arr.filter((s) => !drop.has(s.id)),
+    )
+    for (const id of ids) liveStrokes.delete(id)
+    const stack = myStrokes.get(board)
+    if (stack) myStrokes.set(board, stack.filter((id) => !drop.has(id)))
+    sendDraw(board, { kind: 'draw-remove', board, ids })
+    bumpBoard()
+  }
+
+  /** 添加文本。 */
+  function addText(
+    board: string,
+    color: string,
+    x: number,
+    y: number,
+    text: string,
+    fontSize: number,
+  ): string {
+    const id = `${myId.value || 'me'}-${strokeSeq++}-${Date.now().toString(36)}`
+    const textItem: WbText = { id, color, mode: 'text', x, y, text, fontSize }
+    getBoard(board).push(textItem)
+    const stack = myStrokes.get(board) ?? []
+    stack.push(id)
+    myStrokes.set(board, stack)
+    sendDraw(board, { kind: 'draw-text', board, id, color, x, y, text, fontSize })
+    bumpBoard()
+    return id
+  }
+
+  /** 添加图片。 */
+  function addImage(
+    board: string,
+    x: number,
+    y: number,
+    width: number,
+    height: number,
+    dataUrl: string,
+  ): string {
+    const id = `${myId.value || 'me'}-${strokeSeq++}-${Date.now().toString(36)}`
+    const image: WbImage = { id, color: '#000', mode: 'image', x, y, width, height, dataUrl }
+    getBoard(board).push(image)
+    const stack = myStrokes.get(board) ?? []
+    stack.push(id)
+    myStrokes.set(board, stack)
+    sendDraw(board, { kind: 'draw-image', board, id, x, y, width, height, dataUrl })
+    bumpBoard()
+    return id
+  }
+
+  /** 撤销本端在该画面的最后一个元素。 */
   function undoStroke(board: string): void {
     const stack = myStrokes.get(board)
     const id = stack?.pop()
@@ -793,6 +953,8 @@ export const useRoomStore = defineStore('room', () => {
     room.value = ''
     signalingState.value = 'idle'
     status.value = 'idle'
+    // 清除持久化的房间信息
+    sessionStorage.removeItem(SS_CURRENT_ROOM)
   }
 
   /** 加入指定房间（短码房或口令房）。已在线则先离开。 */
@@ -805,6 +967,8 @@ export const useRoomStore = defineStore('room', () => {
       mesh = createMesh(defaultSignalingUrl())
       await mesh.join(roomName, myProfile.value)
       status.value = 'online'
+      // 持久化当前房间信息，页面刷新后可恢复
+      sessionStorage.setItem(SS_CURRENT_ROOM, roomName)
       return true
     } catch (err) {
       lastError.value = String(err)
@@ -902,6 +1066,12 @@ export const useRoomStore = defineStore('room', () => {
         await connectTo(code)
         return
       }
+    }
+    // 尝试恢复刷新前的房间
+    const savedRoom = sessionStorage.getItem(SS_CURRENT_ROOM)
+    if (savedRoom && savedRoom.trim()) {
+      await connectTo(savedRoom)
+      return
     }
     if (allowIncoming.value) await listen()
   }
@@ -1230,6 +1400,11 @@ export const useRoomStore = defineStore('room', () => {
     beginStroke,
     extendStroke,
     endStroke,
+    addLine,
+    addPolyline,
+    addText,
+    addImage,
+    removeItems,
     undoStroke,
     clearBoard,
     sendPointer,

@@ -104,7 +104,14 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
             ClientMsg::TurnCreds => {
                 let (ice_servers, ttl) = build_ice_servers(&state.config);
-                let _ = tx.send(ServerMsg::TurnCreds { ice_servers, ttl }).await;
+                let builtin = state.relay.as_ref().map(|r| r.issue_creds(ttl));
+                let _ = tx
+                    .send(ServerMsg::TurnCreds {
+                        ice_servers,
+                        ttl,
+                        builtin,
+                    })
+                    .await;
             }
 
             ClientMsg::Leave => break,

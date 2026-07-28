@@ -20,6 +20,17 @@ const tool = ref<'pointer' | DrawMode>('pointer')
 const color = ref('#e5484d')
 const size = ref(6)
 const muted = ref(true)
+const polylineArrow = ref(false)
+const layerRef = ref<InstanceType<typeof DrawLayer> | null>(null)
+const selectedCount = computed(() => layerRef.value?.selectedCount ?? 0)
+
+// 切换工具时把粗细落到该工具的可选档位上
+function setTool(next: 'pointer' | DrawMode): void {
+  tool.value = next
+  if (next === 'eraser') size.value = 36
+  else if (next === 'text') size.value = 24
+  else if (next !== 'pointer' && next !== 'select' && next !== 'image') size.value = 6
+}
 
 // —— 画面源 ——
 interface Feed {
@@ -175,23 +186,32 @@ const canShare = computed(() => store.capabilities.displayMedia && store.status 
         />
         <DrawLayer
           v-if="content.width > 0"
+          ref="layerRef"
           class="overlay"
           :style="{ left: `${content.left}px`, top: `${content.top}px` }"
           :board="activeBoard"
           :tool="tool"
           :color="color"
           :size="size"
+          :polyline-arrow="polylineArrow"
           :width="content.width"
           :height="content.height"
         />
         <div class="tools">
           <DrawToolbar
-            v-model:tool="tool"
-            v-model:color="color"
-            v-model:size="size"
+            :tool="tool"
+            :color="color"
+            :size="size"
+            :polyline-arrow="polylineArrow"
+            :selected-count="selectedCount"
             pointer-label="远程指针（点击可提示对方）"
+            @update:tool="setTool"
+            @update:color="color = $event"
+            @update:size="size = $event"
+            @update:polyline-arrow="polylineArrow = $event"
             @undo="store.undoStroke(activeBoard)"
             @clear="clearAnno"
+            @delete-selection="layerRef?.deleteSelection()"
           >
             <template v-if="hasAudio">
               <span class="sep" />

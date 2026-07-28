@@ -1,8 +1,9 @@
 # pphub
 
 免安装、纯浏览器的 P2P 直连协作系统。基于 WebRTC，**单二进制**：前端在编译期
-嵌入 Rust 服务，运行后同一端口既提供网页，又充当信令服务器（仅交换 SDP/ICE、
-签发 TURN 凭证，**不中转任何业务数据**）。
+嵌入 Rust 服务，运行后一个进程同时提供网页、信令服务器（交换 SDP/ICE）与
+**内置 STUN/TURN**（NAT 打洞 + 打洞失败时的中继兜底）。数据优先端到端直传；
+仅在直连不可能的网络下经内置 TURN 中继，且中继的也只是 DTLS 密文。
 
 ## 快速开始
 
@@ -60,9 +61,39 @@ https 或 localhost；移动端浏览器无此 API，只能观看）。画面走
 | `-H, --host` | 监听主机 | `0.0.0.0` | `PPHUB_HOST` |
 | `-p, --port` | 监听端口 | `8080` | `PPHUB_PORT` |
 
-STUN/TURN 等其余配置走环境变量：`PPHUB_STUN_URLS`、`PPHUB_TURN_URLS`、
-`PPHUB_TURN_SECRET`、`PPHUB_TURN_TTL`、`PPHUB_MAX_PEERS`。TURN 共享密钥只留在
-服务端，绝不下发前端。
+## 内置 STUN/TURN（NAT 穿透，零配置）
+
+客户端既然能打开 pphub 的网页，就必然能连到 pphub 所在主机——因此 pphub
+**自带 STUN/TURN 服务器**，随进程在同一台机器的 UDP 端口（默认 3478）启动，
+不依赖任何第三方公共服务：
+
+1. **P2P 直连（优先）**：内置 STUN 应答 Binding 请求，帮两端发现各自的
+   公网映射地址并打洞；打洞成功后所有数据端到端直传，服务器只承担信令。
+2. **TURN 中继（自动兜底）**：对称型 NAT、严格防火墙等打洞必败的环境下，
+   浏览器 ICE 自动改走内置 TURN 中继。中继发生在 ICE 层，对上层完全透明，
+   数据通道与屏幕共享媒体流全都可用；DTLS 端到端加密不变，服务器只见密文。
+
+TURN 凭证走 REST API 规则（username=过期时间戳，credential=HMAC-SHA1），
+共享密钥进程启动时随机生成、只存在内存，无需也无法配置泄露。前端用
+`location.hostname` + 下发的 UDP 端口拼出 `stun:`/`turn:` URL。
+
+**部署要点**：
+
+- 客户端需能访问服务器的 **UDP 端口 3478**（防火墙放行；nginx 只代理 HTTP/WS，
+  UDP 流量是客户端直连主机的，不经过 nginx）；
+- 服务器多网卡/容器环境下自动探测的 IP 不对时，用 `PPHUB_PUBLIC_IP` 显式指定
+  中继宣告地址；服务器在 NAT 后对公网服务时同样需要设置公网 IP 并做端口映射；
+- `PPHUB_UDP_PORT` 更换 UDP 端口；端口被占用时内置中继跳过启动、其余功能不受影响。
+
+环境变量一览：`PPHUB_UDP_PORT`（内置 STUN/TURN 端口，默认 3478）、
+`PPHUB_PUBLIC_IP`（中继宣告 IP，默认自动探测）、`PPHUB_TURN_TTL`（凭证有效期，
+默认 3600 秒）、`PPHUB_MAX_PEERS`（房间上限，默认 6）。仍可通过
+`PPHUB_STUN_URLS` / `PPHUB_TURN_URLS` / `PPHUB_TURN_SECRET` 追加外部
+STUN/coturn 作为补充（默认为空，通常不需要）。
+
+**连接诊断**：浏览器控制台执行 `localStorage.setItem('pphub:debug:ice', 'true')`
+后刷新，可看到 ICE 候选收集与最终选中的连接路径（host 直连 / srflx 打洞 /
+relay 中继）。
 
 ## 项目结构
 
@@ -72,10 +103,11 @@ build.rs            确保 web/dist 存在，供 rust-embed 编译期嵌入
 src/
   main.rs           CLI(clap) + 路由：/ 前端、/ws 信令、/healthz
   assets.rs         嵌入式前端静态资源 + SPA 回退
-  config.rs         环境变量配置（STUN/TURN/上限）
+  config.rs         环境变量配置（UDP 端口/公网 IP/上限等）
   protocol.rs       信令线格式（serde）
   room.rs           房间注册表 + 信令中继
-  turn.rs           TURN 临时凭证（HMAC-SHA1）
+  relay.rs          内置 STUN/TURN 服务器（打洞 + 中继兜底）
+  turn.rs           TURN 临时凭证（HMAC-SHA1，REST API 规则）
   ws.rs             WebSocket 连接生命周期
 web/                前端源码（Vue 3 + TS + Vite），详见 web/README.md
   dist/             前端构建产物，随仓库提交并被嵌入二进制

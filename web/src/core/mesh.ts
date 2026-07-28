@@ -18,7 +18,7 @@ import type {
   SharedFileMeta,
 } from './messages'
 import { Peer } from './peer'
-import type { IceServer } from './protocol'
+import type { BuiltinIce, IceServer } from './protocol'
 import type { Sas } from './security'
 import type { Signaling, SignalingState } from './signaling'
 import {
@@ -159,8 +159,9 @@ export class Mesh extends Emitter<MeshEvents> {
     this.signaling.connect()
     await this.signaling.ready()
 
-    const { iceServers } = await this.signaling.requestTurnCreds()
-    this.iceServers = iceServers.map(toRtcIceServer)
+    const { iceServers, builtin } = await this.signaling.requestTurnCreds()
+    // 内置 STUN/TURN 排在最前：它与本页同主机，必然可达。
+    this.iceServers = [...builtinIceServers(builtin), ...iceServers.map(toRtcIceServer)]
 
     this.signaling.send({ t: 'join', room, peerId: this.myId, nick: profile.nick })
   }
@@ -720,4 +721,22 @@ function toRtcIceServer(s: IceServer): RTCIceServer {
   if (s.username) out.username = s.username
   if (s.credential) out.credential = s.credential
   return out
+}
+
+/**
+ * 由内置 STUN/TURN 的端口与凭证拼出 ICE 服务器条目。
+ * 主机名取 location.hostname：客户端既然能打开本页面，该主机必然可达，
+ * 因此 pphub 自身就是最可靠的打洞/中继服务器。
+ */
+function builtinIceServers(builtin: BuiltinIce | null | undefined): RTCIceServer[] {
+  if (!builtin) return []
+  const host = location.hostname
+  return [
+    { urls: [`stun:${host}:${builtin.udpPort}`] },
+    {
+      urls: [`turn:${host}:${builtin.udpPort}?transport=udp`],
+      username: builtin.username,
+      credential: builtin.credential,
+    },
+  ]
 }

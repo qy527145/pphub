@@ -4,9 +4,23 @@
 // 绝不承载任何业务数据（聊天、文件、媒体都走 P2P 数据/媒体通道）。
 
 import { Emitter } from './emitter'
-import type { ClientMsg, IceServer, PeerInfo, ServerMsg, SignalData } from './protocol'
+import type {
+  BuiltinIce,
+  ClientMsg,
+  IceServer,
+  PeerInfo,
+  ServerMsg,
+  SignalData,
+} from './protocol'
 
 export type SignalingState = 'idle' | 'connecting' | 'open' | 'closed'
+
+/** turn-creds 响应负载。 */
+export interface TurnCredsPayload {
+  iceServers: IceServer[]
+  ttl: number
+  builtin?: BuiltinIce | null
+}
 
 type SignalingEvents = {
   state: SignalingState
@@ -26,7 +40,7 @@ export class Signaling extends Emitter<SignalingEvents> {
   private manualClose = false
   private reconnectAttempts = 0
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null
-  private turnWaiters: Array<(v: { iceServers: IceServer[]; ttl: number }) => void> = []
+  private turnWaiters: Array<(v: TurnCredsPayload) => void> = []
 
   constructor(url: string) {
     super()
@@ -102,7 +116,11 @@ export class Signaling extends Emitter<SignalingEvents> {
         this.emit('signal', { from: msg.from, data: msg.data })
         break
       case 'turn-creds': {
-        const payload = { iceServers: msg.iceServers, ttl: msg.ttl }
+        const payload: TurnCredsPayload = {
+          iceServers: msg.iceServers,
+          ttl: msg.ttl,
+          builtin: msg.builtin,
+        }
         const waiters = this.turnWaiters
         this.turnWaiters = []
         for (const resolve of waiters) resolve(payload)
@@ -131,7 +149,7 @@ export class Signaling extends Emitter<SignalingEvents> {
   }
 
   /** 领取 TURN/STUN 凭证；返回在收到服务端 turn-creds 时兑现的 Promise。 */
-  requestTurnCreds(): Promise<{ iceServers: IceServer[]; ttl: number }> {
+  requestTurnCreds(): Promise<TurnCredsPayload> {
     return new Promise((resolve) => {
       this.turnWaiters.push(resolve)
       this.send({ t: 'turn-creds' })

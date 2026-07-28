@@ -42,7 +42,12 @@ const b = await open('B')
 // A 先加入。
 send(a, { t: 'turn-creds' })
 const creds = await waitFor(a, (m) => m.t === 'turn-creds')
-check(Array.isArray(creds.iceServers) && creds.iceServers.length > 0, 'A 收到 ICE 服务器列表')
+// 内置 STUN/TURN 经 builtin 字段下发（端口+临时凭证）；外部 iceServers 列表可为空。
+check(
+  (creds.builtin && creds.builtin.udpPort > 0 && !!creds.builtin.credential) ||
+    (Array.isArray(creds.iceServers) && creds.iceServers.length > 0),
+  'A 收到可用的 ICE 服务器（内置或外部）',
+)
 check(!JSON.stringify(creds).includes('PPHUB_TURN_SECRET'), 'ICE 凭证不含明文密钥名')
 
 send(a, { t: 'join', room: ROOM, peerId: 'peer-a', nick: 'Alice' })

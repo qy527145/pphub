@@ -50,21 +50,85 @@ export interface SharedFileMeta {
   scope: SendScope
 }
 
-/** 画笔模式：普通笔或橡皮（橡皮以 destination-out 渲染）。 */
-export type DrawMode = 'pen' | 'eraser'
+/** 画笔模式：普通笔、橡皮、直线、箭头、折线、文本、图片、框选。 */
+export type DrawMode =
+  | 'pen'
+  | 'eraser'
+  | 'line'
+  | 'arrow'
+  | 'polyline'
+  | 'text'
+  | 'image'
+  | 'select'
 
 /**
- * 一条完整笔画。坐标归一化到 [0,1]（相对所属画面：白板为 16:9 逻辑板，
- * 屏幕批注为视频内容区），points 为扁平化的 [x0,y0,x1,y1,…]。
- * size 是逻辑宽 1280 下的像素线宽，渲染时按实际画布宽度等比缩放。
+ * 白板绘制元素基础接口。
  */
-export interface WbStroke {
+export interface WbElement {
   id: string
   color: string
-  size: number
   mode: DrawMode
+}
+
+/**
+ * 笔画元素（pen/eraser）。坐标归一化到 [0,1]，points 为扁平化的 [x0,y0,x1,y1,…]。
+ * size 是逻辑宽 1280 下的像素线宽，渲染时按实际画布宽度等比缩放。
+ */
+export interface WbStroke extends WbElement {
+  mode: 'pen' | 'eraser'
+  size: number
   points: number[]
 }
+
+/**
+ * 直线/箭头元素。
+ */
+export interface WbLine extends WbElement {
+  mode: 'line' | 'arrow'
+  size: number
+  x1: number
+  y1: number
+  x2: number
+  y2: number
+}
+
+/**
+ * 折线元素。points 为扁平化的 [x0,y0,x1,y1,…]，arrow=true 时在末段画箭头。
+ */
+export interface WbPolyline extends WbElement {
+  mode: 'polyline'
+  size: number
+  points: number[]
+  arrow?: boolean
+}
+
+/**
+ * 文本元素。
+ */
+export interface WbText extends WbElement {
+  mode: 'text'
+  x: number
+  y: number
+  text: string
+  fontSize: number
+}
+
+/**
+ * 图片元素。
+ */
+export interface WbImage extends WbElement {
+  mode: 'image'
+  x: number
+  y: number
+  width: number
+  height: number
+  dataUrl: string
+}
+
+/**
+ * 所有白板元素的联合类型。
+ */
+export type WbItem = WbStroke | WbLine | WbPolyline | WbText | WbImage
 
 /**
  * 画面（board）寻址：
@@ -107,15 +171,23 @@ export type ControlMessage =
   | { kind: 'screen-start'; scope: SendScope }
   | { kind: 'screen-stop' }
   // —— 绘制（白板 / 屏幕批注共用）——
-  | { kind: 'draw-begin'; board: BoardId; id: string; color: string; size: number; mode: DrawMode; x: number; y: number }
+  | { kind: 'draw-begin'; board: BoardId; id: string; color: string; size: number; mode: 'pen' | 'eraser'; x: number; y: number }
   /** 追加一批采样点（扁平化 x,y 序列，发送端按 ~25fps 批量）。 */
   | { kind: 'draw-points'; board: BoardId; id: string; pts: number[] }
   | { kind: 'draw-end'; board: BoardId; id: string }
-  /** 撤销：按 id 移除若干笔画（仅撤自己画的）。 */
+  /** 添加直线/箭头元素。 */
+  | { kind: 'draw-line'; board: BoardId; id: string; color: string; size: number; mode: 'line' | 'arrow'; x1: number; y1: number; x2: number; y2: number }
+  /** 添加折线元素。 */
+  | { kind: 'draw-polyline'; board: BoardId; id: string; color: string; size: number; points: number[]; arrow?: boolean }
+  /** 添加文本元素。 */
+  | { kind: 'draw-text'; board: BoardId; id: string; color: string; x: number; y: number; text: string; fontSize: number }
+  /** 添加图片元素。 */
+  | { kind: 'draw-image'; board: BoardId; id: string; x: number; y: number; width: number; height: number; dataUrl: string }
+  /** 撤销：按 id 移除若干元素（仅撤自己画的）。 */
   | { kind: 'draw-remove'; board: BoardId; ids: string[] }
   | { kind: 'draw-clear'; board: BoardId }
   /** 全量状态同步（发给新入房的对端，接收方按 id 去重合并）。 */
-  | { kind: 'draw-state'; board: BoardId; strokes: WbStroke[] }
+  | { kind: 'draw-state'; board: BoardId; items: WbItem[] }
   // —— 远程指针（白板成员光标 / 屏幕共享「激光笔」）——
   | { kind: 'ptr-move'; board: BoardId; x: number; y: number }
   | { kind: 'ptr-click'; board: BoardId; x: number; y: number }

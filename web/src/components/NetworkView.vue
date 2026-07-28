@@ -185,7 +185,20 @@ const connectOpen = computed(() => store.peerCount === 0 || showConnect.value)
 
 async function copy(text: string, flag: 'code' | 'link') {
   try {
-    await navigator.clipboard.writeText(text)
+    // 优先使用现代 Clipboard API
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(text)
+    } else {
+      // 降级方案：使用传统的 document.execCommand
+      const textarea = document.createElement('textarea')
+      textarea.value = text
+      textarea.style.position = 'fixed'
+      textarea.style.opacity = '0'
+      document.body.appendChild(textarea)
+      textarea.select()
+      document.execCommand('copy')
+      document.body.removeChild(textarea)
+    }
     if (flag === 'code') {
       copiedCode.value = true
       setTimeout(() => (copiedCode.value = false), 1500)
@@ -193,8 +206,8 @@ async function copy(text: string, flag: 'code' | 'link') {
       copiedLink.value = true
       setTimeout(() => (copiedLink.value = false), 1500)
     }
-  } catch {
-    /* http 环境剪贴板不可用，忽略 */
+  } catch (err) {
+    console.error('复制失败:', err)
   }
 }
 

@@ -30,6 +30,21 @@ const dmPeer = computed(() => {
 const tool = ref<'pointer' | DrawMode>('pen')
 const color = ref('#6c4bf4')
 const size = ref(3)
+const polylineArrow = ref(false)
+const layerRef = ref<InstanceType<typeof DrawLayer> | null>(null)
+const selectedCount = computed(() => layerRef.value?.selectedCount ?? 0)
+
+// 切工具时把粗细切到该工具的量纲上，避免出现 36px 的画笔或 3px 的橡皮。
+function setTool(newTool: 'pointer' | DrawMode): void {
+  tool.value = newTool
+  if (newTool === 'eraser') {
+    size.value = 36
+  } else if (newTool === 'text') {
+    size.value = 24
+  } else if (newTool !== 'pointer' && newTool !== 'select' && newTool !== 'image') {
+    size.value = 3
+  }
+}
 
 // —— 16:9 letterbox 几何 ——
 const wrapEl = ref<HTMLDivElement | null>(null)
@@ -130,12 +145,19 @@ const syncHint = computed(() => {
 
     <div class="tools">
       <DrawToolbar
-        v-model:tool="tool"
-        v-model:color="color"
-        v-model:size="size"
+        :tool="tool"
+        :color="color"
+        :size="size"
+        :polyline-arrow="polylineArrow"
+        :selected-count="selectedCount"
         pointer-label="激光笔（位置实时投给参与者）"
+        @update:tool="setTool"
+        @update:color="color = $event"
+        @update:size="size = $event"
+        @update:polyline-arrow="polylineArrow = $event"
         @undo="store.undoStroke(board)"
         @clear="clear"
+        @delete-selection="layerRef?.deleteSelection()"
       />
     </div>
 
@@ -151,11 +173,13 @@ const syncHint = computed(() => {
       >
         <DrawLayer
           v-if="rect.width > 0"
+          ref="layerRef"
           :key="board"
           :board="board"
           :tool="tool"
           :color="color"
           :size="size"
+          :polyline-arrow="polylineArrow"
           :width="rect.width"
           :height="rect.height"
         />

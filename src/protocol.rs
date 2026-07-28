@@ -26,6 +26,16 @@ pub struct IceServer {
     pub credential: Option<String>,
 }
 
+/// 内置 STUN/TURN 的接入信息。主机名由前端取 `location.hostname` 拼接
+/// （服务端无法可靠得知客户端访问自己用的地址），端口与凭证由此下发。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BuiltinIce {
+    pub udp_port: u16,
+    pub username: String,
+    pub credential: String,
+}
+
 /// 客户端 → 服务器。
 #[derive(Debug, Deserialize)]
 #[serde(tag = "t", rename_all = "kebab-case", rename_all_fields = "camelCase")]
@@ -66,9 +76,12 @@ pub enum ServerMsg {
         data: serde_json::Value,
     },
     /// TURN/STUN 凭证响应；`ttl` 为凭证有效期（秒）。
+    /// `builtin` 为内置 STUN/TURN 的端口与凭证（未启动时缺省）。
     TurnCreds {
         ice_servers: Vec<IceServer>,
         ttl: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        builtin: Option<BuiltinIce>,
     },
     /// 错误。
     Error { code: String, msg: String },

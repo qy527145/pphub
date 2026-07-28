@@ -1,0 +1,157 @@
+//! 内置 STUN/TURN 服务器（基于 webrtc-rs `turn` crate）。
+//!
+//! 设计依据：客户端必然能访问 pphub 的 web/信令端口，因此 pphub 所在主机
+//! 天然是最合适的 STUN/TURN 服务器——无需依赖任何第三方公共服务。
+//!
+//! - 单个 UDP 端口同时应答 STUN Binding（打洞探测）与 TURN Allocate（中继）；
+//! - 凭证走 TURN REST API 规则（username=过期时间戳，credential=HMAC），
+//!   共享密钥进程启动时随机生成，只存在于内存，无需任何配置；
+//! - 前端用 `location.hostname` + 本模块端口拼出 `stun:`/`turn:` URL，
+//!   保证「客户端能打开网页 ⇒ 就能用上这台 STUN/TURN」。
+
+use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
+
+use tokio::net::UdpSocket;
+use tokio::time::Duration;
+use turn::auth::{AuthHandler, generate_auth_key};
+use turn::relay::relay_static::RelayAddressGeneratorStatic;
+use turn::server::config::{ConnConfig, ServerConfig};
+use turn::server::Server;
+use webrtc_util::vnet::net::Net;
+
+use crate::config::Config;
+use crate::protocol::BuiltinIce;
+use crate::turn::{make_credentials, now_secs, password_for};
+
+const REALM: &str = "pphub";
+
+/// 运行中的内置中继：保存端口与密钥，供信令层签发凭证。
+pub struct BuiltinRelay {
+    /// 实际监听的 UDP 端口（供前端拼 URL）。
+    pub udp_port: u16,
+    /// 进程内随机密钥（永不下发，仅用于签发/校验凭证）。
+    secret: String,
+    /// 持有 Server 以维持其内部任务存活。
+    _server: Server,
+}
+
+impl BuiltinRelay {
+    /// 启动内置 STUN/TURN。失败（如端口被占用）时返回 None 并降级继续运行。
+    pub async fn start(cfg: &Config) -> Option<Arc<BuiltinRelay>> {
+        let relay_ip = match cfg
+            .public_ip
+            .as_deref()
+            .and_then(|s| s.parse::<IpAddr>().ok())
+            .or_else(detect_local_ip)
+        {
+            Some(ip) => ip,
+            None => {
+                tracing::warn!("无法确定本机 IP，内置 STUN/TURN 未启动（可设 PPHUB_PUBLIC_IP）");
+                return None;
+            }
+        };
+
+        let conn = match UdpSocket::bind(("0.0.0.0", cfg.udp_port)).await {
+            Ok(c) => Arc::new(c),
+            Err(e) => {
+                tracing::warn!(
+                    "UDP {} 绑定失败（{e}），内置 STUN/TURN 未启动（可设 PPHUB_UDP_PORT 换端口）",
+                    cfg.udp_port
+                );
+                return None;
+            }
+        };
+        let udp_port = conn.local_addr().ok()?.port();
+
+        let secret = random_secret();
+        let auth = SecretAuth {
+            secret: secret.clone(),
+        };
+
+        let server = Server::new(ServerConfig {
+            conn_configs: vec![ConnConfig {
+                conn,
+                relay_addr_generator: Box::new(RelayAddressGeneratorStatic {
+                    relay_address: relay_ip,
+                    address: "0.0.0.0".to_owned(),
+                    net: Arc::new(Net::new(None)),
+                }),
+            }],
+            realm: REALM.to_owned(),
+            auth_handler: Arc::new(auth),
+            channel_bind_timeout: Duration::from_secs(0),
+            alloc_close_notify: None,
+        })
+        .await;
+
+        match server {
+            Ok(server) => {
+                tracing::info!(
+                    "内置 STUN/TURN 已启动: udp/{udp_port}，中继地址 {relay_ip}"
+                );
+                Some(Arc::new(BuiltinRelay {
+                    udp_port,
+                    secret,
+                    _server: server,
+                }))
+            }
+            Err(e) => {
+                tracing::warn!("内置 STUN/TURN 启动失败: {e}");
+                None
+            }
+        }
+    }
+
+    /// 为一个客户端签发临时凭证（前端据此拼 stun:/turn: URL）。
+    pub fn issue_creds(&self, ttl: u64) -> BuiltinIce {
+        let (username, credential) = make_credentials(&self.secret, ttl);
+        BuiltinIce {
+            udp_port: self.udp_port,
+            username,
+            credential,
+        }
+    }
+}
+
+/// 校验 TURN REST 凭证：username 是未过期的时间戳，密码由密钥重新派生比对。
+struct SecretAuth {
+    secret: String,
+}
+
+impl AuthHandler for SecretAuth {
+    fn auth_handle(
+        &self,
+        username: &str,
+        realm: &str,
+        _src_addr: SocketAddr,
+    ) -> Result<Vec<u8>, turn::Error> {
+        let expiry: u64 = username
+            .parse()
+            .map_err(|_| turn::Error::Other("bad turn username".into()))?;
+        if expiry < now_secs() {
+            return Err(turn::Error::Other("turn credential expired".into()));
+        }
+        let password = password_for(&self.secret, username);
+        Ok(generate_auth_key(username, realm, &password))
+    }
+}
+
+/// 生成 256 位随机密钥（十六进制）。
+fn random_secret() -> String {
+    let mut buf = [0u8; 32];
+    getrandom::getrandom(&mut buf).expect("os rng available");
+    buf.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// 探测本机对外网卡 IP：UDP connect 不发包，仅让内核选路。
+fn detect_local_ip() -> Option<IpAddr> {
+    let sock = std::net::UdpSocket::bind(("0.0.0.0", 0)).ok()?;
+    sock.connect(("8.8.8.8", 80)).ok()?;
+    let ip = sock.local_addr().ok()?.ip();
+    if ip.is_unspecified() || ip.is_loopback() {
+        None
+    } else {
+        Some(ip)
+    }
+}

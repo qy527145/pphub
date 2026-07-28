@@ -1,4 +1,4 @@
-// 与 Rust 信令服务器 (crates/signaling/src/protocol.rs) 一一对应的线格式。
+// 与 Rust 信令服务器 (src/protocol.rs) 一一对应的线格式。
 //
 // 服务端使用 #[serde(tag = "t", rename_all = "kebab-case",
 // rename_all_fields = "camelCase")]，因此：
@@ -18,6 +18,16 @@ export interface IceServer {
   credential?: string | null
 }
 
+/**
+ * 内置 STUN/TURN 的接入信息：服务端只知道端口与凭证，
+ * 主机名由前端取 location.hostname 拼接（客户端能开网页 ⇒ 该主机可达）。
+ */
+export interface BuiltinIce {
+  udpPort: number
+  username: string
+  credential: string
+}
+
 /** 客户端 → 服务端。 */
 export type ClientMsg =
   | { t: 'join'; room: string; peerId: string; nick?: string | null }
@@ -31,7 +41,7 @@ export type ServerMsg =
   | { t: 'peer-join'; peer: PeerInfo }
   | { t: 'peer-left'; peerId: string }
   | { t: 'signal'; from: string; data: SignalData }
-  | { t: 'turn-creds'; iceServers: IceServer[]; ttl: number }
+  | { t: 'turn-creds'; iceServers: IceServer[]; ttl: number; builtin?: BuiltinIce | null }
   | { t: 'error'; code: string; msg: string }
 
 /**

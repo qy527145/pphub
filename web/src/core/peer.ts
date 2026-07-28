@@ -10,6 +10,7 @@ import { Emitter } from './emitter'
 import type { ControlMessage } from './messages'
 import type { SignalData } from './protocol'
 import { type Sas, computeSas, extractFingerprint } from './security'
+import { IceDebugger } from '../utils/ice-debug'
 
 export interface PeerConfig {
   /** 对端 peerId。 */
@@ -18,7 +19,7 @@ export interface PeerConfig {
   polite: boolean
   /** 是否由本端创建 control 通道并发起首个 offer。 */
   initiator: boolean
-  /** ICE 服务器（STUN/TURN）。 */
+  /** ICE 服务器（STUN/TURN），首项为 pphub 内置中继。 */
   iceServers: RTCIceServer[]
   /** 把一条信令交给信令层发往对端。 */
   sendSignal: (data: SignalData) => void
@@ -46,6 +47,7 @@ export class Peer extends Emitter<PeerEvents> {
   private swarm: RTCDataChannel | null = null
   private readonly polite: boolean
   private readonly sendSignal: (data: SignalData) => void
+  private iceDebugger: IceDebugger | null = null
 
   // 完美协商状态机标志。
   private makingOffer = false
@@ -58,7 +60,21 @@ export class Peer extends Emitter<PeerEvents> {
     this.remoteId = cfg.remoteId
     this.polite = cfg.polite
     this.sendSignal = cfg.sendSignal
-    this.pc = new RTCPeerConnection({ iceServers: cfg.iceServers })
+
+    this.pc = new RTCPeerConnection({
+      iceServers: cfg.iceServers,
+      // 提前收集候选（含内置 TURN 的 relay 候选），加速连接建立。
+      iceCandidatePoolSize: 4,
+      iceTransportPolicy: 'all',
+      bundlePolicy: 'max-bundle',
+      rtcpMuxPolicy: 'require',
+    })
+
+    // 启用 ICE 调试（开发/诊断模式）
+    if (localStorage.getItem('pphub:debug:ice') === 'true') {
+      this.iceDebugger = new IceDebugger(this.pc, cfg.remoteId)
+    }
+
     this.wire()
     if (cfg.initiator) {
       this.setupControl(this.pc.createDataChannel('control', { ordered: true }))
@@ -145,6 +161,10 @@ export class Peer extends Emitter<PeerEvents> {
       } else {
         try {
           await pc.addIceCandidate(data.candidate ?? undefined)
+          // 记录远程候选用于调试
+          if (this.iceDebugger && data.candidate) {
+            this.iceDebugger.addRemoteCandidate(data.candidate as RTCIceCandidate)
+          }
         } catch (err) {
           if (!this.ignoreOffer) throw err
         }
@@ -178,25 +198,21 @@ export class Peer extends Emitter<PeerEvents> {
 
   /** 通过 control 通道发送一条控制消息；未就绪则返回 false。 */
   sendControl(msg: ControlMessage): boolean {
-    if (this.control && this.control.readyState === 'open') {
-      this.control.send(JSON.stringify(msg))
-      return true
-    }
-    return false
+    if (this.control?.readyState !== 'open') return false
+    this.control.send(JSON.stringify(msg))
+    return true
   }
 
   /** 在 swarm 通道上发一帧分块数据；未就绪返回 false。 */
   sendChunk(frame: ArrayBuffer): boolean {
-    if (this.swarm && this.swarm.readyState === 'open') {
-      this.swarm.send(frame)
-      return true
-    }
-    return false
+    if (this.swarm?.readyState !== 'open') return false
+    this.swarm.send(frame)
+    return true
   }
 
   /** swarm 通道当前积压字节数（供块方据此限流，避免打爆缓冲）。 */
   get swarmBuffered(): number {
-    return this.swarm?.bufferedAmount ?? 0
+    return this.swarm?.readyState === 'open' ? this.swarm.bufferedAmount : 0
   }
 
   get swarmReady(): boolean {

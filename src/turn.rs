@@ -4,6 +4,7 @@
 //!   username   = "<过期时间戳>"
 //!   credential = base64( HMAC-SHA1( secret, username ) )
 //! 共享密钥只存在于服务端，绝不下发前端。
+//! 内置 TURN 服务器（relay.rs）与外部 coturn 共用同一套凭证格式。
 
 use base64::{Engine, engine::general_purpose::STANDARD};
 use hmac::{Hmac, Mac};
@@ -15,7 +16,8 @@ use crate::protocol::IceServer;
 
 type HmacSha1 = Hmac<Sha1>;
 
-/// 根据配置构建下发给前端的 ICE 服务器列表，返回 `(ice_servers, ttl)`。
+/// 根据配置构建下发给前端的**外部** ICE 服务器列表，返回 `(ice_servers, ttl)`。
+/// 内置 STUN/TURN 不在此列（其地址依赖客户端访问的主机名，由前端拼接）。
 pub fn build_ice_servers(cfg: &Config) -> (Vec<IceServer>, u64) {
     let mut servers = Vec::new();
 
@@ -49,19 +51,23 @@ pub fn build_ice_servers(cfg: &Config) -> (Vec<IceServer>, u64) {
     (servers, cfg.turn_ttl)
 }
 
-fn make_credentials(secret: &str, ttl: u64) -> (String, String) {
-    let expiry = now_secs().saturating_add(ttl);
-    let username = expiry.to_string();
-
+/// 由共享密钥为 username 派生密码（TURN REST API 规则）。
+pub fn password_for(secret: &str, username: &str) -> String {
     let mut mac =
         HmacSha1::new_from_slice(secret.as_bytes()).expect("HMAC accepts key of any size");
     mac.update(username.as_bytes());
-    let credential = STANDARD.encode(mac.finalize().into_bytes());
+    STANDARD.encode(mac.finalize().into_bytes())
+}
 
+/// 签发一组临时凭证：`(username, credential)`。
+pub fn make_credentials(secret: &str, ttl: u64) -> (String, String) {
+    let expiry = now_secs().saturating_add(ttl);
+    let username = expiry.to_string();
+    let credential = password_for(secret, &username);
     (username, credential)
 }
 
-fn now_secs() -> u64 {
+pub fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
