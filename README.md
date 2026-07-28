@@ -118,7 +118,29 @@ location /pphub/ {
   需要跨网络共享屏幕就得开 `--stun-turn`。
 - **中继需要安全上下文**。浏览器只在 https 或 localhost 下提供 `crypto.subtle`，
   以明文 http + 局域网 IP 访问时中继无法加密，此时 pphub 宁可拒绝降级也不
-  明文转发，界面会提示改用 https 或放行 3478。
+  明文转发，界面会提示改用 https 或放行 3478。详见下节。
+
+## 用 http 访问（非 localhost）会失去什么
+
+浏览器把「https 或 localhost」之外的页面判定为**非安全上下文**并禁用一批 API。
+以下为在 Chromium 上对 `http://<局域网 IP>:<端口>` 的实测结果：
+
+| 能力 | http + 局域网 IP | 影响 |
+|---|---|---|
+| `RTCPeerConnection` / DataChannel | ✅ 可用 | 同网段直连、聊天、文件、白板全部正常 |
+| `crypto.subtle` | ❌ | **SAS 安全核验失效**；**WS 中继被拒绝**，打不通的对端彻底连不上 |
+| `getDisplayMedia` | ❌ | 无法发起屏幕共享（仍可观看他人共享） |
+| `navigator.clipboard` | ❌ | 自动退回 `execCommand('copy')`，复制功能仍可用 |
+| `crypto.randomUUID` | ❌ | 无影响，已用 `getRandomValues` 兜底 |
+| `showSaveFilePicker` / OPFS | ❌ | 无影响，收文件本就是内存 Blob，未用这两个 API |
+
+**最需要注意的是 `crypto.subtle`**：它同时砍掉了中间人核验和唯一的中继兜底。
+也就是说明文 http + 默认单端口的组合下，**只有同网段的设备能互连**。
+
+进入网络页时会显示一条黄色横幅列出以上受限项，不必等到连接失败才发现。要恢复
+全部能力，给 nginx 配 https（局域网可用 mkcert 自签并在各设备装根证书，或用真实
+域名解析到内网 IP 走 Let's Encrypt DNS-01）；或者退一步开 `--stun-turn`，让 ICE
+层打洞接住跨网络那部分，这样即使没有 https 也不必依赖 WS 中继。
 
 ## 内置 STUN/TURN（`--stun-turn`，NAT 穿透）
 
@@ -264,7 +286,8 @@ cargo run -- -p 8848           # 终端 1：信令
 npm --prefix web run dev       # 终端 2：http://localhost:5173
 ```
 
-> WebRTC 与 SAS 指纹校验依赖「安全上下文」：`localhost` 天然满足；经局域网 IP
-> 访问需 https，否则 `crypto.subtle` 不可用、SAS 降级。
+> `localhost` 天然算「安全上下文」，开发时无需 https。经局域网 IP 明文访问时
+> 部分浏览器 API 会被禁用（SAS、屏幕共享、WS 中继等），详见下节；WebRTC 数据
+> 通道本身不受影响。
 
 详见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。

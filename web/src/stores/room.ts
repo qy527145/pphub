@@ -1080,10 +1080,11 @@ export const useRoomStore = defineStore('room', () => {
         return
       }
     }
-    // 尝试恢复刷新前的房间
+    // 尝试恢复刷新前的房间。刷新前若在监听，存的就是自己的短码房，
+    // 直接 joinRoom 恢复监听；connectTo 的自码校验只针对手动输入。
     const savedRoom = sessionStorage.getItem(SS_CURRENT_ROOM)
     if (savedRoom && savedRoom.trim()) {
-      await connectTo(savedRoom)
+      await joinRoom(savedRoom.trim())
       return
     }
     if (allowIncoming.value) await listen()

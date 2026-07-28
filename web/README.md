@@ -58,8 +58,10 @@ cd web && npm install && npm run dev
 Vite 已把 `/ws` 代理到 `ws://localhost:8848`，因此前端始终用同源 `ws://<host>/ws`，
 与一体化部署一致；也可用 `.env` 里的 `VITE_SIGNALING_URL` 覆盖。
 
-> WebRTC 与 SAS 指纹校验依赖「安全上下文」。`localhost` 天然算安全上下文；
-> 若通过局域网 IP 访问，需 https，否则 `crypto.subtle` 不可用、SAS 会降级为不可用。
+> `localhost` 天然算「安全上下文」，开发时无需 https。经局域网 IP 明文访问时
+> `crypto.subtle`（SAS + WS 中继加密）、`getDisplayMedia`、剪贴板 API 会被浏览器
+> 禁用，进入网络页会显示一条黄色横幅说明受限项；`RTCPeerConnection` 与数据通道
+> 本身不受影响，同网段直连、聊天、文件、白板都正常。
 
 ## 脚本
 

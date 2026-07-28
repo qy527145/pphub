@@ -7,10 +7,18 @@
 import { computed, ref } from 'vue'
 import { useRoomStore, type Member } from '@/stores/room'
 import { AVATAR_COLORS, AVATAR_EMOJIS } from '@/core/profile'
+import { copyText } from '@/utils/clipboard'
 import AppIcon from './AppIcon.vue'
 import PeerAvatar from './PeerAvatar.vue'
 
 const store = useRoomStore()
+
+// 非安全上下文（局域网 http）下多项能力被浏览器禁用，进页面即提示一次。
+// 关掉后本次会话不再出现——刷新仍会提示，因为这直接影响能否连上人。
+const insecureDismissed = ref(false)
+const showInsecureHint = computed(
+  () => !store.capabilities.secureContext && !insecureDismissed.value,
+)
 
 // —— 画布几何 ——
 const VIEW = 640
@@ -184,30 +192,16 @@ const copiedLink = ref(false)
 const connectOpen = computed(() => store.peerCount === 0 || showConnect.value)
 
 async function copy(text: string, flag: 'code' | 'link') {
-  try {
-    // 优先使用现代 Clipboard API
-    if (navigator.clipboard && navigator.clipboard.writeText) {
-      await navigator.clipboard.writeText(text)
-    } else {
-      // 降级方案：使用传统的 document.execCommand
-      const textarea = document.createElement('textarea')
-      textarea.value = text
-      textarea.style.position = 'fixed'
-      textarea.style.opacity = '0'
-      document.body.appendChild(textarea)
-      textarea.select()
-      document.execCommand('copy')
-      document.body.removeChild(textarea)
-    }
-    if (flag === 'code') {
-      copiedCode.value = true
-      setTimeout(() => (copiedCode.value = false), 1500)
-    } else {
-      copiedLink.value = true
-      setTimeout(() => (copiedLink.value = false), 1500)
-    }
-  } catch (err) {
-    console.error('复制失败:', err)
+  if (!(await copyText(text))) {
+    store.lastError = '复制失败，请手动选中文本复制'
+    return
+  }
+  if (flag === 'code') {
+    copiedCode.value = true
+    setTimeout(() => (copiedCode.value = false), 1500)
+  } else {
+    copiedLink.value = true
+    setTimeout(() => (copiedLink.value = false), 1500)
   }
 }
 
@@ -265,6 +259,17 @@ function stateLabel(m: { state: string; transport: string }): string {
     <!-- 错误/能力提示 -->
     <div v-if="!store.capabilities.webrtc" class="banner danger" @click.stop>
       当前浏览器不支持 WebRTC，无法建立 P2P 连接。请换用新版 Chrome / Edge / Firefox / Safari。
+    </div>
+    <div v-if="showInsecureHint" class="banner warn" @click.stop>
+      <span>
+        当前以 http 访问（非 localhost），浏览器判定为<b>非安全上下文</b>：
+        <b>安全核验（SAS）</b>、<b>发起屏幕共享</b>、以及 WebRTC 打不通时的
+        <b>服务器中继兜底</b>均不可用——跨网段的设备可能因此连不上。
+        同网段直连与聊天 / 文件 / 白板不受影响。改用 https 访问可恢复全部功能。
+      </span>
+      <button class="ghost close" title="不再提示" @click="insecureDismissed = true">
+        <AppIcon name="x" :size="14" />
+      </button>
     </div>
     <div v-if="store.lastError" class="banner danger" @click.stop>
       {{ store.lastError }}
@@ -601,6 +606,14 @@ function stateLabel(m: { state: string; transport: string }): string {
   background: var(--danger-weak);
   color: var(--danger-fg);
   border: 1px solid var(--danger);
+}
+
+.banner.warn {
+  background: var(--warn-weak);
+  color: var(--warn-fg);
+  border: 1px solid var(--warn);
+  line-height: 1.6;
+  align-items: flex-start;
 }
 
 .banner .close {

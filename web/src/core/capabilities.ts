@@ -2,7 +2,11 @@
 // 严格避免调用会触发权限弹窗的 API（如 getUserMedia），仅做存在性检查。
 
 export interface Capabilities {
-  /** 是否安全上下文（https / localhost）；WebRTC、crypto.subtle、剪贴板等均依赖它。 */
+  /**
+   * 是否安全上下文（https / localhost）。注意 RTCPeerConnection 本身**不**依赖它
+   * （明文 http 下数据通道照常可用），受影响的是 crypto.subtle（SAS + WS 中继
+   * 加密）、getDisplayMedia、剪贴板等。
+   */
   secureContext: boolean
   /** RTCPeerConnection 是否可用。 */
   webrtc: boolean

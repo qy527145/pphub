@@ -4,6 +4,7 @@
 import { computed, nextTick, ref, watch } from 'vue'
 import { useRoomStore } from '@/stores/room'
 import { fmtBytes, fmtTime } from '@/utils/format'
+import { copyText } from '@/utils/clipboard'
 import AppIcon from './AppIcon.vue'
 import PeerAvatar from './PeerAvatar.vue'
 
@@ -69,13 +70,12 @@ function onFilePicked(ev: Event) {
 }
 
 async function copyMessage(id: number, text: string) {
-  try {
-    await navigator.clipboard.writeText(text)
-    copiedId.value = id
-    setTimeout(() => (copiedId.value = null), 1200)
-  } catch {
-    /* ignore */
+  if (!(await copyText(text))) {
+    store.lastError = '复制失败，请手动选中文本复制'
+    return
   }
+  copiedId.value = id
+  setTimeout(() => (copiedId.value = null), 1200)
 }
 
 function pickChannel(ch: 'all' | string) {
