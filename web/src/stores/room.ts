@@ -121,10 +121,13 @@ const SS_MY_CODE = 'pphub.myCode'
 function defaultSignalingUrl(): string {
   const fromEnv = import.meta.env.VITE_SIGNALING_URL
   if (fromEnv) return fromEnv
-  // 同源：嵌入式部署时前端与信令由同一 pphub 进程/端口提供；
-  // 开发时 Vite 通过 /ws 代理转发到信令服务器（见 vite.config.ts）。
+  // 相对路径：自动继承 nginx 反向代理的路径前缀。
+  // 取 pathname 的目录部分（去掉末段非斜线内容），再拼 ws。
   const proto = location.protocol === 'https:' ? 'wss' : 'ws'
-  return `${proto}://${location.host}/ws`
+  const dir = location.pathname.endsWith('/')
+    ? location.pathname
+    : location.pathname.slice(0, location.pathname.lastIndexOf('/') + 1)
+  return `${proto}://${location.host}${dir}ws`
 }
 
 /** 6 位数字临时短码（会话内稳定，刷新不变、关标签页失效）。 */
