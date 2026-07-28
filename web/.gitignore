@@ -1,0 +1,12 @@
+# 依赖与本地文件
+node_modules/
+*.local
+
+# 注意：web/dist 不忽略——它会被编译期嵌入 pphub 二进制，随仓库提交以支持
+# `cargo install`（无需 Node 工具链）。改动前端后需重新 build 并提交 dist。
+
+# 编辑器
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store

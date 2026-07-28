@@ -2,5 +2,29 @@
 name = "pphub"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+description = "免安装、纯浏览器的 P2P 直连协作应用（单二进制，前端嵌入）"
+# 前端产物 web/dist 编译期嵌入二进制；改动 web/ 后需 `npm --prefix web run build`。
+include = ["/src/**", "/build.rs", "/web/dist/**", "/README.md", "/LICENSE"]
 
 [dependencies]
+axum = { version = "0.8", features = ["ws"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+futures-util = "0.3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+hmac = "0.12"
+sha1 = "0.10"
+base64 = "0.22"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+clap = { version = "4", features = ["derive", "env"] }
+rust-embed = { version = "8", features = ["mime-guess"] }
+mime_guess = "2"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true

@@ -1,0 +1,1215 @@
+import { computed, reactive, ref, shallowReactive, shallowRef } from 'vue'
+import { defineStore } from 'pinia'
+
+import { peerColor } from '@/core/draw'
+import { Mesh } from '@/core/mesh'
+import type { DrawMessage } from '@/core/mesh'
+import type {
+  Avatar,
+  DrawMode,
+  Profile,
+  SendScope,
+  SharedFileMeta,
+  TransferMode,
+  WbStroke,
+} from '@/core/messages'
+import { type Capabilities, detectCapabilities } from '@/core/capabilities'
+import { imageToAvatar, loadProfile, saveProfile } from '@/core/profile'
+import type { Sas } from '@/core/security'
+import { Signaling, type SignalingState } from '@/core/signaling'
+import {
+  applyTheme,
+  initialTheme,
+  persistTheme,
+  type Theme,
+  watchSystemTheme,
+} from '@/core/theme'
+
+/** idle=未上线 · connecting=正在进房 · online=已在房间（监听中或已连接对端） */
+export type Status = 'idle' | 'connecting' | 'online'
+
+export type View = 'network' | 'send' | 'receive' | 'chat' | 'screen' | 'board'
+
+export interface Member {
+  peerId: string
+  nick?: string
+  state: RTCPeerConnectionState | 'new'
+  sas?: Sas
+  /** 用户已带外核对 SAS 一致。 */
+  verified: boolean
+  /** 该对端正在共享屏幕（screen-start 已到，媒体流可能稍后到达）。 */
+  sharing?: boolean
+  /** 对端名片（昵称 + 头像）；未到达时回退 nick/peerId。 */
+  profile?: Profile
+}
+
+/** 白板/批注上的远程成员光标。 */
+export interface RemotePointer {
+  peerId: string
+  x: number
+  y: number
+  ts: number
+  color: string
+}
+
+/** 点击涟漪特效（转瞬即逝，由 store 定时清除）。 */
+export interface ClickFx {
+  id: number
+  board: string
+  x: number
+  y: number
+  color: string
+}
+
+/** 聊天频道：'all' 为群聊，否则为对端 peerId（一对一私聊）。 */
+export type ChatChannel = 'all' | string
+
+export interface ChatEntry {
+  id: number
+  from: string
+  fromNick: string
+  text: string
+  ts: number
+  self: boolean
+  channel: ChatChannel
+}
+
+export interface Transfer {
+  id: string
+  direction: 'send' | 'recv'
+  peerId: string
+  peerNick: string
+  name: string
+  size: number
+  bytes: number
+  state: 'pending' | 'active' | 'done' | 'error' | 'canceled'
+  error?: string
+  /** 接收完成后的 objectURL，可再次保存。 */
+  url?: string
+  startedAt: number
+  finishedAt?: number
+}
+
+/** 懒发送 / 多源下载条目（共享目录里的一项）。 */
+export interface ShareItem {
+  fileId: string
+  name: string
+  size: number
+  mime: string
+  ownerId: string
+  scope: SendScope
+  ts: number
+  /** 本端是共享方（持有原始文件）。 */
+  local: boolean
+  /** idle=可下载 · downloading=多源下载中 · done=已完成 · error=失败 */
+  state: 'idle' | 'downloading' | 'done' | 'error'
+  bytes: number
+  /** 当前参与供块的源数量。 */
+  sources: number
+  /** 本端作为源被拉取过的次数（上传活动指示）。 */
+  served: number
+  url?: string
+  error?: string
+}
+
+const LS_ALLOW_INCOMING = 'pphub.allowIncoming'
+const LS_DEVICE_NAME = 'pphub.deviceName'
+const SS_MY_CODE = 'pphub.myCode'
+
+function defaultSignalingUrl(): string {
+  const fromEnv = import.meta.env.VITE_SIGNALING_URL
+  if (fromEnv) return fromEnv
+  // 同源：嵌入式部署时前端与信令由同一 pphub 进程/端口提供；
+  // 开发时 Vite 通过 /ws 代理转发到信令服务器（见 vite.config.ts）。
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws'
+  return `${proto}://${location.host}/ws`
+}
+
+/** 6 位数字临时短码（会话内稳定，刷新不变、关标签页失效）。 */
+function ensureMyCode(): string {
+  const saved = sessionStorage.getItem(SS_MY_CODE)
+  if (saved && /^\d{6}$/.test(saved)) return saved
+  return regenCode()
+}
+
+function regenCode(): string {
+  const buf = new Uint32Array(1)
+  crypto.getRandomValues(buf)
+  const code = String(buf[0] % 1_000_000).padStart(6, '0')
+  sessionStorage.setItem(SS_MY_CODE, code)
+  return code
+}
+
+/** 从 UA 推导默认设备名（如 “Mac · Chrome”）。 */
+function defaultDeviceName(): string {
+  const ua = navigator.userAgent
+  const browser = ua.includes('Edg/')
+    ? 'Edge'
+    : ua.includes('Firefox/')
+      ? 'Firefox'
+      : ua.includes('Chrome/')
+        ? 'Chrome'
+        : ua.includes('Safari/')
+          ? 'Safari'
+          : '浏览器'
+  const os = /Windows/.test(ua)
+    ? 'Windows'
+    : /Macintosh|Mac OS X/.test(ua)
+      ? 'Mac'
+      : /Android/.test(ua)
+        ? 'Android'
+        : /iPhone|iPad|iPod/.test(ua)
+          ? 'iPhone'
+          : /Linux/.test(ua)
+            ? 'Linux'
+            : ''
+  return os ? `${os} · ${browser}` : browser
+}
+
+function triggerDownload(name: string, url: string): void {
+  const a = document.createElement('a')
+  a.href = url
+  a.download = name
+  document.body.appendChild(a)
+  a.click()
+  a.remove()
+}
+
+export const useRoomStore = defineStore('room', () => {
+  const capabilities: Capabilities = detectCapabilities()
+
+  // —— 连接状态 ——
+  const status = ref<Status>('idle')
+  const myId = ref('')
+  const room = ref('')
+  const myCode = ref(ensureMyCode())
+  const myProfile = ref<Profile>(
+    loadProfile(localStorage.getItem(LS_DEVICE_NAME) || defaultDeviceName()),
+  )
+  const allowIncoming = ref(localStorage.getItem(LS_ALLOW_INCOMING) !== '0')
+  const signalingState = ref<SignalingState>('idle')
+  const lastError = ref<string | null>(null)
+
+  // —— 会话数据 ——
+  const members = reactive(new Map<string, Member>())
+  const messages = ref<ChatEntry[]>([])
+  const transfers = ref<Transfer[]>([])
+  /** 共享目录（懒发送登记 + 远端可下载）。 */
+  const shares = reactive(new Map<string, ShareItem>())
+  /** 网络拓扑：peerId → 它上报的邻接表（neighbor → 连接状态）。 */
+  const peerLinks = reactive(new Map<string, Map<string, string>>())
+
+  // —— 聊天频道 ——
+  const activeChannel = ref<ChatChannel>('all')
+  /** 各频道未读数（badge 汇总用）。 */
+  const unread = reactive(new Map<ChatChannel, number>())
+
+  // —— 屏幕共享 ——
+  /** 本端是否正在共享屏幕。 */
+  const sharing = ref(false)
+  /** 本端共享的可见范围。 */
+  const sharingScope = ref<{ scope: SendScope; to?: string }>({ scope: 'all' })
+  /** 本端共享流（本地预览用）。 */
+  const localScreen = shallowRef<MediaStream | null>(null)
+  /** 远端共享流：sharerPeerId → MediaStream。 */
+  const remoteScreens = shallowReactive(new Map<string, MediaStream>())
+  /** 当前观看谁的画面：'self' 为自己预览，否则为 sharer peerId。 */
+  const watching = ref<string | null>(null)
+
+  // —— 白板 / 屏幕批注 ——
+  // 笔画本体不做响应式（高频追加 + canvas 直读），以 boardRev 驱动重绘。
+  const boards = new Map<string, WbStroke[]>()
+  const boardRev = ref(0)
+  /** 白板页当前打开的画板：'wb' 公共，或 dmBoardId(peer) 私有。 */
+  const activeBoard = ref('wb')
+  /** 正在绘制中的远端笔画：strokeId → { board, stroke }。 */
+  const liveStrokes = new Map<string, { board: string; stroke: WbStroke }>()
+  /** 本端各画面的笔画 id 栈（撤销用）。 */
+  const myStrokes = new Map<string, string[]>()
+  /** 远程成员光标：`${board}|${peerId}` → RemotePointer。 */
+  const pointers = reactive(new Map<string, RemotePointer>())
+  /** 点击涟漪特效队列。 */
+  const clicks = ref<ClickFx[]>([])
+
+  // —— 外观 ——
+  const theme = ref<Theme>(initialTheme())
+  applyTheme(theme.value)
+  // 未显式选过主题时继续跟随系统。
+  watchSystemTheme((t) => {
+    theme.value = t
+    applyTheme(t)
+  })
+
+  // —— UI 导航 ——
+  const activeView = ref<View>('network')
+  const unseenRecv = ref(0)
+  const unseenShare = ref(0)
+  /** 发送页预选目标（网络视图点节点「发文件」带过来）。 */
+  const sendTarget = ref<'all' | string>('all')
+
+  const memberList = computed(() => [...members.values()])
+  const peerCount = computed(() => members.size)
+  const connectedPeers = computed(() => memberList.value.filter((m) => m.state === 'connected'))
+  /** 正在共享屏幕的远端成员。 */
+  const sharers = computed(() => memberList.value.filter((m) => m.sharing))
+  /** 在自己短码的房间里等待别人连入。 */
+  const listening = computed(() => status.value === 'online' && room.value === myCode.value)
+  /** 分享链接：对方打开即加入我所在的房间（未上线则指向我的短码）。 */
+  const shareLink = computed(() => {
+    const target = status.value === 'online' ? room.value : myCode.value
+    return `${location.origin}${location.pathname}?c=${encodeURIComponent(target)}`
+  })
+  const shareList = computed(() => [...shares.values()].sort((a, b) => b.ts - a.ts))
+  const unreadTotal = computed(() => {
+    let n = 0
+    for (const v of unread.values()) n += v
+    return n
+  })
+
+  let mesh: Mesh | null = null
+  let msgSeq = 0
+  let strokeSeq = 0
+  let clickSeq = 0
+  /** 发送侧取消回调（id → cancel）。 */
+  const sendCancels = new Map<string, () => void>()
+  /** 多源下载取消回调（fileId → cancel）。 */
+  const downloadCancels = new Map<string, () => void>()
+
+  // 光标停止上报后自动淡出（对端崩溃/切页时兜底）。
+  setInterval(() => {
+    const now = Date.now()
+    for (const [key, p] of pointers) {
+      if (now - p.ts > 5000) pointers.delete(key)
+    }
+  }, 2000)
+
+  /** 成员显示名：名片昵称 > 信令 nick > peerId。 */
+  function displayName(peerId: string): string {
+    if (peerId === myId.value) return myProfile.value.nick || '我'
+    const m = members.get(peerId)
+    return m?.profile?.nick ?? m?.nick ?? peerId
+  }
+
+  /** 与某对端的私有白板 id（两端各自计算，结果一致）。 */
+  function dmBoardId(peerId: string): string {
+    const pair = [myId.value, peerId].sort()
+    return `wb:${pair[0]}~${pair[1]}`
+  }
+
+  /** 私有白板 id 中的对方节点；非私有板返回 null。 */
+  function dmBoardPeer(board: string): string | null {
+    if (!board.startsWith('wb:')) return null
+    const pair = board.slice(3).split('~')
+    return pair.find((p) => p !== myId.value) ?? null
+  }
+
+  /** 取画面的笔画数组（惰性创建）。canvas 组件配合 boardRev 直读。 */
+  function getBoard(board: string): WbStroke[] {
+    let arr = boards.get(board)
+    if (!arr) {
+      arr = []
+      boards.set(board, arr)
+    }
+    return arr
+  }
+
+  function bumpBoard(): void {
+    boardRev.value++
+  }
+
+  /** 清掉某画面的全部本地状态（笔画/光标/涟漪）。 */
+  function dropBoard(board: string): void {
+    boards.delete(board)
+    myStrokes.delete(board)
+    for (const [id, live] of liveStrokes) {
+      if (live.board === board) liveStrokes.delete(id)
+    }
+    for (const key of pointers.keys()) {
+      if (key.startsWith(`${board}|`)) pointers.delete(key)
+    }
+    clicks.value = clicks.value.filter((c) => c.board !== board)
+    bumpBoard()
+  }
+
+  function findTransfer(id: string): Transfer | undefined {
+    return transfers.value.find((t) => t.id === id)
+  }
+
+  /** 绘制/指针消息路由：私有白板只发给对方，其余广播。 */
+  function sendDraw(board: string, msg: DrawMessage): void {
+    if (!mesh) return
+    const peer = dmBoardPeer(board)
+    if (peer) {
+      mesh.sendTo(peer, msg)
+    } else {
+      mesh.broadcast(msg)
+    }
+  }
+
+  function bumpUnread(channel: ChatChannel): void {
+    if (activeView.value === 'chat' && activeChannel.value === channel) return
+    unread.set(channel, (unread.get(channel) ?? 0) + 1)
+  }
+
+  function createMesh(url: string): Mesh {
+    const m = new Mesh(new Signaling(url))
+
+    m.on('self', (id) => {
+      myId.value = id
+    })
+    m.on('peer-added', ({ peerId, nick: n }) => {
+      members.set(peerId, { peerId, nick: n, state: 'new', verified: false })
+    })
+    m.on('peer-removed', (peerId) => {
+      members.delete(peerId)
+      peerLinks.delete(peerId)
+      if (members.size === 0 || remoteScreens.has(peerId)) cleanupRemoteShare(peerId)
+      for (const key of pointers.keys()) {
+        if (key.endsWith(`|${peerId}`)) pointers.delete(key)
+      }
+    })
+    m.on('peer-state', ({ peerId, state }) => {
+      const member = members.get(peerId)
+      if (member) member.state = state
+    })
+    m.on('peer-sas', ({ peerId, sas }) => {
+      const member = members.get(peerId)
+      if (member) member.sas = sas
+    })
+    m.on('peer-profile', ({ peerId, profile }) => {
+      const member = members.get(peerId)
+      if (!member) return
+      if (member.profile && member.profile.rev > profile.rev) return
+      member.profile = profile
+      member.nick = profile.nick
+    })
+    m.on('peer-links', ({ peerId, links }) => {
+      peerLinks.set(peerId, new Map(links.map((l) => [l.peerId, l.state])))
+    })
+    m.on('chat', ({ from, text, ts, scope }) => {
+      const channel: ChatChannel = scope === 'dm' ? from : 'all'
+      pushMessage({ from, fromNick: displayName(from), text, ts, self: false, channel })
+      bumpUnread(channel)
+    })
+
+    m.on('peer-channel-open', (peerId) => {
+      // 新对端通道就绪：补发公共白板与和它的私有白板全量状态（对方按 id 去重合并）。
+      const wb = boards.get('wb')
+      if (wb && wb.length > 0) {
+        m.sendTo(peerId, { kind: 'draw-state', board: 'wb', strokes: wb })
+      }
+      const dm = boards.get(dmBoardId(peerId))
+      if (dm && dm.length > 0) {
+        m.sendTo(peerId, { kind: 'draw-state', board: dmBoardId(peerId), strokes: dm })
+      }
+    })
+
+    m.on('screen-start', (peerId) => {
+      const member = members.get(peerId)
+      if (member) member.sharing = true
+    })
+    m.on('screen-stream', ({ peerId, stream }) => {
+      remoteScreens.set(peerId, stream)
+      const member = members.get(peerId)
+      if (member) member.sharing = true
+      // 自动切到新开播的画面；不在共享页时挂角标提醒。
+      if (watching.value === null || watching.value === 'self') watching.value = peerId
+      if (activeView.value !== 'screen') unseenShare.value++
+    })
+    m.on('screen-stop', (peerId) => cleanupRemoteShare(peerId))
+
+    m.on('draw', ({ from, msg }) => applyDraw(from, msg))
+
+    m.on('file-offer', ({ peerId, offer }) => {
+      transfers.value.unshift({
+        id: offer.id,
+        direction: 'recv',
+        peerId,
+        peerNick: displayName(peerId),
+        name: offer.name,
+        size: offer.size,
+        bytes: 0,
+        state: 'pending',
+        startedAt: Date.now(),
+      })
+      if (activeView.value !== 'receive') unseenRecv.value++
+    })
+    m.on('file-progress', ({ id, bytes }) => {
+      const t = findTransfer(id)
+      if (!t || t.state === 'done' || t.state === 'error' || t.state === 'canceled') return
+      t.bytes = bytes
+      if (t.state === 'pending') t.state = 'active'
+    })
+    m.on('file-done', ({ id, blob }) => {
+      const t = findTransfer(id)
+      if (!t) return
+      t.bytes = t.size
+      t.state = 'done'
+      t.finishedAt = Date.now()
+      t.url = URL.createObjectURL(blob)
+      // 自动保存（浏览器允许程序化触发下载）。列表里保留“另存”入口。
+      triggerDownload(t.name, t.url)
+    })
+    m.on('file-error', ({ id, reason, canceled }) => {
+      const t = findTransfer(id)
+      if (!t || t.state === 'done') return
+      t.state = canceled ? 'canceled' : 'error'
+      t.error = reason
+      t.finishedAt = Date.now()
+    })
+
+    m.on('share-added', ({ peerId, file }) => {
+      registerShare(file, false)
+      if (activeView.value !== 'receive') unseenRecv.value++
+      void peerId
+    })
+    m.on('share-removed', ({ fileId }) => {
+      const item = shares.get(fileId)
+      if (!item) return
+      if (item.state === 'downloading') {
+        item.state = 'error'
+        item.error = '共享已撤销或所有源离线'
+      } else if (item.state !== 'done') {
+        shares.delete(fileId)
+      }
+    })
+    m.on('share-sources', ({ fileId, count }) => {
+      const item = shares.get(fileId)
+      if (item) item.sources = count
+    })
+    m.on('share-serving', ({ fileId }) => {
+      const item = shares.get(fileId)
+      if (item) item.served++
+    })
+
+    m.on('signaling-state', (s) => {
+      signalingState.value = s
+    })
+    m.on('error', (e) => {
+      lastError.value = e.msg || e.code
+      if (status.value === 'connecting') {
+        teardown()
+      }
+    })
+
+    return m
+  }
+
+  function registerShare(meta: SharedFileMeta, local: boolean): ShareItem {
+    let item = shares.get(meta.fileId)
+    if (!item) {
+      item = {
+        fileId: meta.fileId,
+        name: meta.name,
+        size: meta.size,
+        mime: meta.mime,
+        ownerId: meta.owner,
+        scope: meta.scope,
+        ts: meta.ts,
+        local,
+        state: 'idle',
+        bytes: local ? meta.size : 0,
+        sources: 0,
+        served: 0,
+      }
+      shares.set(meta.fileId, item)
+    }
+    return item
+  }
+
+  function pushMessage(entry: Omit<ChatEntry, 'id'>): void {
+    messages.value.push({ id: msgSeq++, ...entry })
+  }
+
+  /** 应用一条远端绘制/指针消息。 */
+  function applyDraw(from: string, msg: DrawMessage): void {
+    switch (msg.kind) {
+      case 'draw-begin': {
+        const stroke: WbStroke = {
+          id: msg.id,
+          color: msg.color,
+          size: msg.size,
+          mode: msg.mode,
+          points: [msg.x, msg.y],
+        }
+        getBoard(msg.board).push(stroke)
+        liveStrokes.set(msg.id, { board: msg.board, stroke })
+        bumpBoard()
+        break
+      }
+      case 'draw-points': {
+        const live = liveStrokes.get(msg.id)
+        if (live) {
+          live.stroke.points.push(...msg.pts)
+          bumpBoard()
+        }
+        break
+      }
+      case 'draw-end':
+        liveStrokes.delete(msg.id)
+        break
+      case 'draw-remove': {
+        const arr = boards.get(msg.board)
+        if (arr) {
+          const drop = new Set(msg.ids)
+          boards.set(
+            msg.board,
+            arr.filter((s) => !drop.has(s.id)),
+          )
+          bumpBoard()
+        }
+        break
+      }
+      case 'draw-clear':
+        dropBoard(msg.board)
+        break
+      case 'draw-state': {
+        const arr = getBoard(msg.board)
+        const have = new Set(arr.map((s) => s.id))
+        for (const s of msg.strokes) {
+          if (!have.has(s.id)) arr.push(s)
+        }
+        bumpBoard()
+        break
+      }
+      case 'ptr-move': {
+        const key = `${msg.board}|${from}`
+        const p = pointers.get(key)
+        if (p) {
+          p.x = msg.x
+          p.y = msg.y
+          p.ts = Date.now()
+        } else {
+          pointers.set(key, {
+            peerId: from,
+            x: msg.x,
+            y: msg.y,
+            ts: Date.now(),
+            color: peerColor(from),
+          })
+        }
+        break
+      }
+      case 'ptr-click':
+        spawnClick(msg.board, msg.x, msg.y, peerColor(from))
+        break
+      case 'ptr-hide':
+        pointers.delete(`${msg.board}|${from}`)
+        break
+    }
+  }
+
+  function spawnClick(board: string, x: number, y: number, color: string): void {
+    const fx: ClickFx = { id: clickSeq++, board, x, y, color }
+    clicks.value.push(fx)
+    setTimeout(() => {
+      clicks.value = clicks.value.filter((c) => c.id !== fx.id)
+    }, 1200)
+  }
+
+  /** 远端停止共享 / 离线：撤画面、清批注层、回退观看目标。 */
+  function cleanupRemoteShare(peerId: string): void {
+    remoteScreens.delete(peerId)
+    const member = members.get(peerId)
+    if (member) member.sharing = false
+    dropBoard(`screen:${peerId}`)
+    if (watching.value === peerId) {
+      const next = [...remoteScreens.keys()][0]
+      watching.value = next ?? (sharing.value ? 'self' : null)
+    }
+  }
+
+  // —— 屏幕共享 ——
+
+  /**
+   * 采集屏幕并共享。scope=all 给网络内所有节点；direct 只给指定节点。
+   * 用户在选择器里取消不算错误。
+   */
+  async function startShare(scope: SendScope = 'all', to?: string): Promise<boolean> {
+    if (!mesh || status.value !== 'online') {
+      lastError.value = '请先连接设备再共享屏幕'
+      return false
+    }
+    let stream: MediaStream
+    try {
+      stream = await navigator.mediaDevices.getDisplayMedia({
+        video: { frameRate: { ideal: 30 } },
+        audio: true,
+      })
+    } catch (err) {
+      if (err instanceof DOMException && err.name === 'NotAllowedError') return false
+      lastError.value = `无法采集屏幕：${String(err)}`
+      return false
+    }
+    localScreen.value = stream
+    sharing.value = true
+    sharingScope.value = { scope, to }
+    mesh.startScreenShare(stream, scope, to)
+    // 浏览器原生「停止共享」按钮 → 轨道 ended → 同步收尾。
+    const videoTrack = stream.getVideoTracks()[0]
+    if (videoTrack) videoTrack.onended = () => stopShare()
+    if (watching.value === null) watching.value = 'self'
+    return true
+  }
+
+  function stopShare(): void {
+    if (!sharing.value) return
+    mesh?.stopScreenShare()
+    localScreen.value = null
+    sharing.value = false
+    dropBoard(`screen:${myId.value}`)
+    if (watching.value === 'self') {
+      watching.value = [...remoteScreens.keys()][0] ?? null
+    }
+  }
+
+  // —— 白板 / 批注绘制（canvas 组件调用；按 board 路由单播/广播）——
+
+  function beginStroke(
+    board: string,
+    mode: DrawMode,
+    color: string,
+    size: number,
+    x: number,
+    y: number,
+  ): string {
+    const id = `${myId.value || 'me'}-${strokeSeq++}-${Date.now().toString(36)}`
+    const stroke: WbStroke = { id, color, size, mode, points: [x, y] }
+    getBoard(board).push(stroke)
+    liveStrokes.set(id, { board, stroke })
+    const stack = myStrokes.get(board) ?? []
+    stack.push(id)
+    myStrokes.set(board, stack)
+    sendDraw(board, { kind: 'draw-begin', board, id, color, size, mode, x, y })
+    bumpBoard()
+    return id
+  }
+
+  /** 追加一批采样点（组件按帧节流合并后调用）。 */
+  function extendStroke(board: string, id: string, pts: number[]): void {
+    const live = liveStrokes.get(id)
+    if (!live || pts.length === 0) return
+    live.stroke.points.push(...pts)
+    sendDraw(board, { kind: 'draw-points', board, id, pts })
+    bumpBoard()
+  }
+
+  function endStroke(board: string, id: string): void {
+    liveStrokes.delete(id)
+    sendDraw(board, { kind: 'draw-end', board, id })
+  }
+
+  /** 撤销本端在该画面的最后一笔。 */
+  function undoStroke(board: string): void {
+    const stack = myStrokes.get(board)
+    const id = stack?.pop()
+    if (!id) return
+    const arr = boards.get(board)
+    if (arr) {
+      boards.set(
+        board,
+        arr.filter((s) => s.id !== id),
+      )
+    }
+    liveStrokes.delete(id)
+    sendDraw(board, { kind: 'draw-remove', board, ids: [id] })
+    bumpBoard()
+  }
+
+  /** 清空整个画面（对参与者生效）。 */
+  function clearBoard(board: string): void {
+    dropBoard(board)
+    sendDraw(board, { kind: 'draw-clear', board })
+  }
+
+  // —— 远程指针 ——
+
+  function sendPointer(board: string, x: number, y: number): void {
+    sendDraw(board, { kind: 'ptr-move', board, x, y })
+  }
+
+  function sendClick(board: string, x: number, y: number): void {
+    spawnClick(board, x, y, peerColor(myId.value))
+    sendDraw(board, { kind: 'ptr-click', board, x, y })
+  }
+
+  function hidePointer(board: string): void {
+    sendDraw(board, { kind: 'ptr-hide', board })
+  }
+
+  /** 断开当前会话（不触发自动重新监听）。 */
+  function teardown(): void {
+    if (mesh) {
+      mesh.leave()
+      mesh = null
+    }
+    for (const t of transfers.value) {
+      if (t.state === 'active' || t.state === 'pending') {
+        t.state = 'error'
+        t.error = '连接已断开'
+        t.finishedAt = Date.now()
+      }
+    }
+    sendCancels.clear()
+    for (const cancel of downloadCancels.values()) cancel()
+    downloadCancels.clear()
+    for (const item of shares.values()) {
+      if (item.url) URL.revokeObjectURL(item.url)
+    }
+    shares.clear()
+    peerLinks.clear()
+    members.clear()
+    unread.clear()
+    activeChannel.value = 'all'
+    // 屏幕共享与画板状态随会话销毁（换房间不携带旧内容）。
+    sharing.value = false
+    localScreen.value = null
+    remoteScreens.clear()
+    watching.value = null
+    boards.clear()
+    liveStrokes.clear()
+    myStrokes.clear()
+    pointers.clear()
+    clicks.value = []
+    activeBoard.value = 'wb'
+    bumpBoard()
+    myId.value = ''
+    room.value = ''
+    signalingState.value = 'idle'
+    status.value = 'idle'
+  }
+
+  /** 加入指定房间（短码房或口令房）。已在线则先离开。 */
+  async function joinRoom(roomName: string): Promise<boolean> {
+    lastError.value = null
+    if (mesh) teardown()
+    status.value = 'connecting'
+    room.value = roomName
+    try {
+      mesh = createMesh(defaultSignalingUrl())
+      await mesh.join(roomName, myProfile.value)
+      status.value = 'online'
+      return true
+    } catch (err) {
+      lastError.value = String(err)
+      teardown()
+      return false
+    }
+  }
+
+  /** 打开「允许短码连我」时，进入自己短码的房间等待连入。 */
+  async function listen(): Promise<void> {
+    if (status.value !== 'idle') return
+    await joinRoom(myCode.value)
+  }
+
+  /** 用对方短码/口令直连。 */
+  async function connectTo(code: string): Promise<boolean> {
+    const target = code.trim()
+    if (!target) return false
+    if (target === myCode.value) {
+      lastError.value = '这是你自己的短码，请输入对方的短码'
+      return false
+    }
+    return joinRoom(target)
+  }
+
+  /** 断开并（若开启）回到短码监听。 */
+  async function disconnect(): Promise<void> {
+    // 在自己短码房且对端仍在场时，直接重进会立刻被对方重连；
+    // 换一个新短码保证“断开”语义成立（临时短码本就允许轮换）。
+    const needNewCode = listening.value && peerCount.value > 0
+    teardown()
+    if (needNewCode) myCode.value = regenCode()
+    if (allowIncoming.value) await listen()
+  }
+
+  function setAllowIncoming(v: boolean): void {
+    allowIncoming.value = v
+    localStorage.setItem(LS_ALLOW_INCOMING, v ? '1' : '0')
+    if (v && status.value === 'idle') {
+      void listen()
+    } else if (!v && listening.value && peerCount.value === 0) {
+      teardown()
+    }
+  }
+
+  // —— 名片 ——
+
+  function commitProfile(patch: Partial<Pick<Profile, 'nick' | 'avatar'>>): void {
+    const next: Profile = {
+      nick: patch.nick?.trim() || myProfile.value.nick,
+      avatar: patch.avatar ?? myProfile.value.avatar,
+      rev: myProfile.value.rev + 1,
+    }
+    myProfile.value = next
+    saveProfile(next)
+    localStorage.setItem(LS_DEVICE_NAME, next.nick)
+    mesh?.setProfile(next)
+  }
+
+  function setNick(nick: string): void {
+    if (!nick.trim()) return
+    commitProfile({ nick })
+  }
+
+  function setAvatar(avatar: Avatar): void {
+    commitProfile({ avatar })
+  }
+
+  async function setAvatarImage(file: File): Promise<void> {
+    try {
+      const dataUrl = await imageToAvatar(file)
+      commitProfile({ avatar: { kind: 'image', value: dataUrl, color: '#7a8699' } })
+    } catch (err) {
+      lastError.value = err instanceof Error ? err.message : String(err)
+    }
+  }
+
+  /** 换一个新短码；若正在监听则迁移到新短码房。 */
+  async function regenerateCode(): Promise<void> {
+    const wasListening = listening.value && peerCount.value === 0
+    myCode.value = regenCode()
+    if (wasListening) {
+      teardown()
+      await listen()
+    }
+  }
+
+  /** 应用启动：处理 ?c= 直连参数，否则按设置进入监听。 */
+  async function init(): Promise<void> {
+    const params = new URLSearchParams(location.search)
+    const code = params.get('c')
+    if (code) {
+      history.replaceState(null, '', location.pathname)
+      if (code.trim() !== myCode.value) {
+        await connectTo(code)
+        return
+      }
+    }
+    if (allowIncoming.value) await listen()
+  }
+
+  // —— 聊天 ——
+
+  /** 发消息到当前频道（'all' 群发；否则私聊）。 */
+  function sendChat(text: string, channel?: ChatChannel): void {
+    const trimmed = text.trim()
+    const ch = channel ?? activeChannel.value
+    if (!trimmed || !mesh) return
+    if (ch === 'all') {
+      mesh.sendChat(trimmed)
+    } else if (!mesh.sendDm(ch, trimmed)) {
+      lastError.value = '对方暂不可达，消息未送出'
+      return
+    }
+    pushMessage({
+      from: myId.value,
+      fromNick: myProfile.value.nick || '我',
+      text: trimmed,
+      ts: Date.now(),
+      self: true,
+      channel: ch,
+    })
+  }
+
+  /** 打开某个聊天频道（网络视图点「私聊」进来）。 */
+  function openChat(channel: ChatChannel): void {
+    activeChannel.value = channel
+    unread.delete(channel)
+    setView('chat')
+  }
+
+  // —— 文件：强制发送（推） ——
+
+  /**
+   * 强制发送：target 为 'all' 时发给所有已连接设备。
+   * 同一对端内串行（避免通道交织），多对端之间并行。
+   */
+  function sendFiles(files: File[], target: 'all' | string = 'all'): void {
+    const m = mesh
+    if (!m || files.length === 0) return
+    const targets =
+      target === 'all' ? connectedPeers.value.map((p) => p.peerId) : [target]
+    if (targets.length === 0) {
+      lastError.value = '没有已连接的设备，无法发送'
+      return
+    }
+
+    for (const pid of targets) {
+      void (async () => {
+        for (const file of files) {
+          const handle = m.sendFileTo(pid, file)
+          if (!handle) {
+            transfers.value.unshift({
+              id: `x${Date.now()}${Math.random().toString(36).slice(2, 6)}`,
+              direction: 'send',
+              peerId: pid,
+              peerNick: displayName(pid),
+              name: file.name,
+              size: file.size,
+              bytes: 0,
+              state: 'error',
+              error: '对端通道未就绪',
+              startedAt: Date.now(),
+              finishedAt: Date.now(),
+            })
+            continue
+          }
+          transfers.value.unshift({
+            id: handle.id,
+            direction: 'send',
+            peerId: pid,
+            peerNick: displayName(pid),
+            name: file.name,
+            size: file.size,
+            bytes: 0,
+            state: 'active',
+            startedAt: Date.now(),
+          })
+          sendCancels.set(handle.id, handle.cancel)
+          try {
+            await handle.done
+            const t = findTransfer(handle.id)
+            if (t) {
+              t.bytes = t.size
+              t.state = 'done'
+              t.finishedAt = Date.now()
+            }
+          } catch (err) {
+            const t = findTransfer(handle.id)
+            if (t && t.state !== 'canceled' && t.state !== 'error') {
+              const canceled = err instanceof Error && err.name === 'TransferCanceled'
+              t.state = canceled ? 'canceled' : 'error'
+              t.error = canceled ? '传输已取消' : String(err)
+              t.finishedAt = Date.now()
+            }
+          } finally {
+            sendCancels.delete(handle.id)
+          }
+        }
+      })()
+    }
+  }
+
+  // —— 文件：懒发送 + 多源下载（拉） ——
+
+  /** 懒发送：只登记共享，不上传；对方点下载时才供块。 */
+  function shareFiles(files: File[], target: 'all' | string = 'all'): void {
+    const m = mesh
+    if (!m || files.length === 0) return
+    if (status.value !== 'online') {
+      lastError.value = '请先连接设备再共享文件'
+      return
+    }
+    for (const file of files) {
+      const meta = m.shareFile(
+        file,
+        target === 'all' ? 'all' : 'direct',
+        target === 'all' ? undefined : target,
+      )
+      const item = registerShare(meta, true)
+      item.state = 'idle'
+    }
+  }
+
+  /** 统一入口：按模式分派（UI 上的「发送方式」选择）。 */
+  function dispatchFiles(files: File[], mode: TransferMode, target: 'all' | string): void {
+    if (mode === 'force') sendFiles(files, target)
+    else shareFiles(files, target)
+  }
+
+  /** 撤销本端共享。 */
+  function revokeShare(fileId: string): void {
+    mesh?.revokeShare(fileId)
+    const item = shares.get(fileId)
+    if (item?.url) URL.revokeObjectURL(item.url)
+    shares.delete(fileId)
+  }
+
+  /** 从多个源并行下载一个共享文件。 */
+  function downloadShare(fileId: string): void {
+    const m = mesh
+    const item = shares.get(fileId)
+    if (!m || !item || item.local || item.state === 'downloading') return
+    item.state = 'downloading'
+    item.bytes = 0
+    item.error = undefined
+    const handle = m.downloadShare(fileId, {
+      onProgress: (bytes) => {
+        item.bytes = bytes
+      },
+      onDone: (blob) => {
+        downloadCancels.delete(fileId)
+        item.bytes = item.size
+        item.state = 'done'
+        item.url = URL.createObjectURL(blob)
+        triggerDownload(item.name, item.url)
+      },
+      onError: (reason) => {
+        downloadCancels.delete(fileId)
+        if (item.state === 'downloading') {
+          item.state = 'error'
+          item.error = reason
+        }
+      },
+    })
+    if (!handle) {
+      item.state = 'error'
+      item.error = '无法开始下载'
+      return
+    }
+    downloadCancels.set(fileId, handle.cancel)
+  }
+
+  function cancelDownload(fileId: string): void {
+    downloadCancels.get(fileId)?.()
+    downloadCancels.delete(fileId)
+    const item = shares.get(fileId)
+    if (item && item.state === 'downloading') {
+      item.state = 'idle'
+      item.bytes = 0
+      item.sources = 0
+    }
+  }
+
+  function cancelTransfer(id: string): void {
+    const t = findTransfer(id)
+    if (!t || (t.state !== 'active' && t.state !== 'pending')) return
+    if (t.direction === 'send') {
+      sendCancels.get(id)?.()
+    } else {
+      mesh?.cancelReceive(id)
+    }
+  }
+
+  function clearFinishedTransfers(): void {
+    for (const t of transfers.value) {
+      if (t.url && t.state !== 'active' && t.state !== 'pending') URL.revokeObjectURL(t.url)
+    }
+    transfers.value = transfers.value.filter(
+      (t) => t.state === 'active' || t.state === 'pending',
+    )
+  }
+
+  function setTheme(t: Theme): void {
+    theme.value = t
+    applyTheme(t)
+    persistTheme(t)
+  }
+
+  function toggleTheme(): void {
+    setTheme(theme.value === 'daylight' ? 'midnight' : 'daylight')
+  }
+
+  function setView(v: View): void {
+    activeView.value = v
+    if (v === 'chat') unread.delete(activeChannel.value)
+    if (v === 'receive') unseenRecv.value = 0
+    if (v === 'screen') unseenShare.value = 0
+  }
+
+  function markVerified(peerId: string): void {
+    const member = members.get(peerId)
+    if (member) member.verified = true
+  }
+
+  // —— 网络视图的动作分发（点节点头像/中心节点触发） ——
+
+  function actionSendFile(target: 'all' | string): void {
+    sendTarget.value = target
+    setView('send')
+  }
+
+  function actionBoard(target: 'all' | string): void {
+    activeBoard.value = target === 'all' ? 'wb' : dmBoardId(target)
+    setView('board')
+  }
+
+  async function actionShareScreen(target: 'all' | string): Promise<void> {
+    setView('screen')
+    if (!sharing.value) {
+      await startShare(target === 'all' ? 'all' : 'direct', target === 'all' ? undefined : target)
+    }
+  }
+
+  return {
+    capabilities,
+    status,
+    myId,
+    room,
+    myCode,
+    myProfile,
+    allowIncoming,
+    signalingState,
+    lastError,
+    members,
+    messages,
+    transfers,
+    shares,
+    shareList,
+    peerLinks,
+    theme,
+    activeView,
+    activeChannel,
+    unread,
+    unreadTotal,
+    unseenRecv,
+    unseenShare,
+    sendTarget,
+    memberList,
+    peerCount,
+    connectedPeers,
+    sharers,
+    listening,
+    shareLink,
+    sharing,
+    sharingScope,
+    localScreen,
+    remoteScreens,
+    watching,
+    boardRev,
+    activeBoard,
+    pointers,
+    clicks,
+    displayName,
+    dmBoardId,
+    init,
+    listen,
+    connectTo,
+    disconnect,
+    setAllowIncoming,
+    setNick,
+    setAvatar,
+    setAvatarImage,
+    regenerateCode,
+    sendChat,
+    openChat,
+    sendFiles,
+    shareFiles,
+    dispatchFiles,
+    revokeShare,
+    downloadShare,
+    cancelDownload,
+    cancelTransfer,
+    clearFinishedTransfers,
+    setTheme,
+    toggleTheme,
+    setView,
+    markVerified,
+    startShare,
+    stopShare,
+    getBoard,
+    beginStroke,
+    extendStroke,
+    endStroke,
+    undoStroke,
+    clearBoard,
+    sendPointer,
+    sendClick,
+    hidePointer,
+    actionSendFile,
+    actionBoard,
+    actionShareScreen,
+  }
+})
