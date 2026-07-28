@@ -547,6 +547,10 @@ export class Mesh extends Emitter<MeshEvents> {
       case 'draw-begin':
       case 'draw-points':
       case 'draw-end':
+      case 'draw-line':
+      case 'draw-polyline':
+      case 'draw-text':
+      case 'draw-image':
       case 'draw-remove':
       case 'draw-clear':
       case 'draw-state':
