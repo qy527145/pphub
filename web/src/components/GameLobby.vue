@@ -17,6 +17,10 @@ const showCreateDialog = ref(false)
 const selectedGameType = ref<GameType>('gomoku')
 const isPublicTable = ref(true)
 
+// 匹配功能
+const matching = ref(false)
+const matchGameType = ref<GameType | null>(null)
+
 // 所有公开的游戏桌
 const publicTables = computed(() => {
   return Array.from(store.gameTables.values())
@@ -77,6 +81,31 @@ function getPlayerNick(peerId: string): string {
   return store.displayName(peerId)
 }
 
+// 开始匹配
+function startMatching(gameType: GameType) {
+  matching.value = true
+  matchGameType.value = gameType
+  store.startMatching(gameType)
+}
+
+// 取消匹配
+function cancelMatching() {
+  if (matchGameType.value) {
+    store.cancelMatching(matchGameType.value)
+  }
+  matching.value = false
+  matchGameType.value = null
+}
+
+// 监听匹配成功
+watch(() => store.currentTableId, (newId) => {
+  if (newId && matching.value) {
+    // 匹配成功，停止匹配状态
+    matching.value = false
+    matchGameType.value = null
+  }
+})
+
 // 监听游戏桌变化，实时更新
 watch(() => store.gameTables.size, () => {
   // 桌子数量变化时强制更新
@@ -89,6 +118,20 @@ watch(() => store.gameTables.size, () => {
 
   <!-- 否则显示游戏大厅 -->
   <div v-else class="lobby">
+    <!-- 匹配中遮罩 -->
+    <div v-if="matching" class="matching-overlay">
+      <div class="matching-card">
+        <div class="matching-spinner">
+          <div class="spinner"></div>
+        </div>
+        <h3>正在匹配 {{ GAME_CATALOG.find(g => g.id === matchGameType)?.name }}...</h3>
+        <p>寻找其他玩家中，请稍候</p>
+        <button class="btn-cancel-match" @click="cancelMatching">
+          取消匹配
+        </button>
+      </div>
+    </div>
+
     <header class="lobby-header">
       <div class="header-content">
         <h2>🎮 游戏大厅</h2>
@@ -101,19 +144,50 @@ watch(() => store.gameTables.size, () => {
     </header>
 
     <div class="lobby-content">
-      <!-- 空状态 -->
-      <div v-if="publicTables.length === 0" class="empty-state">
-        <div class="empty-icon">🎯</div>
-        <h3>暂无公开游戏桌</h3>
-        <p>成为第一个创建游戏桌的人吧！</p>
-        <button class="btn-create-big" @click="openCreateDialog">
-          <AppIcon name="plus" :size="20" />
-          创建游戏桌
-        </button>
-      </div>
+      <!-- 游戏目录 -->
+      <section class="games-catalog">
+        <h3 class="section-title">选择游戏</h3>
+        <div class="games-list">
+          <div
+            v-for="game in GAME_CATALOG"
+            :key="game.id"
+            class="game-item"
+          >
+            <div class="game-item-icon">{{ game.icon }}</div>
+            <div class="game-item-info">
+              <h4>{{ game.name }}</h4>
+              <p>{{ game.description }}</p>
+              <div class="game-item-meta">
+                <span class="meta-tag">{{ game.playerCount }}人</span>
+                <span v-if="game.spectatable" class="meta-tag spectatable">可旁观</span>
+              </div>
+            </div>
+            <div class="game-item-actions">
+              <button
+                v-if="game.category !== 'single'"
+                class="btn-match"
+                @click="startMatching(game.id)"
+                :disabled="matching"
+              >
+                <AppIcon name="zap" :size="14" />
+                快速匹配
+              </button>
+              <button
+                class="btn-create-game"
+                @click="() => { selectedGameType = game.id; isPublicTable = true; openCreateDialog(); }"
+              >
+                <AppIcon name="plus" :size="14" />
+                创建桌子
+              </button>
+            </div>
+          </div>
+        </div>
+      </section>
 
-      <!-- 游戏桌列表 -->
-      <div v-else class="tables-grid">
+      <!-- 公开游戏桌列表 -->
+      <section v-if="publicTables.length > 0" class="tables-section">
+        <h3 class="section-title">公开游戏桌</h3>
+        <div class="tables-grid">
         <div
           v-for="table in publicTables"
           :key="table.tableId"
@@ -193,7 +267,8 @@ watch(() => store.gameTables.size, () => {
             </button>
           </div>
         </div>
-      </div>
+        </div>
+      </section>
     </div>
 
     <!-- 创建游戏桌对话框 -->
@@ -207,26 +282,7 @@ watch(() => store.gameTables.size, () => {
         </header>
 
         <div class="dialog-body">
-          <div class="form-group">
-            <label>选择游戏</label>
-            <div class="game-select">
-              <div
-                v-for="game in GAME_CATALOG"
-                :key="game.id"
-                class="game-option"
-                :class="{ selected: selectedGameType === game.id }"
-                @click="selectedGameType = game.id"
-              >
-                <span class="game-option-icon">{{ game.icon }}</span>
-                <div class="game-option-info">
-                  <h4>{{ game.name }}</h4>
-                  <p>{{ game.description }}</p>
-                  <span class="game-meta">{{ game.playerCount }}人游戏</span>
-                </div>
-              </div>
-            </div>
-          </div>
-
+          <!-- 桌子设置放在最上面 -->
           <div class="form-group">
             <label>桌子设置</label>
             <div class="visibility-toggle">
@@ -248,6 +304,29 @@ watch(() => store.gameTables.size, () => {
                 私密桌子
                 <span class="option-desc">仅邀请的人可加入</span>
               </button>
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label>选择游戏</label>
+            <div class="game-select-scroll">
+              <div
+                v-for="game in GAME_CATALOG"
+                :key="game.id"
+                class="game-option"
+                :class="{ selected: selectedGameType === game.id }"
+                @click="selectedGameType = game.id"
+              >
+                <span class="game-option-icon">{{ game.icon }}</span>
+                <div class="game-option-info">
+                  <h4>{{ game.name }}</h4>
+                  <p>{{ game.description }}</p>
+                  <div class="game-option-meta">
+                    <span class="game-meta">{{ game.playerCount }}人游戏</span>
+                    <span v-if="game.spectatable" class="game-meta spectatable">可旁观</span>
+                  </div>
+                </div>
+              </div>
             </div>
           </div>
         </div>
@@ -321,6 +400,199 @@ watch(() => store.gameTables.size, () => {
   flex: 1;
   overflow-y: auto;
   padding: 24px;
+}
+
+.section-title {
+  margin: 0 0 16px 0;
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+/* 游戏目录 */
+.games-catalog {
+  margin-bottom: 40px;
+}
+
+.games-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.game-item {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 16px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  transition: all 0.2s;
+}
+
+.game-item:hover {
+  border-color: var(--accent);
+  box-shadow: var(--shadow-pop);
+}
+
+.game-item-icon {
+  font-size: 40px;
+  flex-shrink: 0;
+}
+
+.game-item-info {
+  flex: 1;
+  min-width: 0;
+}
+
+.game-item-info h4 {
+  margin: 0 0 4px 0;
+  font-size: 16px;
+  color: var(--text);
+}
+
+.game-item-info p {
+  margin: 0 0 8px 0;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.game-item-meta {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.meta-tag {
+  padding: 2px 8px;
+  background: var(--accent-weak);
+  color: var(--accent-strong);
+  border-radius: var(--radius-pill);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.meta-tag.spectatable {
+  background: var(--success-weak);
+  color: var(--success);
+}
+
+.game-item-actions {
+  display: flex;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.btn-match,
+.btn-create-game {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 16px;
+  border: none;
+  border-radius: var(--radius);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.btn-match {
+  background: var(--success);
+  color: white;
+}
+
+.btn-match:hover:not(:disabled) {
+  background: var(--success-strong);
+  transform: translateY(-1px);
+}
+
+.btn-match:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.btn-create-game {
+  background: var(--accent);
+  color: white;
+}
+
+.btn-create-game:hover {
+  background: var(--accent-strong);
+  transform: translateY(-1px);
+}
+
+/* 匹配遮罩 */
+.matching-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.7);
+  display: grid;
+  place-items: center;
+  z-index: 1000;
+  animation: fadeIn 0.3s;
+}
+
+.matching-card {
+  background: var(--panel);
+  border-radius: var(--radius);
+  padding: 40px;
+  text-align: center;
+  max-width: 400px;
+  box-shadow: var(--shadow-pop);
+}
+
+.matching-spinner {
+  margin-bottom: 24px;
+  display: flex;
+  justify-content: center;
+}
+
+.spinner {
+  width: 60px;
+  height: 60px;
+  border: 4px solid var(--border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+.matching-card h3 {
+  margin: 0 0 8px 0;
+  font-size: 20px;
+  color: var(--text);
+}
+
+.matching-card p {
+  margin: 0 0 24px 0;
+  font-size: 14px;
+  color: var(--muted);
+}
+
+.btn-cancel-match {
+  padding: 10px 24px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--panel);
+  color: var(--text);
+  font-size: 14px;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.btn-cancel-match:hover {
+  background: var(--hover);
+  border-color: var(--accent);
+}
+
+/* 游戏桌区域 */
+.tables-section {
+  margin-top: 40px;
 }
 
 .empty-state {
@@ -650,10 +922,31 @@ watch(() => store.gameTables.size, () => {
   color: var(--text);
 }
 
-.game-select {
+.game-select-scroll {
+  max-height: 400px;
+  overflow-y: auto;
   display: flex;
   flex-direction: column;
   gap: 12px;
+  padding-right: 8px;
+}
+
+.game-select-scroll::-webkit-scrollbar {
+  width: 6px;
+}
+
+.game-select-scroll::-webkit-scrollbar-track {
+  background: var(--bg);
+  border-radius: 3px;
+}
+
+.game-select-scroll::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 3px;
+}
+
+.game-select-scroll::-webkit-scrollbar-thumb:hover {
+  background: var(--muted);
 }
 
 .game-option {
@@ -693,9 +986,15 @@ watch(() => store.gameTables.size, () => {
 }
 
 .game-option-info p {
-  margin: 0 0 6px 0;
+  margin: 0 0 8px 0;
   font-size: 13px;
   color: var(--muted);
+}
+
+.game-option-meta {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
 }
 
 .game-meta {
@@ -706,6 +1005,11 @@ watch(() => store.gameTables.size, () => {
   border-radius: var(--radius-pill);
   font-size: 11px;
   font-weight: 600;
+}
+
+.game-meta.spectatable {
+  background: var(--success-weak);
+  color: var(--success);
 }
 
 .visibility-toggle {

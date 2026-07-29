@@ -332,6 +332,10 @@ export const useRoomStore = defineStore('room', () => {
   const gameChats = reactive(new Map<string, GameChatMessage[]>())
   /** 游戏内鼠标位置 */
   const gameMousePositions = reactive(new Map<string, MousePosition[]>())
+  /** 匹配队列：gameType -> 等待匹配的玩家 ID 列表 */
+  const matchingQueues = reactive(new Map<GameType, string[]>())
+  /** 当前正在匹配的游戏类型 */
+  const myMatchingGame = ref<GameType | null>(null)
 
   /** 文件夹打包中的数量（UI 转圈提示）。 */
   const packing = ref(0)
@@ -625,6 +629,8 @@ export const useRoomStore = defineStore('room', () => {
     m.on('game', ({ from, msg }) => handleGame(from, msg))
 
     m.on('peer-channel-open', (peerId) => {
+      console.log('[GameTable] peer-channel-open:', peerId, '当前桌子数:', gameTables.size)
+
       // 新对端通道就绪：补发公共白板与和它的私有白板全量状态（对方按 id 去重合并）。
       const wb = boards.get('wb')
       if (wb && wb.length > 0) {
@@ -636,11 +642,14 @@ export const useRoomStore = defineStore('room', () => {
       }
 
       // 同步所有公开的游戏桌给新加入的成员
+      let syncCount = 0
       for (const table of gameTables.values()) {
         if (table.visibility === 'public') {
           m.sendTo(peerId, { kind: 'table-create', tableId: table.tableId, table })
+          syncCount++
         }
       }
+      console.log('[GameTable] 已同步', syncCount, '个公开桌子给', peerId)
     })
 
     m.on('screen-start', (peerId) => {
@@ -1596,8 +1605,16 @@ export const useRoomStore = defineStore('room', () => {
       // —— 游戏桌消息处理 ——
       case 'table-create': {
         const table = msg.table as GameTable
+        console.log('[GameTable] 收到 table-create:', {
+          from,
+          tableId: table?.tableId,
+          gameType: table?.gameType,
+          visibility: table?.visibility,
+          players: table?.players,
+        })
         if (table && table.tableId) {
           gameTables.set(table.tableId, table)
+          console.log('[GameTable] 已添加到 gameTables, 当前桌子数:', gameTables.size)
         }
         break
       }
@@ -1687,6 +1704,51 @@ export const useRoomStore = defineStore('room', () => {
           const filtered = positions.filter(p => p.peerId !== pos.peerId)
           filtered.push(pos)
           gameMousePositions.set(msg.tableId, filtered)
+        }
+        break
+      }
+      // —— 匹配消息 ——
+      case 'match-request': {
+        const gameType = (msg as any).gameType as GameType
+        if (!gameType || !myMatchingGame.value || myMatchingGame.value !== gameType) break
+
+        console.log('[Matching] 收到匹配请求:', from, gameType)
+
+        // 如果我也在匹配同一个游戏，匹配成功
+        if (myMatchingGame.value === gameType) {
+          matchWith(from, gameType)
+        }
+        break
+      }
+      case 'match-cancel': {
+        const gameType = (msg as any).gameType as GameType
+        if (!gameType) break
+
+        console.log('[Matching] 对方取消匹配:', from, gameType)
+
+        // 从队列中移除
+        const queue = matchingQueues.get(gameType)
+        if (queue) {
+          const index = queue.indexOf(from)
+          if (index >= 0) {
+            queue.splice(index, 1)
+            if (queue.length === 0) {
+              matchingQueues.delete(gameType)
+            }
+          }
+        }
+        break
+      }
+      case 'match-found': {
+        const tableId = (msg as any).tableId as string
+        const gameType = (msg as any).gameType as GameType
+
+        console.log('[Matching] 匹配成功，加入游戏桌:', tableId, gameType)
+
+        if (tableId && myMatchingGame.value === gameType) {
+          myMatchingGame.value = null
+          // 自动加入游戏桌
+          joinGameTable(tableId, false)
         }
         break
       }
@@ -2289,12 +2351,26 @@ export const useRoomStore = defineStore('room', () => {
     gameTables.set(tableId, table)
     currentTableId.value = tableId
 
-    // 广播创建游戏桌消息
-    mesh?.broadcast({
-      kind: 'table-create',
+    console.log('[GameTable] 创建游戏桌:', {
       tableId,
-      table,
+      gameType,
+      visibility: table.visibility,
+      players: table.players,
+      mesh: !!mesh,
+      peerCount: connectedPeers.value.length,
     })
+
+    // 广播创建游戏桌消息
+    if (mesh) {
+      mesh.broadcast({
+        kind: 'table-create',
+        tableId,
+        table,
+      })
+      console.log('[GameTable] 已广播 table-create 消息到', connectedPeers.value.length, '个节点')
+    } else {
+      console.warn('[GameTable] mesh 为 null，无法广播')
+    }
 
     // 切换到游戏视图
     setView('games')
@@ -2471,6 +2547,89 @@ export const useRoomStore = defineStore('room', () => {
     })
   }
 
+  // —— 匹配功能 ——
+
+  function startMatching(gameType: GameType): void {
+    if (!mesh || myMatchingGame.value) return
+
+    myMatchingGame.value = gameType
+    console.log('[Matching] 开始匹配:', gameType)
+
+    // 广播匹配请求
+    mesh.broadcast({
+      kind: 'match-request',
+      gameType,
+    })
+
+    // 检查是否有人在等待
+    const queue = matchingQueues.get(gameType) || []
+    if (queue.length > 0) {
+      // 立即匹配到第一个等待者
+      const partnerId = queue[0]
+      console.log('[Matching] 找到等待者:', partnerId)
+      matchWith(partnerId, gameType)
+    } else {
+      // 加入等待队列
+      queue.push(myId.value)
+      matchingQueues.set(gameType, queue)
+      console.log('[Matching] 加入等待队列:', queue.length)
+    }
+  }
+
+  function cancelMatching(gameType: GameType): void {
+    if (!mesh || myMatchingGame.value !== gameType) return
+
+    console.log('[Matching] 取消匹配:', gameType)
+
+    // 从队列中移除
+    const queue = matchingQueues.get(gameType)
+    if (queue) {
+      const index = queue.indexOf(myId.value)
+      if (index >= 0) {
+        queue.splice(index, 1)
+        if (queue.length === 0) {
+          matchingQueues.delete(gameType)
+        }
+      }
+    }
+
+    // 广播取消匹配
+    mesh.broadcast({
+      kind: 'match-cancel',
+      gameType,
+    })
+
+    myMatchingGame.value = null
+  }
+
+  function matchWith(partnerId: string, gameType: GameType): void {
+    console.log('[Matching] 匹配成功，创建游戏桌:', partnerId, gameType)
+
+    // 从队列中移除双方
+    const queue = matchingQueues.get(gameType)
+    if (queue) {
+      const idx1 = queue.indexOf(myId.value)
+      const idx2 = queue.indexOf(partnerId)
+      if (idx1 >= 0) queue.splice(idx1, 1)
+      if (idx2 >= 0) queue.splice(idx2, 1)
+      if (queue.length === 0) {
+        matchingQueues.delete(gameType)
+      }
+    }
+
+    myMatchingGame.value = null
+
+    // 创建游戏桌（公开）
+    createGameTable(gameType, true)
+
+    // 通知对方加入
+    mesh?.sendTo(partnerId, {
+      kind: 'match-found',
+      tableId: currentTableId.value!,
+      gameType,
+    })
+  }
+
   return {
     capabilities,
     status,
@@ -2598,5 +2757,8 @@ export const useRoomStore = defineStore('room', () => {
     sitDownAtTable,
     standUpFromTable,
     inviteToTable,
+    startMatching,
+    cancelMatching,
+    myMatchingGame,
   }
 })

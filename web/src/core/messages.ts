@@ -259,3 +259,7 @@ export type ControlMessage =
   | { kind: 'game-move'; tableId: string; moveData: unknown }
   | { kind: 'game-chat'; tableId: string; chatMsg: unknown }
   | { kind: 'mouse-pos'; tableId: string; pos: unknown }
+  // —— 匹配系统 ——
+  | { kind: 'match-request'; gameType: string }
+  | { kind: 'match-cancel'; gameType: string }
+  | { kind: 'match-found'; tableId: string; gameType: string }

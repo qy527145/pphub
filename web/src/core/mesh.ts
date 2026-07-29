@@ -109,13 +109,14 @@ export type DrawMessage = Extract<
   { kind: `draw-${string}` } | { kind: `ptr-${string}` }
 >
 
-/** ControlMessage 中的游戏子集（你画我猜 / 五子棋 / 游戏桌）。 */
+/** ControlMessage 中的游戏子集（你画我猜 / 五子棋 / 游戏桌 / 匹配）。 */
 export type GameMessage = Extract<
   ControlMessage,
   | { kind: `guess-${string}` }
   | { kind: `gomoku-${string}` }
   | { kind: `table-${string}` }
   | { kind: `game-${string}` }
+  | { kind: `match-${string}` }
   | { kind: 'mouse-pos' }
 >
 
@@ -1023,6 +1024,9 @@ export class Mesh extends Emitter<MeshEvents> {
       case 'game-move':
       case 'game-chat':
       case 'mouse-pos':
+      case 'match-request':
+      case 'match-cancel':
+      case 'match-found':
         this.emit('game', { from, msg })
         break
       case 'profile': {
