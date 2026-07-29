@@ -77,6 +77,26 @@ async function main() {
     const bId = await b.evaluate(() => window.__pphub.myId)
     ok('三端口令房组网，全网状互连')
 
+    // —— 0. 粘贴即发：合成 paste 事件，全程不碰回车/发送按钮 ——
+    await b.evaluate(() => window.__pphub.setView('chat'))
+    await until(b, () => !!document.querySelector('.composer input'), 'B 聊天页就绪')
+    await b.evaluate(() => {
+      const dt = new DataTransfer()
+      dt.items.add(new File([new Uint8Array([137, 80, 78, 71])], '截图.png', { type: 'image/png' }))
+      window.dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt }))
+    })
+    await until(
+      b,
+      () => window.__pphub.messages.some((m) => m.self && m.file?.name === '截图.png'),
+      'B 粘贴后本地即出文件卡片',
+    )
+    await until(
+      a,
+      () => window.__pphub.shareList.some((s) => s.name === '截图.png'),
+      'A 收到粘贴的共享',
+    )
+    ok('粘贴即发：paste 事件直接挂出共享并送达对端，无需回车/发送')
+
     // —— 1. 表情回应 ——
     await a.evaluate(() => window.__pphub.sendChat('回应我试试'))
     const msgId = await until(
@@ -176,8 +196,21 @@ async function main() {
     )
     ok('网络视图：连线上渲染出 RTT 标注')
 
-    // —— 4. 五子棋 ——
-    await a.evaluate((to) => window.__pphub.inviteGomoku(to), bId)
+    // —— 4. 五子棋（经网络视图入口发起：切私聊 + 发邀请）——
+    await a.evaluate((to) => window.__pphub.actionGomoku(to), bId)
+    const entryOk = await a.evaluate(
+      (to) => {
+        const s = window.__pphub
+        return (
+          s.activeView === 'chat' &&
+          s.activeChannel === to &&
+          s.gomoku.get(to)?.state === 'invite-out'
+        )
+      },
+      bId,
+    )
+    if (!entryOk) throw new Error('actionGomoku 入口未正确切频道/发邀请')
+    ok('入口：网络视图「五子棋对局」切到私聊并发出邀请')
     await until(
       b,
       (id) => window.__pphub.gomoku.get(id)?.state === 'invite-in',
@@ -243,7 +276,16 @@ async function main() {
     )
     ok('五子棋：认输终局，双方结果互补')
 
-    // —— 5. 你画我猜 ——
+    // —— 5. 你画我猜（先验证网络动作条入口：直达白板 + 弹出出题面板）——
+    await a.evaluate(() => window.__pphub.actionGuess())
+    await until(
+      a,
+      () => window.__pphub.activeView === 'board' && !!document.querySelector('.words'),
+      '出题面板弹出',
+    )
+    ok('入口：网络动作条「你画我猜」直达公共白板并弹出出题面板')
+    await a.click('.modal-actions .ghost') // 取消面板，改用 store 直接开局（后续断言不依赖 UI）
+
     await a.evaluate(() => window.__pphub.startGuessRound('苹果'))
     await until(
       c,

@@ -2126,6 +2126,26 @@ export const useRoomStore = defineStore('room', () => {
     }
   }
 
+  /** 网络视图「五子棋」入口：切到与该节点的私聊，有对局就开棋盘，否则发邀请。 */
+  function actionGomoku(peerId: string): void {
+    openChat(peerId)
+    if (gomoku.has(peerId)) {
+      gomokuOpen.value = peerId
+    } else {
+      inviteGomoku(peerId)
+    }
+  }
+
+  /** 你画我猜入口信号：白板页消费它弹出出题面板（挂载时与变化时都检查）。 */
+  const guessSetupReq = ref(false)
+
+  /** 网络视图「你画我猜」入口：切到公共白板并直接弹出出题面板。 */
+  function actionGuess(): void {
+    activeBoard.value = 'wb'
+    setView('board')
+    guessSetupReq.value = true
+  }
+
   return {
     capabilities,
     status,
@@ -2236,5 +2256,8 @@ export const useRoomStore = defineStore('room', () => {
     actionSendFile,
     actionBoard,
     actionShareScreen,
+    actionGomoku,
+    actionGuess,
+    guessSetupReq,
   }
 })

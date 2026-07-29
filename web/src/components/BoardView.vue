@@ -63,6 +63,7 @@ onMounted(() => {
     wrapH.value = wrapEl.value.clientHeight
   })
   if (wrapEl.value) resizeObs.observe(wrapEl.value)
+  consumeGuessSetup()
 })
 
 onBeforeUnmount(() => resizeObs?.disconnect())
@@ -161,6 +162,19 @@ watch(
     await nextTick()
     if (triesEl.value) triesEl.value.scrollTop = triesEl.value.scrollHeight
   },
+)
+
+// 网络视图「你画我猜」入口：标志在挂载前就可能已置位（视图切换先于本组件
+// 挂载），因此挂载时与变化时都消费一次。
+function consumeGuessSetup(): void {
+  if (!store.guessSetupReq) return
+  store.guessSetupReq = false
+  if (!game.value.active) openStart()
+}
+
+watch(
+  () => store.guessSetupReq,
+  () => consumeGuessSetup(),
 )
 </script>
 

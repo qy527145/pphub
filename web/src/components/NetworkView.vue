@@ -142,7 +142,7 @@ function menuStyle(node: GraphNode): Record<string, string> {
   }
 }
 
-function act(action: 'chat' | 'file' | 'screen' | 'board' | 'verify', peerId: string): void {
+function act(action: 'chat' | 'file' | 'screen' | 'board' | 'gomoku' | 'verify', peerId: string): void {
   menuFor.value = null
   switch (action) {
     case 'chat':
@@ -156,6 +156,9 @@ function act(action: 'chat' | 'file' | 'screen' | 'board' | 'verify', peerId: st
       break
     case 'board':
       store.actionBoard(peerId)
+      break
+    case 'gomoku':
+      store.actionGomoku(peerId)
       break
     case 'verify':
       verifyFor.value = peerId
@@ -440,6 +443,12 @@ function stateLabel(m: { state: string; transport: string }): string {
           <button @click="act('board', menuNode.member.peerId)">
             <AppIcon name="pen" :size="16" /> 私有白板
           </button>
+          <button
+            :disabled="menuNode.member.state !== 'connected'"
+            @click="act('gomoku', menuNode.member.peerId)"
+          >
+            <AppIcon name="dice" :size="16" /> 五子棋对局
+          </button>
           <button @click="act('verify', menuNode.member.peerId)">
             <AppIcon name="shield" :size="16" /> 安全核验
             <i v-if="menuNode.member.verified" class="okdot" />
@@ -624,6 +633,14 @@ function stateLabel(m: { state: string; transport: string }): string {
       </button>
       <button class="ghost" @click="store.actionBoard('all')">
         <AppIcon name="pen" :size="16" /> 互动白板
+      </button>
+      <button
+        class="ghost"
+        title="在公共白板上开一轮你画我猜"
+        :disabled="store.connectedPeers.length === 0"
+        @click="store.actionGuess()"
+      >
+        <AppIcon name="dice" :size="16" /> 你画我猜
       </button>
     </footer>
   </div>

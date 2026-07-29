@@ -73,16 +73,34 @@ function onFilePicked(ev: Event) {
   input.value = ''
 }
 
-/** 粘贴文件/截图直接发送；纯文本仍走输入框默认粘贴。 */
+/**
+ * 从剪贴板事件里收齐文件：有些来源只把文件放进 items 而 files 为空
+ * （取决于复制它的应用），两处都查，以 items 为准、files 兜底。
+ */
+function pastedFiles(dt: DataTransfer): File[] {
+  const out: File[] = []
+  for (const item of dt.items) {
+    if (item.kind === 'file') {
+      const f = item.getAsFile()
+      if (f) out.push(f)
+    }
+  }
+  if (out.length === 0) out.push(...dt.files)
+  return out
+}
+
+/** 粘贴文件/截图**立即发送**（不需要再按回车）；纯文本仍走输入框默认粘贴。 */
 function onPaste(ev: ClipboardEvent) {
-  const files = ev.clipboardData?.files
-  if (!files?.length) return
+  const dt = ev.clipboardData
+  if (!dt) return
+  const files = pastedFiles(dt)
+  if (files.length === 0) return
   ev.preventDefault()
   if (!channelReachable.value) {
     store.lastError = '对方不可达，暂不能发送文件'
     return
   }
-  shareToChannel([...files])
+  shareToChannel(files)
 }
 
 onMounted(() => window.addEventListener('paste', onPaste))
