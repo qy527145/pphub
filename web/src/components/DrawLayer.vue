@@ -23,6 +23,7 @@ import {
   LOGICAL_WIDTH,
 } from '@/core/draw'
 import type { DrawMode, WbImage } from '@/core/messages'
+import AppIcon from './AppIcon.vue'
 
 const props = withDefaults(
   defineProps<{
@@ -103,7 +104,20 @@ function onPointerDown(ev: PointerEvent): void {
   }
 
   if (props.tool === 'select') {
-    // 点中图片则直接进入拖动；否则拉框选
+    // 裁剪进行中：只响应裁剪手柄/按钮（它们自带 stop），空白点击不打断
+    if (cropMode.value) return
+    // 点在已选包围盒内 → 拖动整组；点中图片 → 单图变换；否则拉框选
+    const box = selectionBox.value
+    if (
+      box &&
+      p.x >= box.x1 - 0.005 &&
+      p.x <= box.x2 + 0.005 &&
+      p.y >= box.y1 - 0.005 &&
+      p.y <= box.y2 + 0.005
+    ) {
+      groupMove = { last: p }
+      return
+    }
     const img = imageAt(p)
     if (img) {
       selectedIds.value = [img.id]
@@ -199,12 +213,19 @@ function onKeyDown(ev: KeyboardEvent): void {
     else if (ev.key === 'Escape') cancelPolyline()
     return
   }
-  if (props.tool === 'select' && selectedIds.value.length > 0) {
-    if (ev.key === 'Delete' || ev.key === 'Backspace') {
-      ev.preventDefault()
-      deleteSelection()
-    } else if (ev.key === 'Escape') {
-      selectedIds.value = []
+  if (props.tool === 'select') {
+    if (cropMode.value) {
+      if (ev.key === 'Escape') cancelCrop()
+      else if (ev.key === 'Enter') applyCrop()
+      return
+    }
+    if (selectedIds.value.length > 0) {
+      if (ev.key === 'Delete' || ev.key === 'Backspace') {
+        ev.preventDefault()
+        deleteSelection()
+      } else if (ev.key === 'Escape') {
+        selectedIds.value = []
+      }
     }
   }
 }
@@ -213,6 +234,8 @@ function onKeyDown(ev: KeyboardEvent): void {
 const selectedIds = ref<string[]>([])
 
 const selectionBox = computed(() => {
+  // 元素本体不做响应式（room store 约定），读 boardRev 让包围盒跟随拖动/远端更新
+  void store.boardRev
   if (selectedIds.value.length === 0) return null
   const keep = new Set(selectedIds.value)
   const items = store.getBoard(props.board).filter((i) => keep.has(i.id))
@@ -246,6 +269,7 @@ function applySelection(rect: { x1: number; y1: number; x2: number; y2: number }
 
 function deleteSelection(): void {
   if (selectedIds.value.length === 0) return
+  cancelCrop()
   store.removeItems(props.board, selectedIds.value)
   selectedIds.value = []
 }
@@ -261,6 +285,9 @@ interface XformState {
   orig: { x: number; y: number; width: number; height: number; rotation: number }
 }
 let xform: XformState | null = null
+
+/** 框选整组拖动状态（增量平移，网络端由 store 限流）。 */
+let groupMove: { last: { x: number; y: number } } | null = null
 
 const aspect = computed(() => (props.width > 0 ? props.height / props.width : 1))
 
@@ -287,12 +314,15 @@ function imageAt(p: { x: number; y: number }): WbImage | null {
 
 /** 唯一选中且是图片时才显示变换手柄。 */
 const activeImage = computed<WbImage | null>(() => {
+  void store.boardRev
   if (props.tool !== 'select' || selectedIds.value.length !== 1) return null
   const it = store.getBoard(props.board).find((i) => i.id === selectedIds.value[0])
   return it && it.mode === 'image' ? it : null
 })
 
 const xformStyle = computed(() => {
+  // 拖动中元素被就地改写，靠 boardRev 让手柄框跟随
+  void store.boardRev
   const img = activeImage.value
   if (!img) return {}
   return {
@@ -387,14 +417,151 @@ function endXform(): void {
   }
 }
 
+// —— 图片裁剪（select 工具，选中单张图片后进入）——
+// 裁剪框以图片本地 [0,1] 分数坐标表示，随图片一起旋转显示；
+// 确认时把源图子区域重编码为新元素（删旧加新，两条消息均已有同步语义）。
+const cropMode = ref(false)
+const cropRect = ref<{ x1: number; y1: number; x2: number; y2: number } | null>(null)
+let cropDrag: 'nw' | 'ne' | 'sw' | 'se' | null = null
+
+function startCrop(): void {
+  if (!activeImage.value) return
+  cropMode.value = true
+  cropRect.value = { x1: 0, y1: 0, x2: 1, y2: 1 }
+}
+
+function cancelCrop(): void {
+  cropMode.value = false
+  cropRect.value = null
+  cropDrag = null
+}
+
+/** 把层归一化坐标换算到图片本地 [0,1] 分数坐标（旋转感知）。 */
+function toLocalFrac(p: { x: number; y: number }, img: WbImage): { fx: number; fy: number } {
+  const a = aspect.value
+  const cx = img.x + img.width / 2
+  const cyS = (img.y + img.height / 2) * a
+  const dx = p.x - cx
+  const dy = p.y * a - cyS
+  const rot = img.rotation ?? 0
+  const cos = Math.cos(-rot)
+  const sin = Math.sin(-rot)
+  const lx = dx * cos - dy * sin
+  const ly = (dx * sin + dy * cos) / a
+  return { fx: lx / img.width + 0.5, fy: ly / img.height + 0.5 }
+}
+
+function startCropHandle(ev: PointerEvent, corner: 'nw' | 'ne' | 'sw' | 'se'): void {
+  layerEl.value?.setPointerCapture(ev.pointerId)
+  cropDrag = corner
+}
+
+function applyCropDrag(p: { x: number; y: number }): void {
+  const img = activeImage.value
+  const r = cropRect.value
+  if (!img || !r || !cropDrag) return
+  const { fx, fy } = toLocalFrac(p, img)
+  const cfx = Math.min(1, Math.max(0, fx))
+  const cfy = Math.min(1, Math.max(0, fy))
+  if (cropDrag === 'nw' || cropDrag === 'sw') r.x1 = Math.min(cfx, r.x2 - 0.05)
+  else r.x2 = Math.max(cfx, r.x1 + 0.05)
+  if (cropDrag === 'nw' || cropDrag === 'ne') r.y1 = Math.min(cfy, r.y2 - 0.05)
+  else r.y2 = Math.max(cfy, r.y1 + 0.05)
+}
+
+function applyCrop(): void {
+  const img = activeImage.value
+  const r = cropRect.value
+  if (!img || !r) return
+  const fx = Math.min(r.x1, r.x2)
+  const fy = Math.min(r.y1, r.y2)
+  const fw = Math.abs(r.x2 - r.x1)
+  const fh = Math.abs(r.y2 - r.y1)
+  cancelCrop()
+  if (fw >= 0.995 && fh >= 0.995) return
+  const src = new Image()
+  src.onload = () => {
+    const sw = Math.max(1, Math.round(src.naturalWidth * fw))
+    const sh = Math.max(1, Math.round(src.naturalHeight * fh))
+    const off = document.createElement('canvas')
+    off.width = sw
+    off.height = sh
+    const octx = off.getContext('2d')
+    if (!octx) return
+    octx.drawImage(src, src.naturalWidth * fx, src.naturalHeight * fy, sw, sh, 0, 0, sw, sh)
+    let dataUrl = off.toDataURL('image/jpeg', 0.8)
+    for (let q = 0.6; dataUrl.length > IMG_MAX_BYTES && q >= 0.3; q -= 0.15) {
+      dataUrl = off.toDataURL('image/jpeg', q)
+    }
+    // 裁剪中心的本地偏移旋转回世界系（旋转发生在像素空间，y 按 aspect 折算）
+    const rot = img.rotation ?? 0
+    const a = aspect.value
+    const ox = (fx + fw / 2 - 0.5) * img.width
+    const oy = (fy + fh / 2 - 0.5) * img.height
+    const cos = Math.cos(rot)
+    const sin = Math.sin(rot)
+    const ncx = img.x + img.width / 2 + (ox * cos - oy * a * sin)
+    const ncy = img.y + img.height / 2 + ((ox / a) * sin + oy * cos)
+    const nw = img.width * fw
+    const nh = img.height * fh
+    store.removeItems(props.board, [img.id])
+    const id = store.addImage(props.board, ncx - nw / 2, ncy - nh / 2, nw, nh, dataUrl)
+    if (rot) {
+      store.updateImage(
+        props.board,
+        id,
+        { x: ncx - nw / 2, y: ncy - nh / 2, width: nw, height: nh, rotation: rot },
+        true,
+      )
+    }
+    selectedIds.value = [id]
+  }
+  src.src = img.dataUrl
+}
+
+const cropBoxStyle = computed(() => {
+  const r = cropRect.value
+  if (!r) return {}
+  return {
+    left: `${Math.min(r.x1, r.x2) * 100}%`,
+    top: `${Math.min(r.y1, r.y2) * 100}%`,
+    width: `${Math.abs(r.x2 - r.x1) * 100}%`,
+    height: `${Math.abs(r.y2 - r.y1) * 100}%`,
+  }
+})
+
+function cropHandleStyle(c: 'nw' | 'ne' | 'sw' | 'se'): Record<string, string> {
+  const r = cropRect.value
+  if (!r) return {}
+  const x = c === 'nw' || c === 'sw' ? Math.min(r.x1, r.x2) : Math.max(r.x1, r.x2)
+  const y = c === 'nw' || c === 'ne' ? Math.min(r.y1, r.y2) : Math.max(r.y1, r.y2)
+  return { left: `${x * 100}%`, top: `${y * 100}%` }
+}
+
+// 被裁剪的图片若被删除（本端撤销/远端擦除），退出裁剪态
+watch(activeImage, (img) => {
+  if (!img) cancelCrop()
+})
+
 function onPointerMove(ev: PointerEvent): void {
   const p = norm(ev)
   if (!p) return
   lastPos = p
   pointerInside = true
 
+  if (cropDrag) {
+    applyCropDrag(p)
+    return
+  }
+
   if (xform) {
     applyXform(p)
+    return
+  }
+
+  if (groupMove) {
+    store.moveItems(props.board, selectedIds.value, p.x - groupMove.last.x, p.y - groupMove.last.y)
+    groupMove.last = p
     return
   }
 
@@ -434,8 +601,19 @@ function flushPoints(): void {
 function onPointerUp(): void {
   erasing = false
 
+  if (cropDrag) {
+    cropDrag = null
+    return
+  }
+
   if (xform) {
     endXform()
+    return
+  }
+
+  if (groupMove) {
+    groupMove = null
+    store.moveItems(props.board, selectedIds.value, 0, 0, true)
     return
   }
 
@@ -585,8 +763,10 @@ watch(
   () => props.tool,
   () => {
     cancelPolyline()
+    cancelCrop()
     selectedIds.value = []
     xform = null
+    groupMove = null
   },
 )
 
@@ -800,11 +980,38 @@ function getArrowPoints(): string {
       />
     </svg>
 
-    <!-- 图片变换手柄：框体拖动、上方旋转、右下角缩放 -->
+    <!-- 图片变换手柄：框体拖动、上方旋转、右下角缩放、下方裁剪 -->
     <div v-if="activeImage" class="img-xform" :style="xformStyle">
-      <span class="rot-line" />
-      <span class="handle rot" title="旋转" @pointerdown.stop.prevent="startHandle($event, 'rotate')" />
-      <span class="handle scale" title="缩放" @pointerdown.stop.prevent="startHandle($event, 'scale')" />
+      <template v-if="!cropMode">
+        <span class="rot-line" />
+        <span class="handle rot" title="旋转" @pointerdown.stop.prevent="startHandle($event, 'rotate')" />
+        <span class="handle scale" title="缩放" @pointerdown.stop.prevent="startHandle($event, 'scale')" />
+        <div class="xf-actions">
+          <button class="xf-btn" title="裁剪" @pointerdown.stop @click.stop="startCrop">
+            <AppIcon name="crop" :size="13" />
+          </button>
+        </div>
+      </template>
+      <template v-else-if="cropRect">
+        <div class="crop-shade">
+          <div class="crop-box" :style="cropBoxStyle" />
+        </div>
+        <span
+          v-for="c in (['nw', 'ne', 'sw', 'se'] as const)"
+          :key="c"
+          class="handle crop-h"
+          :style="cropHandleStyle(c)"
+          @pointerdown.stop.prevent="startCropHandle($event, c)"
+        />
+        <div class="xf-actions">
+          <button class="xf-btn ok" title="确认裁剪 (Enter)" @pointerdown.stop @click.stop="applyCrop">
+            <AppIcon name="check" :size="13" />
+          </button>
+          <button class="xf-btn" title="取消 (Esc)" @pointerdown.stop @click.stop="cancelCrop">
+            <AppIcon name="x" :size="13" />
+          </button>
+        </div>
+      </template>
     </div>
 
     <!-- 远端鼠标轨迹尾迹（SVG 渐隐线段） -->
@@ -930,6 +1137,58 @@ function getArrowPoints(): string {
   right: -7px;
   bottom: -7px;
   cursor: nwse-resize;
+}
+
+.img-xform .xf-actions {
+  position: absolute;
+  left: 50%;
+  bottom: -34px;
+  transform: translateX(-50%);
+  display: flex;
+  gap: 6px;
+  pointer-events: auto;
+}
+
+.img-xform .xf-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--text);
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.img-xform .xf-btn:hover {
+  color: var(--accent);
+}
+
+.img-xform .xf-btn.ok {
+  background: #4084ff;
+  border-color: #4084ff;
+  color: #fff;
+}
+
+.img-xform .crop-shade {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+.img-xform .crop-box {
+  position: absolute;
+  border: 1.5px solid #fff;
+  box-shadow: 0 0 0 9999px rgb(0 0 0 / 45%);
+}
+
+.img-xform .handle.crop-h {
+  transform: translate(-50%, -50%);
+  cursor: crosshair;
 }
 
 .eraser-ring {

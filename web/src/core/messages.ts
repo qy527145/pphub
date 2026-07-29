@@ -192,6 +192,8 @@ export type ControlMessage =
   | { kind: 'draw-image'; board: BoardId; id: string; x: number; y: number; width: number; height: number; dataUrl: string }
   /** 更新既有图片元素的几何（拖动/缩放/旋转）。 */
   | { kind: 'draw-update'; board: BoardId; id: string; x: number; y: number; width: number; height: number; rotation?: number }
+  /** 平移一组元素（框选拖动），dx/dy 为归一化增量。 */
+  | { kind: 'draw-move'; board: BoardId; ids: string[]; dx: number; dy: number }
   /** 撤销：按 id 移除若干元素（仅撤自己画的）。 */
   | { kind: 'draw-remove'; board: BoardId; ids: string[] }
   | { kind: 'draw-clear'; board: BoardId }

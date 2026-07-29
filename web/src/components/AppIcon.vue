@@ -56,6 +56,7 @@ const ICONS: Record<string, string> = {
     '<rect x="3.4" y="3.4" width="7.7" height="7.7" rx="2"/><rect x="12.9" y="3.4" width="7.7" height="7.7" rx="2"/><rect x="3.4" y="12.9" width="7.7" height="7.7" rx="2"/><rect x="12.9" y="12.9" width="7.7" height="7.7" rx="2"/>',
   expand:
     '<path d="M13.8 4.6h5.6v5.6"/><path d="M10.2 19.4H4.6v-5.6"/><path d="M19.4 4.6l-6.2 6.2"/><path d="M4.6 19.4l6.2-6.2"/>',
+  crop: '<path d="M7.2 3.2v11.6a2 2 0 0 0 2 2h11.6"/><path d="M3.2 7.2h11.6a2 2 0 0 1 2 2v11.6"/>',
 }
 
 defineProps<{ name: string; size?: number }>()

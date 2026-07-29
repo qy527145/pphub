@@ -662,6 +662,17 @@ export const useRoomStore = defineStore('room', () => {
         }
         break
       }
+      case 'draw-move': {
+        const arr = boards.get(msg.board)
+        if (arr) {
+          const keep = new Set(msg.ids)
+          for (const it of arr) {
+            if (keep.has(it.id)) translateItem(it, msg.dx, msg.dy)
+          }
+          bumpBoard()
+        }
+        break
+      }
       case 'draw-remove': {
         const arr = boards.get(msg.board)
         if (arr) {
@@ -943,6 +954,65 @@ export const useRoomStore = defineStore('room', () => {
     if (flush || now - lastImgUpdateSent > 50) {
       lastImgUpdateSent = now
       sendDraw(board, { kind: 'draw-update', board, id, ...patch })
+    }
+  }
+
+  /** 把单个元素整体平移（归一化增量）。 */
+  function translateItem(it: WbItem, dx: number, dy: number): void {
+    if (it.mode === 'pen' || it.mode === 'eraser' || it.mode === 'polyline') {
+      const pts = it.points
+      for (let i = 0; i + 1 < pts.length; i += 2) {
+        pts[i] += dx
+        pts[i + 1] += dy
+      }
+    } else if (it.mode === 'text' || it.mode === 'image') {
+      it.x += dx
+      it.y += dy
+    } else if (
+      it.mode === 'line' ||
+      it.mode === 'arrow' ||
+      it.mode === 'rect' ||
+      it.mode === 'ellipse'
+    ) {
+      it.x1 += dx
+      it.y1 += dy
+      it.x2 += dx
+      it.y2 += dy
+    }
+  }
+
+  /** 框选拖动的网络累积增量（50ms 限流，flush 时清空）。 */
+  let pendingMove: { board: string; ids: string[]; dx: number; dy: number } | null = null
+  let lastMoveSent = 0
+
+  /** 平移一组元素。flush=true 时强制发送累积增量（拖动结束）。 */
+  function moveItems(board: string, ids: string[], dx: number, dy: number, flush = false): void {
+    const arr = boards.get(board)
+    if (!arr || ids.length === 0) return
+    const keep = new Set(ids)
+    for (const it of arr) {
+      if (keep.has(it.id)) translateItem(it, dx, dy)
+    }
+    bumpBoard()
+    if (pendingMove && pendingMove.board === board) {
+      pendingMove.dx += dx
+      pendingMove.dy += dy
+    } else {
+      pendingMove = { board, ids: [...ids], dx, dy }
+    }
+    const now = Date.now()
+    if (flush || now - lastMoveSent > 50) {
+      lastMoveSent = now
+      if (pendingMove.dx !== 0 || pendingMove.dy !== 0) {
+        sendDraw(board, {
+          kind: 'draw-move',
+          board,
+          ids: pendingMove.ids,
+          dx: pendingMove.dx,
+          dy: pendingMove.dy,
+        })
+      }
+      pendingMove = null
     }
   }
 
@@ -1478,6 +1548,7 @@ export const useRoomStore = defineStore('room', () => {
     addText,
     addImage,
     updateImage,
+    moveItems,
     removeItems,
     undoStroke,
     clearBoard,
