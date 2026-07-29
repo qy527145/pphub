@@ -253,6 +253,9 @@ export type ControlMessage =
   | { kind: 'table-spectate'; tableId: string }
   | { kind: 'table-leave'; tableId: string }
   | { kind: 'table-start'; tableId: string }
+  | { kind: 'table-sit'; tableId: string }
+  | { kind: 'table-standup'; tableId: string }
+  | { kind: 'table-invite'; tableId: string; gameName: string }
   | { kind: 'game-move'; tableId: string; moveData: unknown }
   | { kind: 'game-chat'; tableId: string; chatMsg: unknown }
   | { kind: 'mouse-pos'; tableId: string; pos: unknown }

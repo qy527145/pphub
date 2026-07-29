@@ -25,6 +25,14 @@ const isHost = computed(() => {
   return currentTable.value?.hostId === store.myId
 })
 
+const isPlayer = computed(() => {
+  return currentTable.value?.players.includes(store.myId) ?? false
+})
+
+const isSpectator = computed(() => {
+  return currentTable.value?.spectators.includes(store.myId) ?? false
+})
+
 const canStart = computed(() => {
   if (!currentTable.value || !isHost.value || currentTable.value.state !== 'waiting') {
     return false
@@ -36,6 +44,14 @@ const canStart = computed(() => {
   if (meta.category === 'single') return playerCount === 1
   if (meta.category === 'double') return playerCount === meta.playerCount
   return playerCount >= meta.playerCount
+})
+
+const canSitDown = computed(() => {
+  if (!currentTable.value || currentTable.value.state !== 'waiting') return false
+  if (isPlayer.value) return false
+  const meta = gameMeta.value
+  if (!meta) return false
+  return currentTable.value.players.length < meta.playerCount
 })
 
 const chatInput = ref('')
@@ -59,6 +75,21 @@ function leaveTable() {
   store.leaveGameTable()
 }
 
+function sitDown() {
+  if (!store.currentTableId || !canSitDown.value) return
+  store.sitDownAtTable(store.currentTableId)
+}
+
+function standUp() {
+  if (!store.currentTableId || !isPlayer.value || currentTable.value?.state !== 'waiting') return
+  store.standUpFromTable(store.currentTableId)
+}
+
+function invitePeer(peerId: string) {
+  if (!store.currentTableId) return
+  store.inviteToTable(store.currentTableId, peerId)
+}
+
 function getPlayerNick(peerId: string): string {
   return store.displayName(peerId)
 }
@@ -78,6 +109,20 @@ const remotePointers = computed(() => {
   if (!store.currentTableId) return []
   return store.gameMousePositions.get(store.currentTableId) || []
 })
+
+// 可以邀请的网络成员（排除已经在桌上的）
+const invitableMembers = computed(() => {
+  if (!currentTable.value) return []
+  const inTable = new Set([...currentTable.value.players, ...currentTable.value.spectators])
+  return store.memberList.filter(m =>
+    m.peerId !== store.myId &&
+    !inTable.has(m.peerId) &&
+    m.state === 'connected'
+  )
+})
+
+const showInviteDialog = ref(false)
+
 </script>
 
 <template>
@@ -89,10 +134,16 @@ const remotePointers = computed(() => {
           {{ currentTable.state === 'waiting' ? '等待中' : currentTable.state === 'playing' ? '游戏中' : '已结束' }}
         </span>
       </div>
-      <button class="btn-leave" @click="leaveTable">
-        <AppIcon name="x" :size="16" />
-        离开游戏桌
-      </button>
+      <div class="header-actions">
+        <button v-if="currentTable.state === 'waiting'" class="btn-invite" @click="showInviteDialog = true">
+          <AppIcon name="user-plus" :size="16" />
+          邀请好友
+        </button>
+        <button class="btn-leave" @click="leaveTable">
+          <AppIcon name="x" :size="16" />
+          离开游戏桌
+        </button>
+      </div>
     </header>
 
     <div class="table-content">
@@ -105,7 +156,7 @@ const remotePointers = computed(() => {
               v-for="peerId in currentTable.players"
               :key="peerId"
               class="player-item"
-              :class="{ host: peerId === currentTable.hostId }"
+              :class="{ host: peerId === currentTable.hostId, self: peerId === store.myId }"
             >
               <PeerAvatar
                 :avatar="store.members.get(peerId)?.profile?.avatar"
@@ -114,20 +165,51 @@ const remotePointers = computed(() => {
               />
               <span class="player-name">{{ getPlayerNick(peerId) }}</span>
               <span v-if="peerId === currentTable.hostId" class="host-badge">桌主</span>
+              <span v-if="peerId === store.myId" class="self-badge">我</span>
             </div>
+
+            <!-- 空位 -->
+            <div
+              v-for="i in Math.max(0, gameMeta.playerCount - currentTable.players.length)"
+              :key="`empty-${i}`"
+              class="player-item empty"
+            >
+              <div class="empty-avatar">
+                <AppIcon name="user" :size="20" />
+              </div>
+              <span class="player-name">等待玩家...</span>
+            </div>
+          </div>
+
+          <!-- 坐下/站起按钮 -->
+          <div v-if="currentTable.state === 'waiting'" class="seat-actions">
+            <button v-if="canSitDown" class="btn-sit" @click="sitDown">
+              <AppIcon name="log-in" :size="16" />
+              坐下参与游戏
+            </button>
+            <button v-else-if="isPlayer && !isHost" class="btn-standup" @click="standUp">
+              <AppIcon name="log-out" :size="16" />
+              站起旁观
+            </button>
           </div>
         </div>
 
-        <div v-if="gameMeta.spectatable && currentTable.spectators.length > 0" class="panel-section">
+        <div v-if="currentTable.spectators.length > 0" class="panel-section">
           <h3>旁观者 ({{ currentTable.spectators.length }})</h3>
           <div class="spectator-list">
-            <div v-for="peerId in currentTable.spectators" :key="peerId" class="spectator-item">
+            <div
+              v-for="peerId in currentTable.spectators"
+              :key="peerId"
+              class="spectator-item"
+              :class="{ self: peerId === store.myId }"
+            >
               <PeerAvatar
                 :avatar="store.members.get(peerId)?.profile?.avatar"
                 :seed="peerId"
                 :size="24"
               />
               <span class="spectator-name">{{ getPlayerNick(peerId) }}</span>
+              <span v-if="peerId === store.myId" class="self-badge">我</span>
             </div>
           </div>
         </div>
@@ -152,7 +234,17 @@ const remotePointers = computed(() => {
         <GomokuGame v-else-if="currentTable.gameType === 'gomoku'" :table="currentTable" />
         <XiangqiGame v-else-if="currentTable.gameType === 'xiangqi'" :table="currentTable" />
         <div v-else class="game-placeholder">
-          {{ currentTable.state === 'waiting' ? '等待开始...' : '游戏进行中' }}
+          <div v-if="currentTable.state === 'waiting'" class="placeholder-content">
+            <div class="placeholder-icon">⏳</div>
+            <h3>等待开始...</h3>
+            <p v-if="!isPlayer && !isSpectator">请选择坐下或旁观</p>
+            <p v-else-if="isSpectator">你正在旁观，等待游戏开始</p>
+            <p v-else-if="!canStart">等待玩家坐满...</p>
+          </div>
+          <div v-else class="placeholder-content">
+            <div class="placeholder-icon">🎮</div>
+            <h3>游戏进行中</h3>
+          </div>
         </div>
 
         <!-- 远程鼠标指针 -->
@@ -195,6 +287,41 @@ const remotePointers = computed(() => {
         </div>
       </aside>
     </div>
+
+    <!-- 邀请对话框 -->
+    <div v-if="showInviteDialog" class="dialog-mask" @click.self="showInviteDialog = false">
+      <div class="dialog">
+        <header class="dialog-header">
+          <h3>邀请好友</h3>
+          <button class="btn-close" @click="showInviteDialog = false">
+            <AppIcon name="x" :size="16" />
+          </button>
+        </header>
+        <div class="dialog-body">
+          <div v-if="invitableMembers.length === 0" class="empty-invite">
+            <p>暂无可邀请的在线好友</p>
+          </div>
+          <div v-else class="invite-list">
+            <div
+              v-for="member in invitableMembers"
+              :key="member.peerId"
+              class="invite-item"
+            >
+              <PeerAvatar
+                :avatar="member.profile?.avatar"
+                :seed="member.peerId"
+                :size="32"
+              />
+              <span class="invite-name">{{ getPlayerNick(member.peerId) }}</span>
+              <button class="btn-invite-member" @click="invitePeer(member.peerId)">
+                <AppIcon name="user-plus" :size="14" />
+                邀请
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
   </div>
 </template>
 
@@ -235,6 +362,12 @@ const remotePointers = computed(() => {
   font-size: 13px;
 }
 
+.header-actions {
+  display: flex;
+  gap: 12px;
+}
+
+.btn-invite,
 .btn-leave {
   display: flex;
   align-items: center;
@@ -246,8 +379,10 @@ const remotePointers = computed(() => {
   color: var(--text);
   cursor: pointer;
   transition: all 0.2s;
+  font-size: 14px;
 }
 
+.btn-invite:hover,
 .btn-leave:hover {
   background: var(--hover);
 }
@@ -305,18 +440,87 @@ const remotePointers = computed(() => {
   border: 1px solid var(--accent);
 }
 
+.player-item.self {
+  background: var(--accent-weak);
+}
+
+.player-item.empty {
+  border: 2px dashed var(--border);
+  background: transparent;
+  opacity: 0.5;
+}
+
+.empty-avatar {
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  background: var(--bg);
+  display: grid;
+  place-items: center;
+  color: var(--muted);
+}
+
 .player-name {
   flex: 1;
   font-size: 13px;
   color: var(--text);
 }
 
-.host-badge {
+.host-badge,
+.self-badge {
   padding: 2px 6px;
-  background: var(--accent);
-  color: white;
   border-radius: var(--radius-pill);
   font-size: 11px;
+  font-weight: 600;
+}
+
+.host-badge {
+  background: var(--accent);
+  color: white;
+}
+
+.self-badge {
+  background: var(--success);
+  color: white;
+}
+
+.seat-actions {
+  margin-top: 12px;
+}
+
+.btn-sit,
+.btn-standup {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 10px;
+  border: none;
+  border-radius: var(--radius);
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.btn-sit {
+  background: var(--accent);
+  color: white;
+}
+
+.btn-sit:hover {
+  background: var(--accent-strong);
+}
+
+.btn-standup {
+  background: var(--muted-weak);
+  color: var(--text);
+  border: 1px solid var(--border);
+}
+
+.btn-standup:hover {
+  background: var(--hover);
 }
 
 .spectator-item {
@@ -328,7 +532,12 @@ const remotePointers = computed(() => {
   background: var(--bg);
 }
 
+.spectator-item.self {
+  background: var(--accent-weak);
+}
+
 .spectator-name {
+  flex: 1;
   font-size: 12px;
   color: var(--muted);
 }
@@ -380,6 +589,29 @@ const remotePointers = computed(() => {
   height: 100%;
   font-size: 18px;
   color: var(--muted);
+}
+
+.placeholder-content {
+  text-align: center;
+  max-width: 300px;
+}
+
+.placeholder-icon {
+  font-size: 64px;
+  margin-bottom: 16px;
+}
+
+.placeholder-content h3 {
+  margin: 0 0 8px 0;
+  font-size: 20px;
+  color: var(--text);
+}
+
+.placeholder-content p {
+  margin: 0;
+  font-size: 14px;
+  color: var(--muted);
+  line-height: 1.5;
 }
 
 .remote-pointer {
@@ -493,6 +725,107 @@ const remotePointers = computed(() => {
 }
 
 .chat-input button:hover {
+  background: var(--accent-strong);
+}
+
+/* 邀请对话框 */
+.dialog-mask {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  display: grid;
+  place-items: center;
+  z-index: 100;
+}
+
+.dialog {
+  width: min(400px, calc(100vw - 40px));
+  max-height: calc(100vh - 80px);
+  background: var(--panel);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-pop);
+  display: flex;
+  flex-direction: column;
+}
+
+.dialog-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 20px;
+  border-bottom: 1px solid var(--border);
+}
+
+.dialog-header h3 {
+  margin: 0;
+  font-size: 16px;
+  color: var(--text);
+}
+
+.btn-close {
+  padding: 4px;
+  border: none;
+  background: none;
+  color: var(--muted);
+  cursor: pointer;
+  border-radius: var(--radius);
+  transition: all 0.2s;
+}
+
+.btn-close:hover {
+  background: var(--hover);
+  color: var(--text);
+}
+
+.dialog-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 16px 20px;
+}
+
+.empty-invite {
+  text-align: center;
+  padding: 40px 20px;
+  color: var(--muted);
+}
+
+.invite-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.invite-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px;
+  background: var(--bg);
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+}
+
+.invite-name {
+  flex: 1;
+  font-size: 14px;
+  color: var(--text);
+}
+
+.btn-invite-member {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 12px;
+  border: none;
+  border-radius: var(--radius);
+  background: var(--accent);
+  color: white;
+  font-size: 13px;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.btn-invite-member:hover {
   background: var(--accent-strong);
 }
 </style>

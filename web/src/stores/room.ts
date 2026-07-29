@@ -2321,6 +2321,52 @@ export const useRoomStore = defineStore('room', () => {
     })
   }
 
+  function sitDownAtTable(tableId: string): void {
+    const table = gameTables.get(tableId)
+    if (!table || table.state !== 'waiting') return
+
+    // 从旁观者移到玩家
+    table.spectators = table.spectators.filter((p) => p !== myId.value)
+    if (!table.players.includes(myId.value)) {
+      table.players.push(myId.value)
+    }
+
+    // 广播坐下消息
+    mesh?.broadcast({
+      kind: 'table-sit',
+      tableId,
+    })
+  }
+
+  function standUpFromTable(tableId: string): void {
+    const table = gameTables.get(tableId)
+    if (!table || table.state !== 'waiting') return
+
+    // 从玩家移到旁观者
+    table.players = table.players.filter((p) => p !== myId.value)
+    if (!table.spectators.includes(myId.value)) {
+      table.spectators.push(myId.value)
+    }
+
+    // 广播站起消息
+    mesh?.broadcast({
+      kind: 'table-standup',
+      tableId,
+    })
+  }
+
+  function inviteToTable(tableId: string, peerId: string): void {
+    const table = gameTables.get(tableId)
+    if (!table) return
+
+    // 发送邀请消息给指定玩家
+    mesh?.sendTo(peerId, {
+      kind: 'table-invite',
+      tableId,
+      gameName: getGameMeta(table.gameType)?.name || '游戏',
+    })
+  }
+
   return {
     capabilities,
     status,
@@ -2445,5 +2491,8 @@ export const useRoomStore = defineStore('room', () => {
     sendGameMove,
     sendGameChat,
     sendGameMousePos,
+    sitDownAtTable,
+    standUpFromTable,
+    inviteToTable,
   }
 })
