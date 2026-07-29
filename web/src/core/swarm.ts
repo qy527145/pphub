@@ -245,10 +245,10 @@ export class Download {
     for (const [reqId, f] of [...this.inflight]) {
       if (f.peerId === peerId) this.release(reqId)
     }
-    if (this.sources.size === 0) {
-      this.fail('所有源都已离线')
-      return
-    }
+    // 会话内续传：所有源都掉线时不作废下载，保留已到手的分块进入「停摆」，
+    // 等任一源恢复（对端重连 / 传输层降级后通道重开）再自动续传。
+    // UI 依据 onSources(0) 呈现等待态。
+    if (this.sources.size === 0) return
     this.pump()
   }
 

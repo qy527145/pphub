@@ -57,6 +57,8 @@ export interface SharedFileMeta {
   owner: string
   mode: TransferMode
   scope: SendScope
+  /** 图片共享的内联缩略图（小尺寸 dataURL，聊天气泡预览用）。 */
+  thumb?: string
 }
 
 /** 画笔模式：普通笔、橡皮、直线、箭头、折线、矩形、椭圆、文本、图片、框选。 */
@@ -151,14 +153,26 @@ export type WbItem = WbStroke | WbLine | WbPolyline | WbText | WbImage
 export type BoardId = string
 
 export type ControlMessage =
-  /** 聊天。scope=all 为群聊；dm 为一对一私聊（只发给该对端）。 */
-  | { kind: 'chat'; text: string; ts: number; scope: 'all' | 'dm' }
+  /** 聊天。scope=all 为群聊；dm 为一对一私聊（只发给该对端）。msgId 全网唯一，表情回应据此寻址。 */
+  | { kind: 'chat'; msgId?: string; text: string; ts: number; scope: 'all' | 'dm' }
+  /** 对某条消息的表情回应（按 msgId 寻址；op=remove 撤销自己的回应）。 */
+  | { kind: 'react'; msgId: string; emoji: string; op: 'add' | 'remove'; scope: 'all' | 'dm' }
+  /**
+   * 语音消息：录音编码为 base64 随控制通道直达（时长上限约 60s）。
+   * 单条 control 消息受 SCTP maxMessageSize 约束（跨浏览器保守值 ~256KB），
+   * 长录音按 part/parts 分片发送，接收端按 msgId 重组（control 有序可靠，
+   * 分片天然按序到达）。不带 part 字段 = 单片。
+   */
+  | { kind: 'voice-note'; msgId: string; scope: 'all' | 'dm'; data: string; mime: string; dur: number; ts: number; part?: number; parts?: number }
+  // —— RTT 探测（网络视图连线延迟）——
+  | { kind: 'ping'; seq: number }
+  | { kind: 'pong'; seq: number }
   /** 名片同步（通道就绪时互发一次，之后变更即广播）。 */
   | { kind: 'profile'; profile: Profile }
   /** 请求对方补发名片（本端 rev 落后或首次连接时）。 */
   | { kind: 'profile-req' }
-  /** 本端视角的邻接表，用于网络视图画出「节点—节点」的真实连通性。 */
-  | { kind: 'link-state'; links: { peerId: string; state: string }[] }
+  /** 本端视角的邻接表，用于网络视图画出「节点—节点」的真实连通性（附实测 RTT）。 */
+  | { kind: 'link-state'; links: { peerId: string; state: string; rtt?: number }[] }
   // —— 强制发送（推）——
   | ({ kind: 'file-offer' } & FileOffer)
   /** 任一端取消/拒绝传输（含发送端中止），对端据此停止并清理。 */
@@ -186,6 +200,10 @@ export type ControlMessage =
    */
   | { kind: 'screen-start'; scope: SendScope; via?: 'track' | 'codec' }
   | { kind: 'screen-stop' }
+  // —— 实时对讲（麦克风轨，仅 WebRTC 直连/TURN 路径）——
+  /** 本端开麦。streamId 用于对端把到达的媒体流识别为语音（区别于屏幕共享）。 */
+  | { kind: 'voice-start'; streamId: string }
+  | { kind: 'voice-stop' }
   // —— 绘制（白板 / 屏幕批注共用）——
   | { kind: 'draw-begin'; board: BoardId; id: string; color: string; size: number; mode: 'pen' | 'eraser'; x: number; y: number }
   /** 追加一批采样点（扁平化 x,y 序列，发送端按 ~25fps 批量）。 */
@@ -212,3 +230,20 @@ export type ControlMessage =
   | { kind: 'ptr-move'; board: BoardId; x: number; y: number }
   | { kind: 'ptr-click'; board: BoardId; x: number; y: number }
   | { kind: 'ptr-hide'; board: BoardId }
+  // —— 你画我猜（公共白板游戏模式；出题人本地持词，猜中由出题人裁决）——
+  /** 出题人开启一轮：hint 为提示（如字数），词只在出题人本地。 */
+  | { kind: 'guess-start'; round: number; drawer: string; hint: string }
+  /** 某人提交一次猜测（广播，所有人可见）。 */
+  | { kind: 'guess-try'; round: number; text: string; ts: number }
+  /** 出题人裁决猜中：公布答案与最新积分表。 */
+  | { kind: 'guess-correct'; round: number; winner: string; word: string; scores: Record<string, number> }
+  /** 出题人主动公布答案（无人猜中跳过本轮）。 */
+  | { kind: 'guess-reveal'; round: number; word: string }
+  | { kind: 'guess-end' }
+  // —— 五子棋（一对一私聊对局）——
+  | { kind: 'gomoku-invite'; gameId: string }
+  | { kind: 'gomoku-accept'; gameId: string }
+  | { kind: 'gomoku-decline'; gameId: string }
+  /** 落子：n 为手数（从 1 起），用于丢包/乱序防御（control 有序，通常一致）。 */
+  | { kind: 'gomoku-move'; gameId: string; n: number; x: number; y: number }
+  | { kind: 'gomoku-resign'; gameId: string }

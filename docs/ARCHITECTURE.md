@@ -325,11 +325,11 @@ control 通道传 `{t:"chat", from, ts, text|html|imgBlobRef}`；图片/文件�
 | Phase | 内容 | 关键地基 | 状态 |
 |-------|------|---------|------|
 | **1a 地基** | Rust 信令服务器 + WSS 客户端 + Perfect Negotiation + 单连接建立 + **文本聊天**打通端到端 | 房间注册表、信令协议、TURN 凭证、SAS 校验 | ✅ 已完成（2026-07-27） |
-| **1b 文件** | 单文件 → 文件夹快传，Chromium 流式 / 其他 OPFS，Worker 哈希，背压 | 分块协议、落盘抽象 | ⚠️ 基础版已落地（2026-07-27）：多文件/多目标、独立 file-<id> 通道、64KiB 分块 + 背压、进度/取消；内存 Blob 落盘（≤1GB）。流式落盘(FSA/OPFS)、文件夹、Worker 哈希待补 |
+| **1b 文件** | 单文件 → 文件夹快传，Chromium 流式 / 其他 OPFS，Worker 哈希，背压 | 分块协议、落盘抽象 | ⚠️ 基础版已落地（2026-07-27）：多文件/多目标、独立 file-<id> 通道、64KiB 分块 + 背压、进度/取消；内存 Blob 落盘（≤1GB）。文件夹（zip 打包）与会话内断点续传已补（2026-07-29）；流式落盘(FSA/OPFS)、Worker 哈希、跨会话续传待补 |
 | **1c 媒体** | 屏幕共享 + 互动白板（Yjs） | 媒体协商、Canvas 叠加 | ✅ 已落地（2026-07-28）：媒体轨复用既有 PeerConnection + 完美协商；白板未引 Yjs，用「笔画 op + 全量状态合并」轻量同步（见落地记录） |
-| **1d 看片** | 一起看片房（时钟同步 + 漂移纠正） | sync 通道、rVFC | |
+| **1d 看片** | 一起看片房（时钟同步 + 漂移纠正） | sync 通道、rVFC | ❌ 已裁撤（2026-07-29）：判定为低价值功能，侧边栏占位一并移除 |
 | **1e 局域网** | 手输 IP / 二维码 serverless 信令 | vanilla ICE | |
-| **2** | 一键剪贴板互传（降级版）、多人 Mesh 打磨 | | |
+| **2** | 一键剪贴板互传（降级版）、多人 Mesh 打磨 | | ❌ 剪贴板互传已裁撤（2026-07-29）：按钮版体验鸡肋，改为聊天页原生粘贴（文本进输入框、文件/截图直接发送）；Mesh 打磨已随 1a–1c 落地 |
 | **3+** | 空间音频挂机房、旧手机监控、P2P CDN | 后续评估 | |
 
 > 建议即便首期范围含 1c/1d，也**先做完 1a 地基**（信令+连接+聊天+SAS）再并行铺开——所有功能都依赖这套连接与传输底座。
@@ -402,6 +402,25 @@ control 通道传 `{t:"chat", from, ts, text|html|imgBlobRef}`；图片/文件�
 - **动态码长**：`joined` 应答增 `code_len`，按当前房间数推荐（10^len ≥ 10⁴ × 房间数，即新监听者撞码概率 < 10⁻⁴：<100 房 6 位、<1000 房 7 位……9 位封顶）。客户端记入 sessionStorage，后续 `regenCode` 按此长度生成；监听成功但码短于建议且**房里没人**时主动升长换码（有人连着时绝不换，避免把对端甩掉）。生成改为按字节拒绝采样（≥250 丢弃）的无偏数字串，替换原 `Uint32 % 10^6`。
 - **客户端编排**：`mesh.join()` 从「发完 join 即返回」改为**等待服务端应答**——`joined` 兑现（附已有成员数与 `codeLen`），join 阶段错误以 `JoinRejected(code)` 驳回；`status='online'` 从此才是真的在房里。store 的 `listen()` 收到 `code-taken` 自动换码重试（上限 3 次，升长不计入）；刷新恢复走 `listen()` 以重新声明所有权，而非裸 `joinRoom`。
 - **验证**：Node 直连 WS 协议测试 8 项（撞码拒绝 / 拨入放行 / 拨入方先到监听者后到可进 / owner 释放后短码可复用 / 旧格式兼容）+ 码长升降级（105 房 → 7 位，清空 → 6 位）+ 无头 Chromium 双标签页注入同一短码的端到端测试 6 项（先到者保码、后到者自动换码、拨入连到先到者）全过；`cargo check` + `vue-tsc` + `vite build` 通过。
+
+### 十项功能批量落地记录（2026-07-29）
+
+一次落地十项能力，全部构建在既有 control 通道 / 媒体轨 / swarm 底座上，后端信令**零改动**。
+
+- **拖拽发送**：聊天窗整窗拖放（scope 跟随当前频道）、网络视图**拖到节点头像直发 TA**（悬停高亮）、发送页拖放升级。统一入口 `utils/fs.ts::collectDropped`——用 `webkitGetAsEntry` 递归遍历目录（readEntries 每批 100 条循环读尽），把一次 drop 整理成「零散文件 + 顶层文件夹」。
+- **文件夹传输**：不逐文件传目录结构（接收端浏览器没有可靠的按路径落盘能力），改为 `utils/zip.ts` 打包 **store 模式 zip**——Blob 由「头部字节 + File 引用 + 目录字节」拼成，File 部分是惰性引用不进内存，只有 CRC32 需要顺序读一遍；UTF-8 文件名（bit11）；不做 zip64，超 4GB/65535 条目**诚实拒绝**而非产出损坏包。`<input webkitdirectory>` 与拖拽两条入口共用 `store.dispatchPayload`。
+- **断点续传（会话内）**：swarm 的 `Download.dropSource` 在所有源掉线时不再作废下载，保留已到手分块进入**停摆**（UI 呈现「等待源恢复自动续传」，可手动取消）；mesh 在任一对端 `channelopen`（重连/中继降级后重开）时对所有进行中下载补发 `have-req`，源恢复即自动续传；下载中的共享条目不随 share-revoke / 持有者离开作废。边界：共享登记是会话态（刷新即焚），源的**页面**关掉重开需对方重新共享——跨会话续传（IndexedDB 持久化分块）留待后续。
+- **图片消息内联预览**：`shareFiles` 对图片生成 ≤320px JPEG 缩略图（`utils/blob.ts::makeImageThumb`，>64KB 不值得随元信息广播则放弃），随 `SharedFileMeta.thumb` 广播；聊天气泡直接显示缩略图，点击开灯箱——已下载/下载完成自动无缝换原图，未下载给「下载原图」按钮（多源下载链路复用）。接收页共享列表同样显示缩略图。
+- **二维码连接**：`uqr`（gzip 后 ~4KB）把分享链接渲染成 SVG 内嵌组网面板，手机扫码打开 `?c=` 即连，解决跨设备输码。
+- **后台消息通知**：`utils/notify.ts`——页面不可见时来消息（文本/文件/语音）发 Web Notification（点击聚焦回页）+ **标题闪烁**兜底，回到页面自动复原；权限在「连接」这个用户手势里申请（Safari 强制），未授权仍有标题闪烁。
+- **消息表情回应**：`chat` 消息补 `msgId`（全网唯一），`react` 消息按 msgId 寻址（add/remove，按频道单播/广播）；气泡悬停出 6 个 emoji 快捷条，回应以 chips 聚合展示（悬停见回应者，再点撤销）。
+- **语音消息**：按住麦克风录音（MediaRecorder，opus 32kbps，60s 上限自动截断），base64 经 control 通道直达。**关键坑**：单条 control 消息受 SCTP `maxMessageSize` 约束（跨浏览器保守 ~256KB），长录音按 48K 字符分片（`voice-note` 增可选 `part/parts`），接收端按 msgId 重组——control 有序可靠，分片天然按序。松开发送、上滑无、<0.4s 丢弃；播放为自绘气泡（同时只播一条）。
+- **实时对讲（push-to-talk）**：侧边栏「按住说话」，麦克风轨 `pc.addTrack` 复用完美协商链路（同屏幕共享），`voice-start{streamId}` 先行通告让对端把到达的媒体流与屏幕共享区分开（兜底：纯音频流即语音）；迟到/重连对端在 channelopen 补挂。**中继路径收不到**（媒体轨过不了应用层中继，未做音频自编码）——开麦时如实列出听不到的节点并指向语音消息兜底。说话中的节点在网络视图头像上有呼吸麦克风徽标。
+- **连线延迟显示**：mesh 每 5s 向各对端发 `ping{seq}`，`pong` 回来算 RTT；`link-state` gossip 邻接表附带实测 RTT 并周期重播（15s），网络视图在**每条连通边的中点**标注毫秒数（HTML 定位而非 SVG text，避开 `preserveAspectRatio="none"` 的文字拉伸；≥150ms 转警示色）。
+- **你画我猜**：公共白板叠加游戏模式，谜底**只在出题人本地**（`guess-start` 只广播提示），`guess-try` 全网可见，出题人归一化比对自动裁决（也可手动判对），`guess-correct` 携带全量比分（胜者 +2 出题 +1）防漂移；猜词回合非出题人画笔锁定只留激光笔，内置 80 词随机抽三 + 自拟词。
+- **五子棋**：私聊内邀请（`gomoku-invite/accept/decline`，撤回复用 decline），邀请方执黑；两端镜像棋盘各自校验（手数 n 连续、轮次、占位），非法落子直接忽略；连五/棋满/认输/对方离线四种终局。SVG 棋盘弹层，最后一手红点、胜形高亮。
+- **协议/架构**：`messages.ts` 的预留 kind 全部启用（react / voice-note / ping / pong / voice-start / voice-stop / guess-* / gomoku-*），mesh 只做传输与重组、对局与游戏状态全在 store（`GameMessage` 子集事件上抛）；新增 `GomokuPanel.vue`，`utils/` 增 notify / zip / fs / gomoku / words。
+- **验证**：`vue-tsc` + `vite build` + `cargo build` 通过；新增 `web/scripts/e2e-features.mjs` 三端 E2E **18 项全过**：回应加/撤同步 → 200KB 语音分片重组字节一致 → RTT 实测/gossip/视图标注 → 五子棋全流程（含非法落子拒绝）→ 你画我猜全流程（错猜不计分、标点容忍、比分同步）→ 文件夹 zip 结构校验 → 唯一源掉线停摆保留 + 可取消。原七套件（smoke ×2 + e2e-media/network/relay/http-relay/mixed-context，60+ 断言）无回归。
 
 ---
 

@@ -50,7 +50,10 @@ function percent(bytes: number, size: number): number {
           <h2>网络中的共享</h2>
         </div>
         <div v-for="s in remoteShares" :key="s.fileId" class="share card" :class="s.state">
-          <div class="fileicon"><AppIcon name="file" :size="20" /></div>
+          <div class="fileicon" :class="{ img: s.thumb }">
+            <img v-if="s.thumb" :src="s.thumb" :alt="s.name" />
+            <AppIcon v-else :name="s.name.endsWith('.zip') ? 'folder' : 'file'" :size="20" />
+          </div>
           <div class="mid">
             <div class="top">
               <span class="name" :title="s.name">{{ s.name }}</span>
@@ -61,7 +64,10 @@ function percent(bytes: number, size: number): number {
             </div>
             <div class="meta">
               <span>来自 {{ store.displayName(s.ownerId) }}</span>
-              <span v-if="s.state === 'downloading'" class="dl">
+              <span v-if="s.state === 'downloading' && s.sources === 0" class="stall">
+                {{ percent(s.bytes, s.size) }}% · 所有源暂时离线，已下载的部分保留，等待源恢复自动续传…
+              </span>
+              <span v-else-if="s.state === 'downloading'" class="dl">
                 {{ percent(s.bytes, s.size) }}% ·
                 {{ s.sources > 1 ? `${s.sources} 源并行下载` : `${Math.max(1, s.sources)} 源下载` }}
               </span>
@@ -214,6 +220,17 @@ function percent(bytes: number, size: number): number {
   display: grid;
   place-items: center;
   flex: none;
+  overflow: hidden;
+}
+
+.fileicon.img {
+  background: transparent;
+}
+
+.fileicon img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
 }
 
 .mid {
@@ -254,6 +271,7 @@ function percent(bytes: number, size: number): number {
 .dl { color: var(--accent); }
 .ok { color: var(--ok); }
 .err { color: var(--danger); }
+.stall { color: var(--warn-fg, #a05a00); }
 
 .actions {
   flex: none;

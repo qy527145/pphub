@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { computed } from 'vue'
 import { useRoomStore, type View } from '@/stores/room'
 import { THEMES } from '@/core/theme'
 import AppIcon from './AppIcon.vue'
@@ -18,13 +19,7 @@ const NAV: NavItem[] = [
   { view: 'receive', icon: 'download', label: '接收文件', badge: () => store.unseenRecv },
   { view: 'chat', icon: 'chat', label: '消息', badge: () => store.unreadTotal },
   { view: 'screen', icon: 'monitor', label: '屏幕共享', badge: () => store.unseenShare },
-  { view: 'board', icon: 'pen', label: '互动白板' },
-]
-
-/** 路线图上后续 Phase 的能力，先占位展示（ARCHITECTURE.md §九）。 */
-const PLANNED = [
-  { icon: 'play', label: '一起看片' },
-  { icon: 'clipboard', label: '云剪贴板' },
+  { view: 'board', icon: 'pen', label: '互动白板', badge: () => store.unseenBoard },
 ]
 
 const SIG_LABEL: Record<string, string> = {
@@ -32,6 +27,33 @@ const SIG_LABEL: Record<string, string> = {
   connecting: '连接中',
   open: '在线',
   closed: '已断线',
+}
+
+// —— 实时对讲（按住说话，全网可听；走中继的对端收不到）——
+const talkEnabled = computed(
+  () => store.capabilities.userMedia && store.status === 'online' && store.peerCount > 0,
+)
+
+/** 谁在说话（显示第一位 + 数量）。 */
+const speakingNames = computed(() =>
+  [...store.speaking].map((p) => store.displayName(p)),
+)
+
+let pttPointerId: number | null = null
+
+function pttDown(ev: PointerEvent) {
+  if (!talkEnabled.value) return
+  pttPointerId = ev.pointerId
+  ;(ev.currentTarget as HTMLElement | null)?.setPointerCapture?.(ev.pointerId)
+  void store.startTalk().then((ok) => {
+    // 授权弹窗期间已松手：立刻收麦。
+    if (ok && pttPointerId === null) store.stopTalk()
+  })
+}
+
+function pttUp() {
+  pttPointerId = null
+  store.stopTalk()
 }
 </script>
 
@@ -68,17 +90,29 @@ const SIG_LABEL: Record<string, string> = {
         <span class="label">{{ item.label }}</span>
         <span v-if="item.badge && item.badge() > 0" class="badge">{{ item.badge() }}</span>
       </button>
-
-      <div class="divider"></div>
-
-      <div v-for="item in PLANNED" :key="item.label" class="nav-item planned" title="规划中，敬请期待">
-        <AppIcon :name="item.icon" :size="19" />
-        <span class="label">{{ item.label }}</span>
-        <span class="soon">规划中</span>
-      </div>
     </nav>
 
     <div class="foot">
+      <!-- 实时对讲：按住说话（麦克风轨直达所有直连节点） -->
+      <button
+        v-if="talkEnabled"
+        class="ptt"
+        :class="{ on: store.talking }"
+        :title="store.talking ? '松开结束讲话' : '按住说话（全网直连节点可听；走中继的节点听不到）'"
+        @pointerdown.prevent="pttDown"
+        @pointerup="pttUp"
+        @pointercancel="pttUp"
+      >
+        <AppIcon name="mic" :size="16" />
+        <span class="ptt-label">{{ store.talking ? '正在讲话…' : '按住说话' }}</span>
+      </button>
+      <div v-if="speakingNames.length > 0" class="speaking" :title="speakingNames.join('、')">
+        <span class="sdot"></span>
+        <span class="ptt-label">
+          {{ speakingNames[0] }}{{ speakingNames.length > 1 ? ` 等 ${speakingNames.length} 人` : '' }} 在说话
+        </span>
+      </div>
+
       <div class="theme" role="group" aria-label="主题">
         <button
           v-for="t in THEMES"
@@ -196,7 +230,7 @@ const SIG_LABEL: Record<string, string> = {
   transition: height var(--dur);
 }
 
-.nav-item:hover:not(.planned) {
+.nav-item:hover {
   background: var(--panel-2);
   color: var(--text);
 }
@@ -227,32 +261,65 @@ const SIG_LABEL: Record<string, string> = {
   padding: 3px 7px;
 }
 
-.divider {
-  height: 1px;
-  background: var(--border);
-  margin: 10px 8px;
-}
-
-.nav-item.planned {
-  color: var(--faint);
-  cursor: default;
-}
-
-.soon {
-  font-size: 10px;
-  color: var(--faint);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  padding: 1px 5px;
-  white-space: nowrap;
-}
-
 /* —— 底部：主题 + 状态 —— */
 .foot {
   border-top: 1px solid var(--border);
   padding: 12px 6px 0;
   font-size: 12px;
   color: var(--muted);
+}
+
+/* —— 实时对讲 —— */
+.ptt {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  padding: 9px 10px;
+  margin-bottom: 10px;
+  border-radius: var(--radius-sm);
+  border: 1px dashed var(--border-strong);
+  background: transparent;
+  color: var(--text-2);
+  font-size: 12.5px;
+  touch-action: none;
+  user-select: none;
+}
+
+.ptt:hover {
+  border-color: var(--accent);
+  color: var(--accent-strong);
+}
+
+.ptt.on {
+  background: var(--accent);
+  border: 1px solid var(--accent);
+  color: var(--on-accent);
+  animation: pttpulse 1.2s ease-in-out infinite;
+}
+
+@keyframes pttpulse {
+  0%, 100% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 45%, transparent); }
+  50% { box-shadow: 0 0 0 6px transparent; }
+}
+
+.speaking {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 4px 10px;
+  font-size: 11.5px;
+  color: var(--accent-strong);
+}
+
+.sdot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent);
+  flex: none;
+  animation: pttpulse 1.4s ease-out infinite;
 }
 
 .theme {
@@ -343,9 +410,9 @@ const SIG_LABEL: Record<string, string> = {
 
   .brand-text,
   .nav-item .label,
-  .soon,
   .status,
   .device,
+  .ptt-label,
   .theme-label {
     display: none;
   }

@@ -3,7 +3,7 @@ import { defineStore } from 'pinia'
 
 import { peerColor } from '@/core/draw'
 import { JoinRejected, Mesh } from '@/core/mesh'
-import type { DrawMessage } from '@/core/mesh'
+import type { DrawMessage, GameMessage } from '@/core/mesh'
 import type { PeerTransport } from '@/core/peer'
 import type {
   Avatar,
@@ -29,6 +29,12 @@ import {
   type Theme,
   watchSystemTheme,
 } from '@/core/theme'
+import { blobToDataURL, dataURLToBlob, makeImageThumb } from '@/utils/blob'
+import type { DroppedPayload } from '@/utils/fs'
+import { GOMOKU_SIZE, gomokuWinLine } from '@/utils/gomoku'
+import { notifyBackground, requestNotifyPermission } from '@/utils/notify'
+import { normalizeGuess } from '@/utils/words'
+import { zipFolder } from '@/utils/zip'
 
 /** idle=未上线 · connecting=正在进房 · online=已在房间（监听中或已连接对端） */
 export type Status = 'idle' | 'connecting' | 'online'
@@ -73,14 +79,49 @@ export type ChatChannel = 'all' | string
 
 export interface ChatEntry {
   id: number
+  /** 全网唯一消息 id（表情回应按它寻址）。文件卡片消息无 msgId。 */
+  msgId?: string
   from: string
   fromNick: string
   text: string
   ts: number
   self: boolean
   channel: ChatChannel
-  /** 文件卡片（消息中发文件时附带）。 */
-  file?: { fileId: string; name: string; size: number }
+  /** 文件卡片（消息中发文件时附带）。thumb 为图片的内联预览。 */
+  file?: { fileId: string; name: string; size: number; mime?: string; thumb?: string }
+  /** 语音消息（objectURL + 时长 ms）。 */
+  voice?: { url: string; dur: number }
+  /** 表情回应：emoji → 回应者 peerId 列表。 */
+  reactions?: Record<string, string[]>
+}
+
+/** 一局五子棋（一对一，与某对端各持一份镜像状态）。 */
+export interface GomokuGame {
+  gameId: string
+  opponent: string
+  /** 1=黑（先手，邀请方）· 2=白。 */
+  myColor: 1 | 2
+  turn: 1 | 2
+  /** 15×15 展平，0=空。 */
+  cells: number[]
+  moves: number
+  state: 'invite-in' | 'invite-out' | 'active' | 'over'
+  result?: 'win' | 'loss' | 'draw'
+  /** 终局说明（认输/离线/连五）。 */
+  reason?: string
+  /** 最后一手下标（高亮）。 */
+  last?: number
+  winLine?: number[]
+}
+
+/** 你画我猜的一次猜测。 */
+export interface GuessTry {
+  round: number
+  from: string
+  nick: string
+  text: string
+  ts: number
+  correct?: boolean
 }
 
 export interface Transfer {
@@ -119,6 +160,8 @@ export interface ShareItem {
   served: number
   url?: string
   error?: string
+  /** 图片共享的内联缩略图（列表/聊天预览）。 */
+  thumb?: string
 }
 
 const LS_ALLOW_INCOMING = 'pphub.allowIncoming'
@@ -238,8 +281,41 @@ export const useRoomStore = defineStore('room', () => {
   const transfers = ref<Transfer[]>([])
   /** 共享目录（懒发送登记 + 远端可下载）。 */
   const shares = reactive(new Map<string, ShareItem>())
-  /** 网络拓扑：peerId → 它上报的邻接表（neighbor → 连接状态）。 */
-  const peerLinks = reactive(new Map<string, Map<string, string>>())
+  /** 网络拓扑：peerId → 它上报的邻接表（neighbor → 连接状态 + 实测 RTT）。 */
+  const peerLinks = reactive(new Map<string, Map<string, { state: string; rtt?: number }>>())
+  /** 本端到各对端的实测往返延迟（ms，5s 一轮 ping）。 */
+  const rtts = reactive(new Map<string, number>())
+
+  // —— 实时对讲 ——
+  /** 本端正在说话（按住对讲）。 */
+  const talking = ref(false)
+  /** 正在说话的对端。 */
+  const speaking = reactive(new Set<string>())
+  /** 对端语音流的播放元素（非响应式，随 voice-stop / 离线回收）。 */
+  const voiceEls = new Map<string, HTMLAudioElement>()
+
+  // —— 你画我猜（公共白板游戏模式）——
+  const guess = reactive({
+    active: false,
+    round: 0,
+    drawer: '',
+    hint: '',
+    /** 谜底，只在出题人本地存在。 */
+    word: '',
+    tries: [] as GuessTry[],
+    scores: {} as Record<string, number>,
+    /** 上一轮结果（公布答案 / 有人猜中）。 */
+    lastWord: '',
+    lastWinner: '',
+  })
+
+  // —— 五子棋（一对一）——
+  const gomoku = reactive(new Map<string, GomokuGame>())
+  /** 打开棋盘面板的对局（对端 peerId）。 */
+  const gomokuOpen = ref<string | null>(null)
+
+  /** 文件夹打包中的数量（UI 转圈提示）。 */
+  const packing = ref(0)
 
   // —— 聊天频道 ——
   const activeChannel = ref<ChatChannel>('all')
@@ -286,6 +362,8 @@ export const useRoomStore = defineStore('room', () => {
   const activeView = ref<View>('network')
   const unseenRecv = ref(0)
   const unseenShare = ref(0)
+  /** 白板页外收到「你画我猜」开局的角标。 */
+  const unseenBoard = ref(0)
   /** 发送页预选目标（网络视图点节点「发文件」带过来）。 */
   const sendTarget = ref<'all' | string>('all')
 
@@ -426,6 +504,19 @@ export const useRoomStore = defineStore('room', () => {
     m.on('peer-removed', (peerId) => {
       members.delete(peerId)
       peerLinks.delete(peerId)
+      rtts.delete(peerId)
+      speaking.delete(peerId)
+      dropVoiceEl(peerId)
+      // 进行中的对局：对方离线即终局。
+      const game = gomoku.get(peerId)
+      if (game && game.state === 'active') {
+        game.state = 'over'
+        game.result = 'win'
+        game.reason = '对方已离线'
+      } else if (game && game.state !== 'over') {
+        gomoku.delete(peerId)
+        if (gomokuOpen.value === peerId) gomokuOpen.value = null
+      }
       if (members.size === 0 || remoteScreens.has(peerId)) cleanupRemoteShare(peerId)
       for (const key of pointers.keys()) {
         if (key.endsWith(`|${peerId}`)) pointers.delete(key)
@@ -451,13 +542,65 @@ export const useRoomStore = defineStore('room', () => {
       member.nick = profile.nick
     })
     m.on('peer-links', ({ peerId, links }) => {
-      peerLinks.set(peerId, new Map(links.map((l) => [l.peerId, l.state])))
+      peerLinks.set(
+        peerId,
+        new Map(links.map((l) => [l.peerId, { state: l.state, rtt: l.rtt }])),
+      )
     })
-    m.on('chat', ({ from, text, ts, scope }) => {
+    m.on('peer-rtt', ({ peerId, rtt }) => {
+      rtts.set(peerId, rtt)
+    })
+    m.on('chat', ({ from, msgId, text, ts, scope }) => {
       const channel: ChatChannel = scope === 'dm' ? from : 'all'
-      pushMessage({ from, fromNick: displayName(from), text, ts, self: false, channel })
+      pushMessage({ from, fromNick: displayName(from), msgId, text, ts, self: false, channel })
       bumpUnread(channel)
     })
+    m.on('react', ({ from, msgId, emoji, op }) => {
+      applyReact(msgId, from, emoji, op)
+    })
+    m.on('voice-note', ({ from, msgId, scope, data, mime, dur, ts }) => {
+      let url: string
+      try {
+        url = URL.createObjectURL(dataURLToBlob(data, mime))
+      } catch {
+        return
+      }
+      const channel: ChatChannel = scope === 'dm' ? from : 'all'
+      pushMessage({
+        from,
+        fromNick: displayName(from),
+        msgId,
+        text: '',
+        ts,
+        self: false,
+        channel,
+        voice: { url, dur },
+      })
+      bumpUnread(channel)
+    })
+
+    // —— 实时对讲 ——
+    m.on('voice-start', (peerId) => speaking.add(peerId))
+    m.on('voice-stop', (peerId) => {
+      speaking.delete(peerId)
+      dropVoiceEl(peerId)
+    })
+    m.on('voice-stream', ({ peerId, stream }) => {
+      let el = voiceEls.get(peerId)
+      if (!el) {
+        el = new Audio()
+        el.autoplay = true
+        voiceEls.set(peerId, el)
+      }
+      el.srcObject = stream
+      void el.play().catch(() => {
+        // 自动播放被拦（用户还没与页面交互过）：给出可操作的提示。
+        lastError.value = '浏览器拦截了语音自动播放，点击页面任意处后恢复'
+      })
+    })
+
+    // —— 游戏（你画我猜 / 五子棋）——
+    m.on('game', ({ from, msg }) => handleGame(from, msg))
 
     m.on('peer-channel-open', (peerId) => {
       // 新对端通道就绪：补发公共白板与和它的私有白板全量状态（对方按 id 去重合并）。
@@ -537,7 +680,13 @@ export const useRoomStore = defineStore('room', () => {
         ts: file.ts,
         self: false,
         channel,
-        file: { fileId: file.fileId, name: file.name, size: file.size },
+        file: {
+          fileId: file.fileId,
+          name: file.name,
+          size: file.size,
+          mime: file.mime,
+          thumb: file.thumb,
+        },
       })
       bumpUnread(channel)
     })
@@ -589,6 +738,7 @@ export const useRoomStore = defineStore('room', () => {
         bytes: local ? meta.size : 0,
         sources: 0,
         served: 0,
+        thumb: meta.thumb,
       }
       shares.set(meta.fileId, item)
     }
@@ -597,6 +747,58 @@ export const useRoomStore = defineStore('room', () => {
 
   function pushMessage(entry: Omit<ChatEntry, 'id'>): void {
     messages.value.push({ id: msgSeq++, ...entry })
+    // 页面在后台时来消息：系统通知 + 标题闪烁（notify 内部判断可见性）。
+    if (!entry.self) {
+      const body = entry.text || (entry.voice ? '[语音消息]' : entry.file ? `[文件] ${entry.file.name}` : '')
+      notifyBackground(entry.fromNick, body)
+    }
+  }
+
+  /** 全网唯一消息 id（表情回应寻址用）。 */
+  function genMsgId(): string {
+    return `${myId.value || 'me'}-${Date.now().toString(36)}-${(msgSeq++).toString(36)}`
+  }
+
+  /** 按 msgId 更新一条消息的表情回应（本地与远端共用）。 */
+  function applyReact(msgId: string, from: string, emoji: string, op: 'add' | 'remove'): void {
+    for (let i = messages.value.length - 1; i >= 0; i--) {
+      const m = messages.value[i]
+      if (m.msgId !== msgId) continue
+      const reactions = m.reactions ?? (m.reactions = {})
+      const who = reactions[emoji] ?? []
+      if (op === 'add') {
+        if (!who.includes(from)) reactions[emoji] = [...who, from]
+      } else {
+        const next = who.filter((p) => p !== from)
+        if (next.length > 0) reactions[emoji] = next
+        else delete reactions[emoji]
+      }
+      return
+    }
+  }
+
+  /** 给某条消息加/撤自己的表情回应（再点同一个 emoji 即撤销）。 */
+  function toggleReact(entry: ChatEntry, emoji: string): void {
+    if (!mesh || !entry.msgId) return
+    const mine = entry.reactions?.[emoji]?.includes(myId.value) ?? false
+    const op = mine ? 'remove' : 'add'
+    const scope = entry.channel === 'all' ? 'all' : 'dm'
+    const msg = { kind: 'react' as const, msgId: entry.msgId, emoji, op: op as 'add' | 'remove', scope: scope as 'all' | 'dm' }
+    if (entry.channel === 'all') {
+      mesh.broadcast(msg)
+    } else if (!mesh.sendTo(entry.channel, msg)) {
+      return
+    }
+    applyReact(entry.msgId, myId.value, emoji, op)
+  }
+
+  function dropVoiceEl(peerId: string): void {
+    const el = voiceEls.get(peerId)
+    if (el) {
+      el.pause()
+      el.srcObject = null
+      voiceEls.delete(peerId)
+    }
   }
 
   /** 应用一条远端绘制/指针消息。 */
@@ -1087,12 +1289,297 @@ export const useRoomStore = defineStore('room', () => {
     sendDraw(board, { kind: 'ptr-hide', board })
   }
 
+  // —— 你画我猜（公共白板，出题人本地持词并裁决）——
+
+  const amDrawer = computed(() => guess.active && guess.drawer === myId.value)
+
+  /** 出题开新一轮：清空公共白板，广播提示；谜底只留在本地。 */
+  function startGuessRound(word: string, hint?: string): void {
+    const w = word.trim()
+    if (!mesh || !w) return
+    guess.round++
+    guess.active = true
+    guess.drawer = myId.value
+    guess.word = w
+    guess.hint = hint?.trim() || `${w.length} 个字`
+    guess.tries = []
+    guess.lastWord = ''
+    guess.lastWinner = ''
+    clearBoard('wb')
+    mesh.broadcast({ kind: 'guess-start', round: guess.round, drawer: myId.value, hint: guess.hint })
+    if (activeView.value !== 'board') setView('board')
+    activeBoard.value = 'wb'
+  }
+
+  /** 猜词（广播给所有人；出题人收到后自动比对）。 */
+  function submitGuess(text: string): void {
+    const t = text.trim()
+    if (!mesh || !t || !guess.active || amDrawer.value) return
+    mesh.broadcast({ kind: 'guess-try', round: guess.round, text: t, ts: Date.now() })
+    guess.tries.push({
+      round: guess.round,
+      from: myId.value,
+      nick: myProfile.value.nick || '我',
+      text: t,
+      ts: Date.now(),
+    })
+  }
+
+  /** 出题人裁决某次猜测为正确（自动比对不中时可手动判对）。 */
+  function judgeCorrect(t: GuessTry): void {
+    if (!mesh || !amDrawer.value || t.round !== guess.round) return
+    const scores = { ...guess.scores }
+    scores[t.from] = (scores[t.from] ?? 0) + 2
+    scores[guess.drawer] = (scores[guess.drawer] ?? 0) + 1
+    mesh.broadcast({
+      kind: 'guess-correct',
+      round: guess.round,
+      winner: t.from,
+      word: guess.word,
+      scores,
+    })
+    settleGuessRound(t.from, guess.word, scores)
+  }
+
+  /** 出题人公布答案（无人猜中，跳过本轮）。 */
+  function revealAnswer(): void {
+    if (!mesh || !amDrawer.value) return
+    mesh.broadcast({ kind: 'guess-reveal', round: guess.round, word: guess.word })
+    settleGuessRound('', guess.word, guess.scores)
+  }
+
+  /** 结束整场游戏（清空计分板）。 */
+  function endGuess(): void {
+    mesh?.broadcast({ kind: 'guess-end' })
+    resetGuess()
+  }
+
+  /** 一轮落定：记录答案与胜者，等待下一位出题。 */
+  function settleGuessRound(winner: string, word: string, scores: Record<string, number>): void {
+    guess.active = false
+    guess.word = ''
+    guess.lastWord = word
+    guess.lastWinner = winner
+    guess.scores = scores
+    if (winner) {
+      const t = [...guess.tries].reverse().find((x) => x.from === winner && x.round === guess.round)
+      if (t) t.correct = true
+    }
+  }
+
+  function resetGuess(): void {
+    guess.active = false
+    guess.round = 0
+    guess.drawer = ''
+    guess.hint = ''
+    guess.word = ''
+    guess.tries = []
+    guess.scores = {}
+    guess.lastWord = ''
+    guess.lastWinner = ''
+  }
+
+  // —— 五子棋（一对一，两端镜像状态、各自校验）——
+
+  function newGomokuGame(opponent: string, gameId: string, myColor: 1 | 2): GomokuGame {
+    return {
+      gameId,
+      opponent,
+      myColor,
+      turn: 1,
+      cells: new Array<number>(GOMOKU_SIZE * GOMOKU_SIZE).fill(0),
+      moves: 0,
+      state: myColor === 1 ? 'invite-out' : 'invite-in',
+    }
+  }
+
+  /** 邀请对局：邀请方执黑先手。 */
+  function inviteGomoku(peerId: string): void {
+    if (!mesh) return
+    const existing = gomoku.get(peerId)
+    if (existing && existing.state !== 'over') return
+    const gameId = genMsgId()
+    if (!mesh.sendTo(peerId, { kind: 'gomoku-invite', gameId })) {
+      lastError.value = '对方暂不可达，无法邀请对局'
+      return
+    }
+    gomoku.set(peerId, newGomokuGame(peerId, gameId, 1))
+    gomokuOpen.value = peerId
+  }
+
+  function respondGomoku(peerId: string, accept: boolean): void {
+    const game = gomoku.get(peerId)
+    if (!mesh || !game || game.state !== 'invite-in') return
+    if (accept) {
+      mesh.sendTo(peerId, { kind: 'gomoku-accept', gameId: game.gameId })
+      game.state = 'active'
+      gomokuOpen.value = peerId
+    } else {
+      mesh.sendTo(peerId, { kind: 'gomoku-decline', gameId: game.gameId })
+      gomoku.delete(peerId)
+    }
+  }
+
+  /** 落子（idx 为 15×15 展平下标）。 */
+  function moveGomoku(peerId: string, idx: number): void {
+    const game = gomoku.get(peerId)
+    if (!mesh || !game || game.state !== 'active') return
+    if (game.turn !== game.myColor || game.cells[idx] !== 0) return
+    applyGomokuMove(game, idx, game.myColor)
+    mesh.sendTo(peerId, {
+      kind: 'gomoku-move',
+      gameId: game.gameId,
+      n: game.moves,
+      x: idx % GOMOKU_SIZE,
+      y: Math.floor(idx / GOMOKU_SIZE),
+    })
+  }
+
+  function resignGomoku(peerId: string): void {
+    const game = gomoku.get(peerId)
+    if (!mesh || !game || game.state !== 'active') return
+    mesh.sendTo(peerId, { kind: 'gomoku-resign', gameId: game.gameId })
+    game.state = 'over'
+    game.result = 'loss'
+    game.reason = '你认输了'
+  }
+
+  /** 收起面板：撤回未被接受的邀请，或清掉终局记录。 */
+  function closeGomoku(peerId: string): void {
+    const game = gomoku.get(peerId)
+    if (game && game.state === 'invite-out') {
+      // 复用 decline 语义通知对方「邀请已撤回」。
+      mesh?.sendTo(peerId, { kind: 'gomoku-decline', gameId: game.gameId })
+      gomoku.delete(peerId)
+    } else if (game && game.state === 'over') {
+      gomoku.delete(peerId)
+    }
+    if (gomokuOpen.value === peerId) gomokuOpen.value = null
+  }
+
+  function applyGomokuMove(game: GomokuGame, idx: number, color: 1 | 2): void {
+    game.cells[idx] = color
+    game.moves++
+    game.last = idx
+    game.turn = color === 1 ? 2 : 1
+    const line = gomokuWinLine(game.cells, idx)
+    if (line) {
+      game.state = 'over'
+      game.winLine = line
+      game.result = color === game.myColor ? 'win' : 'loss'
+      game.reason = '五连珠'
+    } else if (game.moves >= GOMOKU_SIZE * GOMOKU_SIZE) {
+      game.state = 'over'
+      game.result = 'draw'
+      game.reason = '棋盘已满'
+    }
+  }
+
+  /** 游戏消息统一入口（mesh 'game' 事件）。 */
+  function handleGame(from: string, msg: GameMessage): void {
+    switch (msg.kind) {
+      case 'guess-start':
+        guess.active = true
+        guess.round = msg.round
+        guess.drawer = msg.drawer
+        guess.hint = msg.hint
+        guess.word = ''
+        guess.tries = []
+        guess.lastWord = ''
+        guess.lastWinner = ''
+        if (activeView.value !== 'board') unseenBoard.value++
+        notifyBackground('你画我猜', `${displayName(from)} 出题了，快来猜！`)
+        break
+      case 'guess-try': {
+        if (!guess.active || msg.round !== guess.round) break
+        const t: GuessTry = {
+          round: msg.round,
+          from,
+          nick: displayName(from),
+          text: msg.text,
+          ts: msg.ts,
+        }
+        guess.tries.push(t)
+        // 出题人自动裁决：归一化后精确命中即宣布猜中。
+        if (amDrawer.value && normalizeGuess(msg.text) === normalizeGuess(guess.word)) {
+          judgeCorrect(t)
+        }
+        break
+      }
+      case 'guess-correct':
+        if (msg.round !== guess.round) break
+        settleGuessRound(msg.winner, msg.word, msg.scores)
+        break
+      case 'guess-reveal':
+        if (msg.round !== guess.round) break
+        settleGuessRound('', msg.word, guess.scores)
+        break
+      case 'guess-end':
+        resetGuess()
+        break
+      case 'gomoku-invite': {
+        gomoku.set(from, { ...newGomokuGame(from, msg.gameId, 2), state: 'invite-in' })
+        bumpUnread(from)
+        notifyBackground('五子棋', `${displayName(from)} 邀请你对局`)
+        break
+      }
+      case 'gomoku-accept': {
+        const game = gomoku.get(from)
+        if (game && game.gameId === msg.gameId && game.state === 'invite-out') {
+          game.state = 'active'
+          if (activeChannel.value !== from || activeView.value !== 'chat') bumpUnread(from)
+        }
+        break
+      }
+      case 'gomoku-decline': {
+        const game = gomoku.get(from)
+        if (game && game.gameId === msg.gameId && game.state !== 'active' && game.state !== 'over') {
+          const wasInvited = game.state === 'invite-in'
+          gomoku.delete(from)
+          if (gomokuOpen.value === from) gomokuOpen.value = null
+          lastError.value = wasInvited
+            ? `${displayName(from)} 撤回了五子棋邀请`
+            : `${displayName(from)} 婉拒了五子棋对局`
+        }
+        break
+      }
+      case 'gomoku-move': {
+        const game = gomoku.get(from)
+        if (!game || game.gameId !== msg.gameId || game.state !== 'active') break
+        const idx = msg.y * GOMOKU_SIZE + msg.x
+        const oppColor: 1 | 2 = game.myColor === 1 ? 2 : 1
+        // control 有序可靠，n 不匹配说明状态漂移，忽略防御。
+        if (msg.n !== game.moves + 1 || game.turn !== oppColor) break
+        if (idx < 0 || idx >= game.cells.length || game.cells[idx] !== 0) break
+        applyGomokuMove(game, idx, oppColor)
+        if (activeChannel.value !== from || activeView.value !== 'chat') bumpUnread(from)
+        break
+      }
+      case 'gomoku-resign': {
+        const game = gomoku.get(from)
+        if (game && game.gameId === msg.gameId && game.state === 'active') {
+          game.state = 'over'
+          game.result = 'win'
+          game.reason = '对方认输'
+        }
+        break
+      }
+    }
+  }
+
   /** 断开当前会话（不触发自动重新监听）。 */
   function teardown(): void {
+    stopTalk()
     if (mesh) {
       mesh.leave()
       mesh = null
     }
+    for (const [pid] of voiceEls) dropVoiceEl(pid)
+    speaking.clear()
+    resetGuess()
+    gomoku.clear()
+    gomokuOpen.value = null
+    rtts.clear()
     for (const t of transfers.value) {
       if (t.state === 'active' || t.state === 'pending') {
         t.state = 'error'
@@ -1143,6 +1630,8 @@ export const useRoomStore = defineStore('room', () => {
   async function joinRoom(roomName: string, listen = false): Promise<JoinOutcome> {
     lastError.value = null
     if (mesh) teardown()
+    // 通常由用户点击触发，正是申请通知权限的合法时机（后台消息提醒用）。
+    requestNotifyPermission()
     status.value = 'connecting'
     room.value = roomName
     try {
@@ -1291,20 +1780,93 @@ export const useRoomStore = defineStore('room', () => {
     const trimmed = text.trim()
     const ch = channel ?? activeChannel.value
     if (!trimmed || !mesh) return
+    const msgId = genMsgId()
     if (ch === 'all') {
-      mesh.sendChat(trimmed)
-    } else if (!mesh.sendDm(ch, trimmed)) {
+      mesh.sendChat(trimmed, msgId)
+    } else if (!mesh.sendDm(ch, trimmed, msgId)) {
       lastError.value = '对方暂不可达，消息未送出'
       return
     }
     pushMessage({
       from: myId.value,
       fromNick: myProfile.value.nick || '我',
+      msgId,
       text: trimmed,
       ts: Date.now(),
       self: true,
       channel: ch,
     })
+  }
+
+  /** 发送一条语音消息到当前频道（录音 blob → base64 经 control 直达）。 */
+  async function sendVoiceNote(blob: Blob, durMs: number, channel?: ChatChannel): Promise<void> {
+    const ch = channel ?? activeChannel.value
+    if (!mesh || blob.size === 0) return
+    if (blob.size > 1024 * 1024) {
+      lastError.value = '录音过长，请控制在 60 秒内'
+      return
+    }
+    const msgId = genMsgId()
+    const data = await blobToDataURL(blob)
+    const ok = mesh.sendVoiceNote({
+      msgId,
+      data,
+      mime: blob.type || 'audio/webm',
+      dur: durMs,
+      ts: Date.now(),
+      scope: ch === 'all' ? 'all' : 'dm',
+      to: ch === 'all' ? undefined : ch,
+    })
+    if (!ok) {
+      lastError.value = '对方暂不可达，语音未送出'
+      return
+    }
+    pushMessage({
+      from: myId.value,
+      fromNick: myProfile.value.nick || '我',
+      msgId,
+      text: '',
+      ts: Date.now(),
+      self: true,
+      channel: ch,
+      voice: { url: URL.createObjectURL(blob), dur: durMs },
+    })
+  }
+
+  // —— 实时对讲（按住说话，麦克风轨复用 PeerConnection）——
+
+  async function startTalk(): Promise<boolean> {
+    if (!mesh || status.value !== 'online' || talking.value) return false
+    if (!capabilities.userMedia) {
+      lastError.value = '当前环境无法使用麦克风（需 https 或 localhost）'
+      return false
+    }
+    let stream: MediaStream
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      })
+    } catch {
+      lastError.value = '无法访问麦克风（未授权或被占用）'
+      return false
+    }
+    // 等待授权期间用户可能已松手/离线。
+    if (!mesh || status.value !== 'online') {
+      for (const t of stream.getTracks()) t.stop()
+      return false
+    }
+    const { blocked } = mesh.startVoice(stream)
+    talking.value = true
+    if (blocked.length > 0) {
+      lastError.value = `${blocked.map((p) => displayName(p)).join('、')} 走服务器中继，实时对讲听不到（可改发语音消息）`
+    }
+    return true
+  }
+
+  function stopTalk(): void {
+    if (!talking.value) return
+    mesh?.stopVoice()
+    talking.value = false
   }
 
   /** 打开某个聊天频道（网络视图点「私聊」进来）。 */
@@ -1388,8 +1950,8 @@ export const useRoomStore = defineStore('room', () => {
 
   // —— 文件：懒发送 + 多源下载（拉） ——
 
-  /** 懒发送：只登记共享，不上传；对方点下载时才供块。 */
-  function shareFiles(files: File[], target: 'all' | string = 'all'): void {
+  /** 懒发送：只登记共享，不上传；对方点下载时才供块。图片附内联缩略图。 */
+  async function shareFiles(files: File[], target: 'all' | string = 'all'): Promise<void> {
     const m = mesh
     if (!m || files.length === 0) return
     if (status.value !== 'online') {
@@ -1397,10 +1959,12 @@ export const useRoomStore = defineStore('room', () => {
       return
     }
     for (const file of files) {
+      const thumb = await makeImageThumb(file)
       const meta = m.shareFile(
         file,
         target === 'all' ? 'all' : 'direct',
         target === 'all' ? undefined : target,
+        thumb,
       )
       const item = registerShare(meta, true)
       item.state = 'idle'
@@ -1413,7 +1977,7 @@ export const useRoomStore = defineStore('room', () => {
         ts: meta.ts,
         self: true,
         channel,
-        file: { fileId: meta.fileId, name: meta.name, size: meta.size },
+        file: { fileId: meta.fileId, name: meta.name, size: meta.size, mime: meta.mime, thumb },
       })
     }
   }
@@ -1421,7 +1985,30 @@ export const useRoomStore = defineStore('room', () => {
   /** 统一入口：按模式分派（UI 上的「发送方式」选择）。 */
   function dispatchFiles(files: File[], mode: TransferMode, target: 'all' | string): void {
     if (mode === 'force') sendFiles(files, target)
-    else shareFiles(files, target)
+    else void shareFiles(files, target)
+  }
+
+  /**
+   * 分派一次拖拽/选择的完整载荷：零散文件按模式直发，文件夹先打包成
+   * store 模式 zip（保留目录结构，接收端解压即得）再发。
+   */
+  async function dispatchPayload(
+    payload: DroppedPayload,
+    mode: TransferMode,
+    target: 'all' | string,
+  ): Promise<void> {
+    if (payload.files.length > 0) dispatchFiles(payload.files, mode, target)
+    for (const folder of payload.folders) {
+      packing.value++
+      try {
+        const zipped = await zipFolder(folder.name, folder.entries)
+        dispatchFiles([zipped], mode, target)
+      } catch (err) {
+        lastError.value = err instanceof Error ? err.message : String(err)
+      } finally {
+        packing.value--
+      }
+    }
   }
 
   /** 撤销本端共享。 */
@@ -1512,6 +2099,7 @@ export const useRoomStore = defineStore('room', () => {
     if (v === 'chat') unread.delete(activeChannel.value)
     if (v === 'receive') unseenRecv.value = 0
     if (v === 'screen') unseenShare.value = 0
+    if (v === 'board') unseenBoard.value = 0
   }
 
   function markVerified(peerId: string): void {
@@ -1554,6 +2142,14 @@ export const useRoomStore = defineStore('room', () => {
     shares,
     shareList,
     peerLinks,
+    rtts,
+    talking,
+    speaking,
+    guess,
+    amDrawer,
+    gomoku,
+    gomokuOpen,
+    packing,
     theme,
     activeView,
     activeChannel,
@@ -1561,6 +2157,7 @@ export const useRoomStore = defineStore('room', () => {
     unreadTotal,
     unseenRecv,
     unseenShare,
+    unseenBoard,
     sendTarget,
     memberList,
     peerCount,
@@ -1590,10 +2187,25 @@ export const useRoomStore = defineStore('room', () => {
     setAvatarImage,
     regenerateCode,
     sendChat,
+    sendVoiceNote,
+    toggleReact,
+    startTalk,
+    stopTalk,
     openChat,
     sendFiles,
     shareFiles,
     dispatchFiles,
+    dispatchPayload,
+    startGuessRound,
+    submitGuess,
+    judgeCorrect,
+    revealAnswer,
+    endGuess,
+    inviteGomoku,
+    respondGomoku,
+    moveGomoku,
+    resignGomoku,
+    closeGomoku,
     revokeShare,
     downloadShare,
     cancelDownload,

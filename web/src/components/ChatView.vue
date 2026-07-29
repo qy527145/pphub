@@ -1,12 +1,15 @@
 <script setup lang="ts">
 // 聊天：左侧频道列表（群聊 + 每个节点的私聊），右侧消息流。
 // 私聊经 control 通道只发给对方；群聊广播给全网。
-import { computed, nextTick, ref, watch } from 'vue'
-import { useRoomStore } from '@/stores/room'
+// 文件/截图三种进入方式：选择、粘贴（Ctrl/Cmd+V）、拖拽（含文件夹，自动打包 zip）。
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
+import { useRoomStore, type ChatEntry } from '@/stores/room'
 import { fmtBytes, fmtTime } from '@/utils/format'
 import { copyText } from '@/utils/clipboard'
+import { collectDropped } from '@/utils/fs'
 import AppIcon from './AppIcon.vue'
 import PeerAvatar from './PeerAvatar.vue'
+import GomokuPanel from './GomokuPanel.vue'
 
 const store = useRoomStore()
 
@@ -14,6 +17,9 @@ const draft = ref('')
 const logEl = ref<HTMLElement | null>(null)
 const copiedId = ref<number | null>(null)
 const fileInput = ref<HTMLInputElement | null>(null)
+
+/** 表情回应的候选（点开即发，再点撤销）。 */
+const REACT_EMOJIS = ['👍', '❤️', '😂', '😮', '😢', '👏']
 
 const channelMessages = computed(() =>
   store.messages.filter((m) => m.channel === store.activeChannel),
@@ -23,6 +29,8 @@ const channelName = computed(() =>
   store.activeChannel === 'all' ? '群聊（全网）' : store.displayName(store.activeChannel),
 )
 
+const isDm = computed(() => store.activeChannel !== 'all')
+
 /** 私聊对象是否在线可达。 */
 const channelReachable = computed(
   () =>
@@ -30,6 +38,9 @@ const channelReachable = computed(
       ? store.connectedPeers.length > 0
       : store.members.get(store.activeChannel)?.state === 'connected',
 )
+
+/** 当前私聊频道的五子棋对局（若有）。 */
+const dmGame = computed(() => (isDm.value ? store.gomoku.get(store.activeChannel) : undefined))
 
 watch(
   () => [channelMessages.value.length, store.activeChannel] as const,
@@ -45,28 +56,225 @@ function send() {
   draft.value = ''
 }
 
-/** 一键剪贴板互传（降级版）：点击读取本机剪贴板并直接发出。 */
-async function sendClipboard() {
-  try {
-    const text = await navigator.clipboard.readText()
-    if (text.trim()) store.sendChat(text)
-  } catch {
-    store.lastError = '无法读取剪贴板（需 https 且授予权限）'
-  }
-}
-
 function pickFile() {
   fileInput.value?.click()
+}
+
+/** 懒发送：挂共享，对方在接收页下载；scope 跟随当前频道（私聊=单播，群聊=广播）。 */
+function shareToChannel(files: File[]) {
+  const target = store.activeChannel === 'all' ? 'all' : store.activeChannel
+  void store.shareFiles(files, target)
 }
 
 function onFilePicked(ev: Event) {
   const input = ev.target as HTMLInputElement
   if (!input.files?.length) return
-  const files = [...input.files]
-  // 懒发送：挂共享，对方在接收页下载；scope 跟随当前频道（私聊=单播，群聊=广播）。
-  const target = store.activeChannel === 'all' ? 'all' : store.activeChannel
-  store.shareFiles(files, target)
+  shareToChannel([...input.files])
   input.value = ''
+}
+
+/** 粘贴文件/截图直接发送；纯文本仍走输入框默认粘贴。 */
+function onPaste(ev: ClipboardEvent) {
+  const files = ev.clipboardData?.files
+  if (!files?.length) return
+  ev.preventDefault()
+  if (!channelReachable.value) {
+    store.lastError = '对方不可达，暂不能发送文件'
+    return
+  }
+  shareToChannel([...files])
+}
+
+onMounted(() => window.addEventListener('paste', onPaste))
+onUnmounted(() => {
+  window.removeEventListener('paste', onPaste)
+  stopRecord(true)
+})
+
+// —— 拖拽发送（文件 / 文件夹，文件夹自动打包 zip）——
+const dragDepth = ref(0)
+const dragging = computed(() => dragDepth.value > 0)
+
+function dragHasFiles(ev: DragEvent): boolean {
+  return [...(ev.dataTransfer?.types ?? [])].includes('Files')
+}
+
+function onDragEnter(ev: DragEvent) {
+  if (dragHasFiles(ev)) dragDepth.value++
+}
+
+function onDragLeave(ev: DragEvent) {
+  if (dragHasFiles(ev) && dragDepth.value > 0) dragDepth.value--
+}
+
+async function onDrop(ev: DragEvent) {
+  dragDepth.value = 0
+  if (!ev.dataTransfer) return
+  if (!channelReachable.value) {
+    store.lastError = '对方不可达，暂不能发送文件'
+    return
+  }
+  const payload = await collectDropped(ev.dataTransfer)
+  if (payload.files.length === 0 && payload.folders.length === 0) return
+  const target = store.activeChannel === 'all' ? 'all' : store.activeChannel
+  void store.dispatchPayload(payload, 'lazy', target)
+}
+
+// —— 图片灯箱 ——
+const lightbox = ref<{ url: string; name: string; fileId: string; full: boolean } | null>(null)
+
+function openImage(msg: ChatEntry) {
+  const f = msg.file
+  if (!f?.thumb) return
+  const share = store.shares.get(f.fileId)
+  const fullUrl = share?.state === 'done' ? share.url : undefined
+  lightbox.value = {
+    url: fullUrl ?? f.thumb,
+    name: f.name,
+    fileId: f.fileId,
+    full: !!fullUrl,
+  }
+}
+
+/** 灯箱里点「下载原图」：走多源下载，完成后自动换成原图。 */
+function downloadOriginal() {
+  const lb = lightbox.value
+  if (!lb) return
+  store.downloadShare(lb.fileId)
+}
+
+// 正在看的图下载完成 → 无缝换原图。
+watch(
+  () => lightbox.value && store.shares.get(lightbox.value.fileId)?.url,
+  (url) => {
+    if (lightbox.value && url && !lightbox.value.full) {
+      lightbox.value = { ...lightbox.value, url, full: true }
+    }
+  },
+)
+
+// —— 语音消息（按住录音，松开发送）——
+const recording = ref(false)
+const recordMs = ref(0)
+let recorder: MediaRecorder | null = null
+let recChunks: Blob[] = []
+let recTimer: ReturnType<typeof setInterval> | null = null
+let recStart = 0
+let recCanceled = false
+let pressing = false
+
+const canRecord = computed(
+  () => store.capabilities.userMedia && typeof MediaRecorder !== 'undefined',
+)
+
+function pickRecordMime(): string | undefined {
+  for (const m of ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4']) {
+    if (MediaRecorder.isTypeSupported(m)) return m
+  }
+  return undefined
+}
+
+async function startRecord(ev: PointerEvent) {
+  if (recording.value || !canRecord.value || !channelReachable.value) return
+  pressing = true
+  ;(ev.currentTarget as HTMLElement | null)?.setPointerCapture?.(ev.pointerId)
+  let stream: MediaStream
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+  } catch {
+    store.lastError = '无法访问麦克风（未授权或被占用）'
+    pressing = false
+    return
+  }
+  // 等授权期间用户已松手：不开始录音。
+  if (!pressing) {
+    for (const t of stream.getTracks()) t.stop()
+    return
+  }
+  const mime = pickRecordMime()
+  try {
+    recorder = new MediaRecorder(
+      stream,
+      mime ? { mimeType: mime, audioBitsPerSecond: 32_000 } : undefined,
+    )
+  } catch {
+    recorder = new MediaRecorder(stream)
+  }
+  recChunks = []
+  recCanceled = false
+  recorder.ondataavailable = (e) => {
+    if (e.data.size > 0) recChunks.push(e.data)
+  }
+  recorder.onstop = () => {
+    for (const t of stream.getTracks()) t.stop()
+    const dur = Date.now() - recStart
+    recording.value = false
+    if (recTimer !== null) {
+      clearInterval(recTimer)
+      recTimer = null
+    }
+    if (recCanceled || dur < 400 || recChunks.length === 0) return
+    const blob = new Blob(recChunks, { type: recorder?.mimeType || mime || 'audio/webm' })
+    void store.sendVoiceNote(blob, Math.min(dur, 60_000))
+  }
+  recStart = Date.now()
+  recordMs.value = 0
+  recording.value = true
+  recTimer = setInterval(() => {
+    recordMs.value = Date.now() - recStart
+    if (recordMs.value >= 60_000) stopRecord(false) // 上限 60s 自动截断发送
+  }, 200)
+  recorder.start()
+}
+
+function stopRecord(cancel: boolean) {
+  pressing = false
+  if (!recorder || recorder.state === 'inactive') return
+  recCanceled = cancel
+  recorder.stop()
+}
+
+// —— 语音播放（同一时刻只播一条）——
+const playingId = ref<number | null>(null)
+const playPos = ref(0)
+let player: HTMLAudioElement | null = null
+
+function toggleVoice(msg: ChatEntry) {
+  if (!msg.voice) return
+  if (playingId.value === msg.id) {
+    player?.pause()
+    playingId.value = null
+    return
+  }
+  player?.pause()
+  player = new Audio(msg.voice.url)
+  playingId.value = msg.id
+  playPos.value = 0
+  player.ontimeupdate = () => {
+    playPos.value = (player?.currentTime ?? 0) * 1000
+  }
+  player.onended = () => {
+    playingId.value = null
+  }
+  void player.play().catch(() => {
+    playingId.value = null
+    store.lastError = '语音播放失败'
+  })
+}
+
+function fmtDur(ms: number): string {
+  return `${Math.max(1, Math.round(ms / 1000))}″`
+}
+
+// —— 表情回应 ——
+/** 我是否已用该 emoji 回应过这条消息。 */
+function reactedByMe(msg: ChatEntry, emoji: string): boolean {
+  return msg.reactions?.[emoji]?.includes(store.myId) ?? false
+}
+
+/** 回应 chips 的悬浮提示（谁回应的）。 */
+function reactTitle(msg: ChatEntry, emoji: string): string {
+  return (msg.reactions?.[emoji] ?? []).map((p) => store.displayName(p)).join('、')
 }
 
 async function copyMessage(id: number, text: string) {
@@ -80,6 +288,17 @@ async function copyMessage(id: number, text: string) {
 
 function pickChannel(ch: 'all' | string) {
   store.openChat(ch)
+}
+
+/** 私聊里点「五子棋」：有对局就打开棋盘，否则发出邀请。 */
+function gomokuEntry() {
+  const peer = store.activeChannel
+  if (peer === 'all') return
+  if (store.gomoku.has(peer)) {
+    store.gomokuOpen = peer
+  } else {
+    store.inviteGomoku(peer)
+  }
 }
 </script>
 
@@ -116,7 +335,13 @@ function pickChannel(ch: 'all' | string) {
     </aside>
 
     <!-- 消息区 -->
-    <div class="main">
+    <div
+      class="main"
+      @dragenter.prevent="onDragEnter"
+      @dragover.prevent
+      @dragleave="onDragLeave"
+      @drop.prevent="onDrop"
+    >
       <header class="head">
         <h1><AppIcon name="chat" :size="20" /> {{ channelName }}</h1>
         <span class="sub">
@@ -130,7 +355,25 @@ function pickChannel(ch: 'all' | string) {
                 : '对方暂不可达'
           }}
         </span>
+        <button
+          v-if="isDm"
+          class="ghost gamebtn"
+          :disabled="!channelReachable && !dmGame"
+          :title="dmGame ? '打开棋盘' : '邀请对方下五子棋'"
+          @click="gomokuEntry"
+        >
+          <AppIcon name="dice" :size="16" />
+          {{ dmGame ? (dmGame.state === 'active' ? '对局中' : '五子棋') : '五子棋' }}
+        </button>
       </header>
+
+      <!-- 五子棋邀请横幅（私聊内） -->
+      <div v-if="dmGame?.state === 'invite-in'" class="gbanner">
+        <AppIcon name="dice" :size="16" />
+        {{ store.displayName(dmGame.opponent) }} 邀请你下五子棋
+        <button class="primary" @click="store.respondGomoku(dmGame.opponent, true)">接受</button>
+        <button class="ghost" @click="store.respondGomoku(dmGame.opponent, false)">婉拒</button>
+      </div>
 
       <div ref="logEl" class="log">
         <div v-if="channelMessages.length === 0" class="empty">
@@ -153,9 +396,16 @@ function pickChannel(ch: 'all' | string) {
             <span class="who">{{ msg.fromNick }}</span>
             <span class="time">{{ fmtTime(msg.ts) }}</span>
           </div>
+          <!-- 图片卡片（内联缩略图，点击放大） -->
+          <div v-if="msg.file?.thumb" class="bubble-row">
+            <button class="imgcard" title="点击查看大图" @click="openImage(msg)">
+              <img :src="msg.file.thumb" :alt="msg.file.name" />
+              <span class="imgmeta">{{ fmtBytes(msg.file.size) }}</span>
+            </button>
+          </div>
           <!-- 文件卡片 -->
-          <div v-if="msg.file" class="bubble file-card" :class="{ 'mine-bubble': msg.self }">
-            <AppIcon name="file" :size="20" />
+          <div v-else-if="msg.file" class="bubble file-card" :class="{ 'mine-bubble': msg.self }">
+            <AppIcon :name="msg.file.name.endsWith('.zip') ? 'folder' : 'file'" :size="20" />
             <div class="fc-info">
               <span class="fc-name">{{ msg.file.name }}</span>
               <span class="fc-size">{{ fmtBytes(msg.file.size) }}</span>
@@ -169,15 +419,60 @@ function pickChannel(ch: 'all' | string) {
               <AppIcon name="download" :size="15" />
             </button>
           </div>
+          <!-- 语音消息 -->
+          <div v-else-if="msg.voice" class="bubble-row">
+            <button
+              class="bubble voice"
+              :class="{ 'mine-bubble': msg.self, playing: playingId === msg.id }"
+              @click="toggleVoice(msg)"
+            >
+              <AppIcon :name="playingId === msg.id ? 'pause' : 'play'" :size="15" />
+              <span class="vwave" :class="{ anim: playingId === msg.id }"><i /><i /><i /><i /></span>
+              <span class="vdur">
+                {{ playingId === msg.id ? fmtDur(playPos) + ' / ' : '' }}{{ fmtDur(msg.voice.dur) }}
+              </span>
+            </button>
+            <div v-if="msg.msgId" class="reactbar">
+              <button
+                v-for="e in REACT_EMOJIS"
+                :key="e"
+                class="remoji"
+                @click="store.toggleReact(msg, e)"
+              >{{ e }}</button>
+            </div>
+          </div>
           <!-- 普通文本气泡 -->
           <div v-else class="bubble-row">
             <div class="bubble">{{ msg.text }}</div>
+            <div class="rowtools">
+              <button
+                class="copy"
+                :title="copiedId === msg.id ? '已复制' : '复制'"
+                @click="copyMessage(msg.id, msg.text)"
+              >
+                <AppIcon :name="copiedId === msg.id ? 'check' : 'copy'" :size="14" />
+              </button>
+              <div v-if="msg.msgId" class="reactbar">
+                <button
+                  v-for="e in REACT_EMOJIS"
+                  :key="e"
+                  class="remoji"
+                  @click="store.toggleReact(msg, e)"
+                >{{ e }}</button>
+              </div>
+            </div>
+          </div>
+          <!-- 表情回应 chips -->
+          <div v-if="msg.reactions && Object.keys(msg.reactions).length" class="reacts">
             <button
-              class="copy"
-              :title="copiedId === msg.id ? '已复制' : '复制'"
-              @click="copyMessage(msg.id, msg.text)"
+              v-for="(who, e) in msg.reactions"
+              :key="e"
+              class="rchip"
+              :class="{ mine: reactedByMe(msg, String(e)) }"
+              :title="reactTitle(msg, String(e))"
+              @click="store.toggleReact(msg, String(e))"
             >
-              <AppIcon :name="copiedId === msg.id ? 'check' : 'copy'" :size="14" />
+              {{ e }} <span v-if="who.length > 1">{{ who.length }}</span>
             </button>
           </div>
         </div>
@@ -185,16 +480,20 @@ function pickChannel(ch: 'all' | string) {
 
       <div class="composer">
         <button
+          v-if="canRecord"
           class="ghost clip"
-          title="发送剪贴板内容"
+          :class="{ rec: recording }"
           :disabled="!channelReachable"
-          @click="sendClipboard"
+          :title="recording ? '松开发送，上限 60 秒' : '按住说一段语音'"
+          @pointerdown.prevent="startRecord($event)"
+          @pointerup="stopRecord(false)"
+          @pointercancel="stopRecord(true)"
         >
-          <AppIcon name="clipboard" :size="18" />
+          <AppIcon name="mic" :size="18" />
         </button>
         <button
           class="ghost clip"
-          title="发送文件（懒发送，对方在接收页下载）"
+          title="发送文件（懒发送，对方在接收页下载；也可粘贴或拖拽文件/文件夹）"
           :disabled="!channelReachable"
           @click="pickFile"
         >
@@ -203,7 +502,13 @@ function pickChannel(ch: 'all' | string) {
         <input ref="fileInput" type="file" multiple hidden @change="onFilePicked" />
         <input
           v-model="draft"
-          :placeholder="channelReachable ? '输入消息或粘贴长文本，回车发送…' : '对方不可达，暂不能发送'"
+          :placeholder="
+            recording
+              ? `录音中 ${fmtDur(recordMs)}（松开发送）…`
+              : channelReachable
+                ? '输入消息，回车发送；文件可粘贴或拖入…'
+                : '对方不可达，暂不能发送'
+          "
           :disabled="!channelReachable"
           @keyup.enter="send"
         />
@@ -211,7 +516,42 @@ function pickChannel(ch: 'all' | string) {
           <AppIcon name="send" :size="15" /> 发送
         </button>
       </div>
+
+      <!-- 打包提示 -->
+      <div v-if="store.packing > 0" class="packing">正在打包文件夹…</div>
+
+      <!-- 拖拽遮罩 -->
+      <div v-if="dragging" class="dropmask">
+        <AppIcon name="upload" :size="40" />
+        <p>松开即发送到「{{ channelName }}」</p>
+        <span>支持多文件与文件夹（自动打包 zip）</span>
+      </div>
     </div>
+
+    <!-- 图片灯箱 -->
+    <div v-if="lightbox" class="lightbox" @click.self="lightbox = null">
+      <img :src="lightbox.url" :alt="lightbox.name" />
+      <div class="lbbar">
+        <span class="lbname">{{ lightbox.name }}</span>
+        <span v-if="!lightbox.full" class="lbhint">预览为缩略图</span>
+        <button
+          v-if="!lightbox.full && !store.shares.get(lightbox.fileId)?.local"
+          class="primary"
+          :disabled="store.shares.get(lightbox.fileId)?.state === 'downloading'"
+          @click="downloadOriginal"
+        >
+          {{
+            store.shares.get(lightbox.fileId)?.state === 'downloading'
+              ? '下载中…'
+              : '下载原图'
+          }}
+        </button>
+        <button class="ghost" @click="lightbox = null"><AppIcon name="x" :size="15" /></button>
+      </div>
+    </div>
+
+    <!-- 五子棋棋盘 -->
+    <GomokuPanel v-if="store.gomokuOpen" :peer-id="store.gomokuOpen" />
   </div>
 </template>
 
@@ -309,6 +649,7 @@ function pickChannel(ch: 'all' | string) {
   display: flex;
   flex-direction: column;
   min-height: 0;
+  position: relative;
 }
 
 .head {
@@ -333,6 +674,36 @@ function pickChannel(ch: 'all' | string) {
   font-size: 12px;
   color: var(--muted);
   flex: 1;
+}
+
+.gamebtn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12.5px;
+}
+
+.gbanner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 10px 24px 0;
+  padding: 9px 14px;
+  font-size: 13px;
+  border: 1px solid var(--accent);
+  background: var(--accent-weak);
+  color: var(--accent-strong);
+  border-radius: var(--radius-sm);
+}
+
+.gbanner .primary,
+.gbanner .ghost {
+  padding: 4px 12px;
+  font-size: 12.5px;
+}
+
+.gbanner .primary {
+  margin-left: auto;
 }
 
 .log {
@@ -397,6 +768,38 @@ function pickChannel(ch: 'all' | string) {
   box-shadow: var(--shadow-soft);
 }
 
+/* —— 图片卡片 —— */
+.imgcard {
+  position: relative;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  overflow: hidden;
+  background: var(--panel);
+  box-shadow: var(--shadow-soft);
+  cursor: zoom-in;
+  line-height: 0;
+}
+
+.imgcard img {
+  max-width: 260px;
+  max-height: 200px;
+  display: block;
+  object-fit: cover;
+}
+
+.imgmeta {
+  position: absolute;
+  right: 6px;
+  bottom: 6px;
+  font-size: 10.5px;
+  line-height: 1;
+  color: #fff;
+  background: rgba(0, 0, 0, 0.55);
+  border-radius: 6px;
+  padding: 3px 6px;
+}
+
 .file-card {
   display: inline-flex;
   align-items: center;
@@ -452,6 +855,161 @@ function pickChannel(ch: 'all' | string) {
   flex: none;
 }
 
+/* —— 语音气泡 —— */
+.bubble.voice {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  min-width: 120px;
+  color: var(--accent-strong);
+}
+
+.bubble.voice.mine-bubble {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--on-accent);
+}
+
+.msg.mine .bubble.voice {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--on-accent);
+}
+
+.vwave {
+  display: inline-flex;
+  align-items: center;
+  gap: 2.5px;
+  height: 14px;
+}
+
+.vwave i {
+  width: 2.5px;
+  height: 6px;
+  border-radius: 2px;
+  background: currentColor;
+  opacity: 0.75;
+}
+
+.vwave i:nth-child(2) {
+  height: 12px;
+}
+
+.vwave i:nth-child(3) {
+  height: 8px;
+}
+
+.vwave i:nth-child(4) {
+  height: 11px;
+}
+
+.vwave.anim i {
+  animation: vbounce 0.9s ease-in-out infinite;
+}
+
+.vwave.anim i:nth-child(2) {
+  animation-delay: 0.15s;
+}
+
+.vwave.anim i:nth-child(3) {
+  animation-delay: 0.3s;
+}
+
+.vwave.anim i:nth-child(4) {
+  animation-delay: 0.45s;
+}
+
+@keyframes vbounce {
+  0%,
+  100% {
+    transform: scaleY(0.6);
+  }
+
+  50% {
+    transform: scaleY(1.4);
+  }
+}
+
+.vdur {
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* —— 表情回应 —— */
+.rowtools {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.msg.mine .rowtools {
+  flex-direction: row-reverse;
+}
+
+.reactbar {
+  display: inline-flex;
+  gap: 2px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-pill);
+  padding: 2px 5px;
+  box-shadow: var(--shadow-soft);
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+
+.bubble-row:hover .reactbar {
+  opacity: 1;
+}
+
+.remoji {
+  border: none;
+  background: transparent;
+  font-size: 13px;
+  padding: 2px 3px;
+  border-radius: 6px;
+  line-height: 1;
+}
+
+.remoji:hover {
+  background: var(--accent-weak);
+  transform: scale(1.2);
+}
+
+.reacts {
+  display: flex;
+  gap: 4px;
+  margin-top: 4px;
+  flex-wrap: wrap;
+}
+
+.msg.mine .reacts {
+  justify-content: flex-end;
+}
+
+.rchip {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 12px;
+  line-height: 1;
+  padding: 3px 8px;
+  border-radius: var(--radius-pill);
+  border: 1px solid var(--border);
+  background: var(--panel);
+}
+
+.rchip.mine {
+  border-color: var(--accent);
+  background: var(--accent-weak);
+}
+
+.rchip span {
+  font-size: 10.5px;
+  color: var(--muted);
+}
+
 .msg .bubble {
   border-bottom-left-radius: 5px;
 }
@@ -501,6 +1059,119 @@ function pickChannel(ch: 'all' | string) {
 
 .clip {
   padding: 8px 10px;
+  touch-action: none;
+}
+
+.clip.rec {
+  background: var(--danger);
+  border-color: var(--danger);
+  color: #fff;
+  animation: recpulse 1.2s ease-in-out infinite;
+}
+
+@keyframes recpulse {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--danger) 45%, transparent);
+  }
+
+  50% {
+    box-shadow: 0 0 0 6px transparent;
+  }
+}
+
+.packing {
+  position: absolute;
+  left: 50%;
+  bottom: 76px;
+  transform: translateX(-50%);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-pill);
+  box-shadow: var(--shadow-pop);
+  font-size: 12.5px;
+  color: var(--muted);
+  padding: 7px 16px;
+}
+
+.dropmask {
+  position: absolute;
+  inset: 8px;
+  z-index: 10;
+  border: 2.5px dashed var(--accent);
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--accent-weak) 85%, transparent);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  color: var(--accent-strong);
+  pointer-events: none;
+}
+
+.dropmask p {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.dropmask span {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+/* —— 图片灯箱 —— */
+.lightbox {
+  position: fixed;
+  inset: 0;
+  z-index: 45;
+  background: rgba(8, 6, 20, 0.82);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  cursor: zoom-out;
+}
+
+.lightbox img {
+  max-width: min(92vw, 1400px);
+  max-height: 82vh;
+  border-radius: 10px;
+  box-shadow: var(--shadow-pop);
+  cursor: default;
+}
+
+.lbbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-pill);
+  padding: 8px 10px 8px 18px;
+  cursor: default;
+}
+
+.lbname {
+  font-size: 13px;
+  font-weight: 600;
+  max-width: 320px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.lbhint {
+  font-size: 11.5px;
+  color: var(--muted);
+}
+
+.lbbar .primary,
+.lbbar .ghost {
+  padding: 5px 12px;
+  font-size: 12.5px;
 }
 
 @media (max-width: 700px) {

@@ -49,11 +49,32 @@ type MeshEvents = {
   'peer-sas': { peerId: string; sas: Sas }
   /** 对端的名片到达/更新。 */
   'peer-profile': { peerId: string; profile: Profile }
-  /** 对端上报了它的邻接表（网络视图边数据）。 */
-  'peer-links': { peerId: string; links: { peerId: string; state: string }[] }
+  /** 对端上报了它的邻接表（网络视图边数据，附实测 RTT）。 */
+  'peer-links': { peerId: string; links: { peerId: string; state: string; rtt?: number }[] }
   /** 某对端的 control 通道就绪（可向其补发状态同步，如白板全量）。 */
   'peer-channel-open': string
-  chat: { from: string; text: string; ts: number; scope: 'all' | 'dm' }
+  chat: { from: string; msgId: string; text: string; ts: number; scope: 'all' | 'dm' }
+  /** 对端对某条消息的表情回应。 */
+  react: { from: string; msgId: string; emoji: string; op: 'add' | 'remove'; scope: 'all' | 'dm' }
+  /** 对端发来的语音消息。 */
+  'voice-note': {
+    from: string
+    msgId: string
+    scope: 'all' | 'dm'
+    data: string
+    mime: string
+    dur: number
+    ts: number
+  }
+  /** 与该对端的实测往返延迟（ms）。 */
+  'peer-rtt': { peerId: string; rtt: number }
+  /** 对端开麦 / 关麦（实时对讲）。 */
+  'voice-start': string
+  'voice-stop': string
+  /** 对端麦克风媒体流已到达，可以播放。 */
+  'voice-stream': { peerId: string; stream: MediaStream }
+  /** 游戏消息（你画我猜 / 五子棋），由上层维护对局状态。 */
+  game: { from: string; msg: GameMessage }
   /** 对端要发文件给我（接收侧新传输开始，强制发送）。 */
   'file-offer': { peerId: string; offer: FileOffer }
   /** 双向传输进度（bytes 为已完成字节数）。 */
@@ -86,6 +107,12 @@ type MeshEvents = {
 export type DrawMessage = Extract<
   ControlMessage,
   { kind: `draw-${string}` } | { kind: `ptr-${string}` }
+>
+
+/** ControlMessage 中的游戏子集（你画我猜 / 五子棋）。 */
+export type GameMessage = Extract<
+  ControlMessage,
+  { kind: `guess-${string}` } | { kind: `gomoku-${string}` }
 >
 
 /** 供 store 查询的共享条目视图。 */
@@ -160,6 +187,20 @@ export class Mesh extends Emitter<MeshEvents> {
   private screenStream: MediaStream | null = null
   private screenScope: { scope: SendScope; to?: string } = { scope: 'all' }
   private readonly screenSenders = new Map<string, RTCRtpSender[]>()
+
+  // 实时对讲：本端麦克风流 + 各对端 senders；remoteVoiceStreams 记录对端通告的
+  // 语音流 id，用于把到达的媒体流与屏幕共享区分开。
+  private voiceStream: MediaStream | null = null
+  private readonly voiceSenders = new Map<string, RTCRtpSender[]>()
+  private readonly remoteVoiceStreams = new Map<string, string>()
+  /** 语音消息分片重组缓冲：`${from}|${msgId}` → 已到分片。 */
+  private readonly voiceParts = new Map<string, string[]>()
+
+  // RTT 探测：每对端周期 ping，pong 回来算往返。
+  private pingSeq = 1
+  private readonly pendingPings = new Map<number, { peerId: string; sentAt: number }>()
+  private readonly rtts = new Map<string, number>()
+  private pingTimer: ReturnType<typeof setInterval> | null = null
   // 中继对端走 WebCodecs 自编码：一个编码器，画面分发给所有中继观众。
   private screenEncoder: ScreenEncoder | null = null
   private encoderStarting: Promise<boolean> | null = null
@@ -172,7 +213,30 @@ export class Mesh extends Emitter<MeshEvents> {
     super()
     this.signaling = signaling
     this.wireSignaling()
+    // RTT 探测 + 邻接表（含 RTT）周期广播；leave 时清除。
+    this.pingTimer = setInterval(() => this.pingAll(), 5000)
   }
+
+  /** 向所有通道就绪的对端发一轮 ping；久未应答的记录顺带过期。 */
+  private pingAll(): void {
+    const now = performance.now()
+    for (const [seq, p] of this.pendingPings) {
+      if (now - p.sentAt > 30_000) this.pendingPings.delete(seq)
+    }
+    for (const [peerId, peer] of this.peers) {
+      const seq = this.pingSeq++
+      if (peer.sendControl({ kind: 'ping', seq })) {
+        this.pendingPings.set(seq, { peerId, sentAt: performance.now() })
+      }
+    }
+    // 周期性重播邻接表：让对端网络视图上「节点—节点」边的 RTT 保持新鲜。
+    if (this.peers.size > 0 && now - this.lastLinksBroadcast > 15_000) {
+      this.lastLinksBroadcast = now
+      this.broadcastLinks()
+    }
+  }
+
+  private lastLinksBroadcast = 0
 
   private wireSignaling(): void {
     this.signaling.on('joined', ({ peerId, peers }) => {
@@ -250,13 +314,48 @@ export class Mesh extends Emitter<MeshEvents> {
   }
 
   /** 群聊：向所有对端广播。 */
-  sendChat(text: string): void {
-    this.broadcast({ kind: 'chat', text, ts: Date.now(), scope: 'all' })
+  sendChat(text: string, msgId: string): void {
+    this.broadcast({ kind: 'chat', msgId, text, ts: Date.now(), scope: 'all' })
   }
 
   /** 私聊：只发给指定对端。 */
-  sendDm(peerId: string, text: string): boolean {
-    return this.sendTo(peerId, { kind: 'chat', text, ts: Date.now(), scope: 'dm' })
+  sendDm(peerId: string, text: string, msgId: string): boolean {
+    return this.sendTo(peerId, { kind: 'chat', msgId, text, ts: Date.now(), scope: 'dm' })
+  }
+
+  /**
+   * 发送语音消息。base64 超过单条 control 消息的安全上限时自动分片
+   * （接收端按 msgId 重组）。dm 时首片发送失败即返回 false。
+   */
+  sendVoiceNote(opts: {
+    msgId: string
+    data: string
+    mime: string
+    dur: number
+    ts: number
+    scope: 'all' | 'dm'
+    to?: string
+  }): boolean {
+    const PART = 48_000
+    const parts = Math.max(1, Math.ceil(opts.data.length / PART))
+    for (let i = 0; i < parts; i++) {
+      const piece: ControlMessage = {
+        kind: 'voice-note',
+        msgId: opts.msgId,
+        scope: opts.scope,
+        data: opts.data.slice(i * PART, (i + 1) * PART),
+        mime: opts.mime,
+        dur: opts.dur,
+        ts: opts.ts,
+        ...(parts > 1 ? { part: i, parts } : {}),
+      }
+      if (opts.scope === 'dm' && opts.to) {
+        if (!this.sendTo(opts.to, piece)) return false
+      } else {
+        this.broadcast(piece)
+      }
+    }
+    return true
   }
 
   /** 更新并广播本端名片。 */
@@ -284,11 +383,12 @@ export class Mesh extends Emitter<MeshEvents> {
     return this.peers.get(peerId)?.sendControl(msg) ?? false
   }
 
-  /** 当前各对端连接状态（link-state 广播 + 本端网络视图）。 */
-  linkStates(): { peerId: string; state: string }[] {
+  /** 当前各对端连接状态（link-state 广播 + 本端网络视图），附实测 RTT。 */
+  linkStates(): { peerId: string; state: string; rtt?: number }[] {
     return [...this.peers.entries()].map(([peerId, p]) => ({
       peerId,
       state: p.connectionState,
+      rtt: this.rtts.get(peerId),
     }))
   }
 
@@ -376,6 +476,55 @@ export class Mesh extends Emitter<MeshEvents> {
 
   get sharingScreen(): boolean {
     return this.screenStream !== null
+  }
+
+  // —— 实时对讲（麦克风轨）——
+
+  /**
+   * 开麦：把麦克风轨挂到所有 WebRTC 直连/TURN 的对端（复用媒体轨重协商链路）。
+   * 走 WS 中继的对端收不到（媒体轨过不了应用层中继，且未做音频自编码），
+   * 返回收不到的对端列表供 UI 说明。
+   */
+  startVoice(stream: MediaStream): { blocked: string[] } {
+    this.stopVoice()
+    this.voiceStream = stream
+    const blocked: string[] = []
+    for (const peer of this.peers.values()) {
+      if (peer.transport === 'webrtc') {
+        this.attachVoice(peer)
+      } else {
+        blocked.push(peer.remoteId)
+      }
+    }
+    return { blocked }
+  }
+
+  /** 关麦：撤各对端的音频轨并停止本地采集。 */
+  stopVoice(): void {
+    if (!this.voiceStream) return
+    for (const [peerId, senders] of this.voiceSenders) {
+      const peer = this.peers.get(peerId)
+      if (peer) for (const s of senders) peer.removeTrack(s)
+    }
+    this.voiceSenders.clear()
+    for (const track of this.voiceStream.getTracks()) track.stop()
+    this.voiceStream = null
+    this.broadcast({ kind: 'voice-stop' })
+  }
+
+  get voiceActive(): boolean {
+    return this.voiceStream !== null
+  }
+
+  /** 幂等：把麦克风轨挂到某对端并通告流 id（对端据此识别为语音流）。 */
+  private attachVoice(peer: Peer): void {
+    const stream = this.voiceStream
+    if (!stream || peer.transport !== 'webrtc') return
+    if (!this.voiceSenders.has(peer.remoteId)) {
+      const senders = stream.getAudioTracks().map((t) => peer.addTrack(t, stream))
+      this.voiceSenders.set(peer.remoteId, senders)
+    }
+    peer.sendControl({ kind: 'voice-start', streamId: stream.id })
   }
 
   /** 本次共享是否覆盖该对端（广播覆盖全部，单播只覆盖指定的那个）。 */
@@ -563,7 +712,7 @@ export class Mesh extends Emitter<MeshEvents> {
    * 共享一个本地文件（懒发送）：登记元信息并广播，不上传任何字节。
    * scope=direct 时只对指定对端可见。
    */
-  shareFile(file: File, scope: SendScope = 'all', to?: string): SharedFileMeta {
+  shareFile(file: File, scope: SendScope = 'all', to?: string, thumb?: string): SharedFileMeta {
     const meta: SharedFileMeta = {
       fileId: genId() + genId(),
       name: file.name,
@@ -575,6 +724,7 @@ export class Mesh extends Emitter<MeshEvents> {
       owner: this.myId,
       mode: 'lazy',
       scope,
+      thumb,
     }
     this.stores.set(meta.fileId, new FileStore(meta, file))
     this.shares.set(meta.fileId, { meta, local: true, holders: new Set([this.myId]) })
@@ -669,6 +819,19 @@ export class Mesh extends Emitter<MeshEvents> {
   }
 
   leave(): void {
+    if (this.pingTimer !== null) {
+      clearInterval(this.pingTimer)
+      this.pingTimer = null
+    }
+    this.pendingPings.clear()
+    this.rtts.clear()
+    if (this.voiceStream) {
+      for (const track of this.voiceStream.getTracks()) track.stop()
+      this.voiceStream = null
+    }
+    this.voiceSenders.clear()
+    this.remoteVoiceStreams.clear()
+    this.voiceParts.clear()
     if (this.screenStream) {
       for (const track of this.screenStream.getTracks()) track.stop()
       this.screenStream = null
@@ -732,8 +895,15 @@ export class Mesh extends Emitter<MeshEvents> {
         this.attachScreen(peer)
       }
     })
-    peer.on('track', ({ streams }) => {
-      if (streams[0]) this.emit('screen-stream', { peerId: remoteId, stream: streams[0] })
+    peer.on('track', ({ track, streams }) => {
+      const stream = streams[0]
+      if (!stream) return
+      // 对讲的语音流 id 由 voice-start 先行通告；其余媒体流一律视为屏幕共享。
+      if (this.remoteVoiceStreams.get(remoteId) === stream.id || (track.kind === 'audio' && stream.getVideoTracks().length === 0)) {
+        this.emit('voice-stream', { peerId: remoteId, stream })
+        return
+      }
+      this.emit('screen-stream', { peerId: remoteId, stream })
     })
     peer.on('channelopen', () => {
       // 通道就绪：互换名片、邻接表、共享目录；迟到者补挂屏幕。
@@ -746,6 +916,12 @@ export class Mesh extends Emitter<MeshEvents> {
       // attachScreen 幂等：这里既补发 screen-start，也让中继观众拿到关键帧
       // （中继的 channelopen 正好在密钥协商完成时触发）。
       if (this.screenStream && this.sharedWith(remoteId)) this.attachScreen(peer)
+      if (this.voiceStream) this.attachVoice(peer)
+      // 会话内续传：通道（重新）就绪时向它询问所有进行中下载的持块情况，
+      // 停摆的下载据此拿回源并自动继续。
+      for (const fileId of this.downloads.keys()) {
+        peer.sendControl({ kind: 'have-req', fileId })
+      }
       this.emit('peer-channel-open', remoteId)
     })
 
@@ -765,7 +941,74 @@ export class Mesh extends Emitter<MeshEvents> {
   private handleControl(from: string, msg: ControlMessage): void {
     switch (msg.kind) {
       case 'chat':
-        this.emit('chat', { from, text: msg.text, ts: msg.ts, scope: msg.scope ?? 'all' })
+        this.emit('chat', {
+          from,
+          msgId: msg.msgId ?? `${from}-${msg.ts}`,
+          text: msg.text,
+          ts: msg.ts,
+          scope: msg.scope ?? 'all',
+        })
+        break
+      case 'react':
+        this.emit('react', { from, msgId: msg.msgId, emoji: msg.emoji, op: msg.op, scope: msg.scope })
+        break
+      case 'voice-note': {
+        // 分片重组：control 有序可靠，同一 msgId 的分片按序到达。
+        let data = msg.data
+        if (msg.parts && msg.parts > 1) {
+          const key = `${from}|${msg.msgId}`
+          const buf = this.voiceParts.get(key) ?? []
+          buf.push(msg.data)
+          if (buf.length < msg.parts) {
+            this.voiceParts.set(key, buf)
+            break
+          }
+          this.voiceParts.delete(key)
+          data = buf.join('')
+        }
+        this.emit('voice-note', {
+          from,
+          msgId: msg.msgId,
+          scope: msg.scope,
+          data,
+          mime: msg.mime,
+          dur: msg.dur,
+          ts: msg.ts,
+        })
+        break
+      }
+      case 'ping':
+        this.sendTo(from, { kind: 'pong', seq: msg.seq })
+        break
+      case 'pong': {
+        const p = this.pendingPings.get(msg.seq)
+        if (p && p.peerId === from) {
+          this.pendingPings.delete(msg.seq)
+          const rtt = Math.max(0, Math.round(performance.now() - p.sentAt))
+          this.rtts.set(from, rtt)
+          this.emit('peer-rtt', { peerId: from, rtt })
+        }
+        break
+      }
+      case 'voice-start':
+        this.remoteVoiceStreams.set(from, msg.streamId)
+        this.emit('voice-start', from)
+        break
+      case 'voice-stop':
+        this.remoteVoiceStreams.delete(from)
+        this.emit('voice-stop', from)
+        break
+      case 'guess-start':
+      case 'guess-try':
+      case 'guess-correct':
+      case 'guess-reveal':
+      case 'guess-end':
+      case 'gomoku-invite':
+      case 'gomoku-accept':
+      case 'gomoku-decline':
+      case 'gomoku-move':
+      case 'gomoku-resign':
+        this.emit('game', { from, msg })
         break
       case 'profile': {
         this.nicks.set(from, msg.profile.nick)
@@ -867,7 +1110,8 @@ export class Mesh extends Emitter<MeshEvents> {
         if (!entry || entry.local) break
         entry.holders.delete(from)
         this.downloads.get(msg.fileId)?.dropSource(from)
-        if (entry.holders.size === 0) {
+        // 下载进行中不作废条目：留给会话内续传等源恢复。
+        if (entry.holders.size === 0 && !this.downloads.has(msg.fileId)) {
           this.shares.delete(msg.fileId)
           this.emit('share-removed', { fileId: msg.fileId })
         }
@@ -996,6 +1240,12 @@ export class Mesh extends Emitter<MeshEvents> {
     this.screenSenders.delete(remoteId)
     this.codecViewers.delete(remoteId)
     this.dropScreenDecoder(remoteId)
+    this.voiceSenders.delete(remoteId)
+    this.remoteVoiceStreams.delete(remoteId)
+    this.rtts.delete(remoteId)
+    for (const key of [...this.voiceParts.keys()]) {
+      if (key.startsWith(`${remoteId}|`)) this.voiceParts.delete(key)
+    }
     // 该对端的未决 offer 不会再有数据通道了，直接清理。
     for (const [id, p] of this.pendingOffers) {
       if (p.peerId === remoteId) {
@@ -1003,11 +1253,12 @@ export class Mesh extends Emitter<MeshEvents> {
         this.emit('file-error', { id, reason: '对方已离线', canceled: false })
       }
     }
-    // 共享目录：把它从持有者中移除；无人持有的远端共享作废。
+    // 共享目录：把它从持有者中移除；无人持有的远端共享作废（下载中的除外，
+    // 留给会话内续传等源恢复）。
     for (const [fileId, entry] of [...this.shares]) {
       if (!entry.holders.delete(remoteId)) continue
       this.downloads.get(fileId)?.dropSource(remoteId)
-      if (!entry.local && entry.holders.size === 0) {
+      if (!entry.local && entry.holders.size === 0 && !this.downloads.has(fileId)) {
         this.shares.delete(fileId)
         this.emit('share-removed', { fileId })
       }

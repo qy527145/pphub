@@ -3,6 +3,7 @@ import { computed, ref, watch } from 'vue'
 import { useRoomStore } from '@/stores/room'
 import type { TransferMode } from '@/core/messages'
 import { fmtBytes } from '@/utils/format'
+import { collectDropped, groupPickedFolder } from '@/utils/fs'
 import AppIcon from './AppIcon.vue'
 import PeerAvatar from './PeerAvatar.vue'
 import TransferItem from './TransferItem.vue'
@@ -19,6 +20,7 @@ watch(
 const mode = ref<TransferMode>('force')
 const dragging = ref(false)
 const fileInput = ref<HTMLInputElement | null>(null)
+const dirInput = ref<HTMLInputElement | null>(null)
 
 const sends = computed(() => store.transfers.filter((t) => t.direction === 'send'))
 const myShares = computed(() => store.shareList.filter((s) => s.local))
@@ -36,16 +38,32 @@ function pick() {
   fileInput.value?.click()
 }
 
+function pickDir(ev: Event) {
+  ev.stopPropagation()
+  dirInput.value?.click()
+}
+
 function onPicked(ev: Event) {
   const input = ev.target as HTMLInputElement
   if (input.files?.length) sendAll([...input.files])
   input.value = ''
 }
 
-function onDrop(ev: DragEvent) {
+/** 文件夹选择：按顶层目录打包 zip 后发送（结构解压即得）。 */
+function onDirPicked(ev: Event) {
+  const input = ev.target as HTMLInputElement
+  if (input.files?.length) {
+    void store.dispatchPayload(groupPickedFolder([...input.files]), mode.value, target.value)
+  }
+  input.value = ''
+}
+
+async function onDrop(ev: DragEvent) {
   dragging.value = false
-  const files = [...(ev.dataTransfer?.files ?? [])]
-  if (files.length) sendAll(files)
+  if (!ev.dataTransfer) return
+  const payload = await collectDropped(ev.dataTransfer)
+  if (payload.files.length === 0 && payload.folders.length === 0) return
+  void store.dispatchPayload(payload, mode.value, target.value)
 }
 
 function sendAll(files: File[]) {
@@ -123,12 +141,18 @@ const SHARE_STATE: Record<string, string> = {
           @drop.prevent="onDrop"
         >
           <input ref="fileInput" type="file" multiple hidden @change="onPicked" />
+          <input ref="dirInput" type="file" webkitdirectory hidden @change="onDirPicked" />
           <AppIcon name="upload" :size="36" />
-          <p class="drop-main">点击选择文件，或拖拽到此处</p>
+          <p class="drop-main">点击选择文件，或把文件 / 文件夹拖到此处</p>
           <p class="drop-sub">
             {{ mode === 'force' ? '选择后立即开始发送' : '选择后挂出共享，等待对方下载' }}
+            · 文件夹自动打包为 zip（保留目录结构）
             {{ targetValid ? '' : '（目标节点已离线，请重选）' }}
           </p>
+          <button class="ghost dirbtn" @click="pickDir">
+            <AppIcon name="folder" :size="15" /> 选择文件夹
+          </button>
+          <p v-if="store.packing > 0" class="drop-sub packing">正在打包文件夹…</p>
         </div>
       </template>
 
@@ -310,6 +334,18 @@ const SHARE_STATE: Record<string, string> = {
   margin: 0;
   font-size: 12px;
   color: var(--muted);
+}
+
+.dirbtn {
+  margin-top: 6px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12.5px;
+}
+
+.packing {
+  color: var(--accent-strong);
 }
 
 .list {

@@ -5,9 +5,11 @@
 // 指纹核验」，点中心自己的节点编辑名片，底部动作条面向全网（群聊 / 群发 /
 // 共享屏幕 / 公共白板）。
 import { computed, ref } from 'vue'
+import { renderSVG } from 'uqr'
 import { useRoomStore, type Member } from '@/stores/room'
 import { AVATAR_COLORS, AVATAR_EMOJIS } from '@/core/profile'
 import { copyText } from '@/utils/clipboard'
+import { collectDropped } from '@/utils/fs'
 import AppIcon from './AppIcon.vue'
 import PeerAvatar from './PeerAvatar.vue'
 
@@ -60,9 +62,11 @@ interface GraphEdge {
   x2: number
   y2: number
   state: string
+  /** 实测往返延迟（ms），标注在边中点。 */
+  rtt?: number
 }
 
-/** 边集合：本端→各对端（member.state），对端↔对端（link-state gossip）。 */
+/** 边集合：本端→各对端（member.state + 本端实测 RTT），对端↔对端（gossip）。 */
 const edges = computed<GraphEdge[]>(() => {
   const out: GraphEdge[] = []
   const seen = new Set<string>()
@@ -74,23 +78,36 @@ const edges = computed<GraphEdge[]>(() => {
       x2: n.x,
       y2: n.y,
       state: n.member.state,
+      rtt: store.rtts.get(n.member.peerId),
     })
   }
   for (const [from, links] of store.peerLinks) {
     const a = nodeAt(from)
     if (!a) continue
-    for (const [to, state] of links) {
+    for (const [to, link] of links) {
       if (to === store.myId) continue
       const b = nodeAt(to)
       if (!b) continue
       const key = [from, to].sort().join('~')
       if (seen.has(key)) continue
       seen.add(key)
-      out.push({ key, x1: a.x, y1: a.y, x2: b.x, y2: b.y, state })
+      out.push({ key, x1: a.x, y1: a.y, x2: b.x, y2: b.y, state: link.state, rtt: link.rtt })
     }
   }
   return out
 })
+
+/** 连通边的 RTT 标签（HTML 定位在边中点，避免非等比 SVG 拉伸文字）。 */
+const rttLabels = computed(() =>
+  edges.value
+    .filter((e) => e.state === 'connected' && e.rtt !== undefined)
+    .map((e) => ({
+      key: e.key,
+      x: (e.x1 + e.x2) / 2,
+      y: (e.y1 + e.y2) / 2,
+      rtt: e.rtt as number,
+    })),
+)
 
 function edgeClass(state: string): string {
   if (state === 'connected') return 'on'
@@ -190,6 +207,35 @@ const copiedCode = ref(false)
 const copiedLink = ref(false)
 
 const connectOpen = computed(() => store.peerCount === 0 || showConnect.value)
+
+/** 分享链接二维码（手机扫码即连，免输码）。 */
+const qrSvg = computed(() => renderSVG(store.shareLink, { border: 1, ecc: 'M' }))
+
+// —— 拖文件到节点头像：直接发给 TA（懒发送；文件夹自动打包 zip）——
+const dropNode = ref<string | null>(null)
+
+function nodeDragOver(peerId: string, ev: DragEvent) {
+  if (![...(ev.dataTransfer?.types ?? [])].includes('Files')) return
+  ev.preventDefault()
+  dropNode.value = peerId
+}
+
+function nodeDragLeave(peerId: string) {
+  if (dropNode.value === peerId) dropNode.value = null
+}
+
+async function nodeDrop(peerId: string, ev: DragEvent) {
+  dropNode.value = null
+  if (!ev.dataTransfer) return
+  const member = store.members.get(peerId)
+  if (!member || member.state !== 'connected') {
+    store.lastError = '该节点未连接，无法发送文件'
+    return
+  }
+  const payload = await collectDropped(ev.dataTransfer)
+  if (payload.files.length === 0 && payload.folders.length === 0) return
+  void store.dispatchPayload(payload, 'lazy', peerId)
+}
 
 async function copy(text: string, flag: 'code' | 'link') {
   if (!(await copyText(text))) {
@@ -298,6 +344,16 @@ function stateLabel(m: { state: string; transport: string }): string {
           />
         </svg>
 
+        <!-- 连线延迟标注（HTML 定位在边中点，避免 SVG 非等比拉伸文字） -->
+        <span
+          v-for="l in rttLabels"
+          :key="`rtt-${l.key}`"
+          class="rttchip"
+          :class="{ slow: l.rtt >= 150 }"
+          :style="{ left: `${(l.x / VIEW) * 100}%`, top: `${(l.y / VIEW) * 100}%` }"
+          title="实测往返延迟（每 5 秒探测一次）"
+        >{{ l.rtt }}ms</span>
+
         <!-- 本机节点（中心） -->
         <div
           class="node self"
@@ -315,8 +371,12 @@ function stateLabel(m: { state: string; transport: string }): string {
           v-for="n in nodes"
           :key="n.member.peerId"
           class="node"
+          :class="{ droptarget: dropNode === n.member.peerId }"
           :style="{ left: `${(n.x / VIEW) * 100}%`, top: `${(n.y / VIEW) * 100}%` }"
           @click.stop="openMenu(n.member.peerId)"
+          @dragover="nodeDragOver(n.member.peerId, $event)"
+          @dragleave="nodeDragLeave(n.member.peerId)"
+          @drop.prevent.stop="nodeDrop(n.member.peerId, $event)"
         >
           <span class="ring" :class="n.member.state">
             <PeerAvatar
@@ -326,6 +386,9 @@ function stateLabel(m: { state: string; transport: string }): string {
             />
             <i v-if="n.member.sharing" class="live" title="正在共享屏幕">
               <AppIcon name="monitor" :size="11" />
+            </i>
+            <i v-else-if="store.speaking.has(n.member.peerId)" class="talk" title="正在说话">
+              <AppIcon name="mic" :size="11" />
             </i>
             <i v-else-if="n.member.verified" class="ok" title="指纹已核验">
               <AppIcon name="check" :size="11" />
@@ -507,13 +570,17 @@ function stateLabel(m: { state: string; transport: string }): string {
         </div>
 
         <div class="method">
-          <div class="mhead"><span class="num">02</span> 分享链接</div>
+          <div class="mhead"><span class="num">02</span> 分享链接 / 扫码连接</div>
           <div class="row">
             <input :value="store.shareLink" readonly spellcheck="false" @focus="($event.target as HTMLInputElement).select()" />
             <button class="primary" @click="copy(store.shareLink, 'link')">
               <AppIcon :name="copiedLink ? 'check' : 'link'" :size="15" />
               {{ copiedLink ? '已复制' : '复制' }}
             </button>
+          </div>
+          <div class="qrrow">
+            <div class="qr" v-html="qrSvg"></div>
+            <p class="qrhint">手机扫码即连（同一网络下走局域网直连，不同网络自动 P2P 打洞）</p>
           </div>
         </div>
 
@@ -678,6 +745,29 @@ function stateLabel(m: { state: string; transport: string }): string {
   to { stroke-dashoffset: -22; }
 }
 
+/* —— 连线延迟标注 —— */
+.rttchip {
+  position: absolute;
+  transform: translate(-50%, -50%);
+  z-index: 1;
+  font-size: 10px;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+  color: var(--muted);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-pill);
+  padding: 2px 6px;
+  pointer-events: auto;
+  white-space: nowrap;
+}
+
+.rttchip.slow {
+  color: var(--warn-fg, #a05a00);
+  border-color: var(--warn);
+}
+
 /* —— 节点 —— */
 .node {
   position: absolute;
@@ -763,7 +853,8 @@ function stateLabel(m: { state: string; transport: string }): string {
 }
 
 .node .live,
-.node .ok {
+.node .ok,
+.node .talk {
   position: absolute;
   right: -3px;
   bottom: -3px;
@@ -783,6 +874,24 @@ function stateLabel(m: { state: string; transport: string }): string {
 
 .node .ok {
   background: var(--ok);
+}
+
+/* 正在说话：常绿 + 呼吸圈。 */
+.node .talk {
+  background: var(--accent);
+  animation: talkpulse 1.4s ease-out infinite;
+}
+
+@keyframes talkpulse {
+  0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 50%, transparent); }
+  100% { box-shadow: 0 0 0 8px transparent; }
+}
+
+/* 拖文件悬停在节点上：高亮示意「松开发给 TA」。 */
+.node.droptarget .ring {
+  border-color: var(--accent);
+  transform: scale(1.14);
+  box-shadow: 0 0 0 6px var(--accent-weak);
 }
 
 .nbadge {
@@ -1128,6 +1237,37 @@ function stateLabel(m: { state: string; transport: string }): string {
   font-size: 12px;
   cursor: pointer;
   margin-left: auto;
+}
+
+/* —— 二维码 —— */
+.qrrow {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.qr {
+  width: 116px;
+  height: 116px;
+  flex: none;
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+  background: #fff;
+  border: 1px solid var(--border);
+  padding: 4px;
+}
+
+.qr :deep(svg) {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+.qrhint {
+  margin: 0;
+  font-size: 11.5px;
+  color: var(--muted);
+  line-height: 1.6;
 }
 
 /* —— 全网动作条 —— */

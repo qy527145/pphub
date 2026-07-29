@@ -12,12 +12,9 @@ const ICONS: Record<string, string> = {
     '<path d="M12 4.5v11"/><path d="M8.3 11.8 12 15.5l3.7-3.7"/><path d="M4.5 14v3.5a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2V14"/>',
   // 消息：圆角方泡 + 尾巴
   chat: '<path d="M4.5 7a2.5 2.5 0 0 1 2.5-2.5h10A2.5 2.5 0 0 1 19.5 7v6a2.5 2.5 0 0 1-2.5 2.5H9.8L5.6 19v-3.6A2.5 2.5 0 0 1 4.5 13z"/><path d="M8.6 9.2h6.8"/><path d="M8.6 12h4.4"/>',
-  clipboard:
-    '<path d="M9 5.5H7.4a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h9.2a2 2 0 0 0 2-2v-10a2 2 0 0 0-2-2H15"/><rect x="9" y="3.6" width="6" height="3.6" rx="1.4"/><path d="M8.8 12h6.4"/><path d="M8.8 15h4"/>',
   monitor:
     '<rect x="3.2" y="4.8" width="17.6" height="11.4" rx="2.4"/><path d="M9 19.5h6"/><path d="M12 16.2v3.3"/>',
   pen: '<path d="M4.5 19.5l1-3.4L15.4 6.2a2 2 0 0 1 2.8 0l.6.6a2 2 0 0 1 0 2.8L8.9 19.5z"/><path d="M14.4 7.2l3 3"/>',
-  play: '<rect x="3.4" y="4.6" width="17.2" height="14.8" rx="3"/><path d="M10.4 9.6l4.6 2.6-4.6 2.6z"/>',
   link: '<path d="M10.4 13.6a3.4 3.4 0 0 0 4.8 0l2.6-2.6a3.4 3.4 0 0 0-4.8-4.8l-1.3 1.3"/><path d="M13.6 10.4a3.4 3.4 0 0 0-4.8 0l-2.6 2.6a3.4 3.4 0 0 0 4.8 4.8l1.3-1.3"/>',
   copy: '<rect x="9" y="9" width="10.5" height="10.5" rx="2.4"/><path d="M15 6.6a2 2 0 0 0-2-2H6.9a2.4 2.4 0 0 0-2.4 2.4V13a2 2 0 0 0 2 2"/>',
   check: '<path d="M4.8 12.8l4.4 4.2 10-10.2"/>',
@@ -57,6 +54,15 @@ const ICONS: Record<string, string> = {
   expand:
     '<path d="M13.8 4.6h5.6v5.6"/><path d="M10.2 19.4H4.6v-5.6"/><path d="M19.4 4.6l-6.2 6.2"/><path d="M4.6 19.4l6.2-6.2"/>',
   crop: '<path d="M7.2 3.2v11.6a2 2 0 0 0 2 2h11.6"/><path d="M3.2 7.2h11.6a2 2 0 0 1 2 2v11.6"/>',
+  mic: '<rect x="9.2" y="3.4" width="5.6" height="10" rx="2.8"/><path d="M6 11.4a6 6 0 0 0 12 0"/><path d="M12 17.4v3.2"/><path d="M9 20.6h6"/>',
+  smile:
+    '<circle cx="12" cy="12" r="8.4"/><path d="M8.8 14a4.2 4.2 0 0 0 6.4 0"/><path d="M9.4 9.6h.01"/><path d="M14.6 9.6h.01"/>',
+  folder:
+    '<path d="M3.6 7a2 2 0 0 1 2-2h4l2 2.4h7a1.8 1.8 0 0 1 1.8 1.8v8.2a2 2 0 0 1-2 2H5.6a2 2 0 0 1-2-2z"/>',
+  play: '<path d="M8.4 5.8l9.4 6.2-9.4 6.2z"/>',
+  pause: '<path d="M9 5.8v12.4"/><path d="M15 5.8v12.4"/>',
+  // 游戏：骰子（圆角方 + 五点）
+  dice: '<rect x="4" y="4" width="16" height="16" rx="4"/><path d="M8.6 8.6h.01"/><path d="M15.4 8.6h.01"/><path d="M12 12h.01"/><path d="M8.6 15.4h.01"/><path d="M15.4 15.4h.01"/>',
 }
 
 defineProps<{ name: string; size?: number }>()
