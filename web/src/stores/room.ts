@@ -634,6 +634,13 @@ export const useRoomStore = defineStore('room', () => {
       if (dm && dm.length > 0) {
         m.sendTo(peerId, { kind: 'draw-state', board: dmBoardId(peerId), items: dm })
       }
+
+      // 同步所有公开的游戏桌给新加入的成员
+      for (const table of gameTables.values()) {
+        if (table.visibility === 'public') {
+          m.sendTo(peerId, { kind: 'table-create', tableId: table.tableId, table })
+        }
+      }
     })
 
     m.on('screen-start', (peerId) => {
@@ -1676,8 +1683,8 @@ export const useRoomStore = defineStore('room', () => {
         const pos = msg.pos as MousePosition
         if (pos && msg.tableId) {
           const positions = gameMousePositions.get(msg.tableId) || []
-          // 只保留最近的位置
-          const filtered = positions.filter(p => p.peerId !== pos.peerId || Date.now() - p.ts < 5000)
+          // 只保留每个用户的最新位置（移除旧的）
+          const filtered = positions.filter(p => p.peerId !== pos.peerId)
           filtered.push(pos)
           gameMousePositions.set(msg.tableId, filtered)
         }
@@ -2345,7 +2352,7 @@ export const useRoomStore = defineStore('room', () => {
     }
 
     currentTableId.value = null
-    setView('network')
+    setView('games')  // 改为回到游戏大厅
   }
 
   function startGameTable(tableId: string): void {

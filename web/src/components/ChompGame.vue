@@ -184,11 +184,8 @@ onMounted(() => {
             gridTemplateRows: `repeat(${gameState?.rows}, ${cellSize}px)`,
           }"
         >
-          <div
-            v-for="row in gameState?.rows"
-            :key="`row-${row}`"
-            style="display: contents"
-          >
+          <!-- 从第一行（索引0，顶部）到最后一行（索引rows-1，底部）渲染 -->
+          <template v-for="row in gameState?.rows" :key="`row-${row}`">
             <div
               v-for="col in gameState?.cols"
               :key="`${row}-${col}`"
@@ -204,7 +201,7 @@ onMounted(() => {
             >
               <span v-if="getBlockState(row - 1, col - 1) === 'poison'">💀</span>
             </div>
-          </div>
+          </template>
         </div>
       </div>
 
