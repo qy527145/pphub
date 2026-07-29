@@ -336,6 +336,8 @@ export const useRoomStore = defineStore('room', () => {
   const matchingQueues = reactive(new Map<GameType, string[]>())
   /** 当前正在匹配的游戏类型 */
   const myMatchingGame = ref<GameType | null>(null)
+  /** 游戏状态：tableId -> 游戏特定状态 */
+  const gameStates = reactive(new Map<string, any>())
 
   /** 文件夹打包中的数量（UI 转圈提示）。 */
   const packing = ref(0)
@@ -1683,8 +1685,11 @@ export const useRoomStore = defineStore('room', () => {
         break
       }
       case 'game-move': {
-        // 游戏动作，由具体游戏组件处理
-        // 这里可以添加通用的同步逻辑
+        const moveData = msg.moveData
+        if (moveData && msg.tableId) {
+          // 更新游戏状态
+          gameStates.set(msg.tableId, moveData)
+        }
         break
       }
       case 'game-chat': {
@@ -2380,6 +2385,13 @@ export const useRoomStore = defineStore('room', () => {
     const table = gameTables.get(tableId)
     if (!table) return
 
+    // 如果桌子满了但是要旁观，仍然可以加入
+    const meta = getGameMeta(table.gameType)
+    if (!asSpectator && meta && table.players.length >= meta.playerCount) {
+      // 玩家位满了，自动改为旁观
+      asSpectator = true
+    }
+
     if (asSpectator) {
       if (!table.spectators.includes(myId.value)) {
         table.spectators.push(myId.value)
@@ -2657,6 +2669,7 @@ export const useRoomStore = defineStore('room', () => {
     currentTableId,
     gameChats,
     gameMousePositions,
+    gameStates,
     packing,
     theme,
     activeView,

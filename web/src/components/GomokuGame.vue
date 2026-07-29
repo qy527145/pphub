@@ -1,6 +1,6 @@
 <script setup lang="ts">
 // 五子棋游戏组件 - 用于新游戏桌系统
-import { computed, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { useRoomStore } from '@/stores/room'
 import type { GameTable } from '@/core/games'
 import { GOMOKU_SIZE, gomokuWinLine } from '@/utils/gomoku'
@@ -25,25 +25,48 @@ const gameState = ref<GomokuGameState>({
   moves: 0,
 })
 
+// 监听远程走法
+watch(() => store.gameStates.get(props.table.tableId), (remoteState) => {
+  if (remoteState && remoteState.moves > gameState.value.moves) {
+    console.log('[Gomoku] 收到远程走法:', remoteState)
+    gameState.value = {
+      ...gameState.value,
+      cells: remoteState.cells || gameState.value.cells,
+      turn: remoteState.turn || gameState.value.turn,
+      moves: remoteState.moves || gameState.value.moves,
+      lastMove: remoteState.idx,
+      winLine: remoteState.winLine,
+      winner: remoteState.winner,
+    }
+  }
+}, { deep: true })
+
+// 监听桌子状态变化，游戏开始时初始化玩家
+watch(() => props.table.state, (newState) => {
+  if (newState === 'playing' && props.table.players.length >= 2) {
+    gameState.value.players = [props.table.players[0], props.table.players[1]]
+    console.log('[Gomoku] 游戏开始，玩家:', gameState.value.players)
+  }
+})
+
 const myColor = computed(() => {
   const idx = gameState.value.players.indexOf(store.myId)
   return idx === 0 ? 1 : idx === 1 ? 2 : null
 })
 
 const myTurn = computed(() => {
-  return !gameState.value.winner && gameState.value.turn === myColor.value
+  if (!myColor.value || gameState.value.winner || props.table.state !== 'playing') return false
+  return gameState.value.turn === myColor.value
 })
 
-const CELL = 32
-const PAD = CELL
-const SIZE = CELL * (GOMOKU_SIZE - 1) + PAD * 2
+const SIZE = 600
+const PAD = 20
+const CELL = (SIZE - PAD * 2) / (GOMOKU_SIZE - 1)
 
-const STARS = [3, 7, 11].flatMap((y) => [3, 7, 11].map((x) => ({ x, y })))
-
-const stones = computed(() => {
-  const out: { idx: number; x: number; y: number; color: number }[] = []
+const pieces = computed(() => {
+  const out = []
   for (let i = 0; i < gameState.value.cells.length; i++) {
-    if (gameState.value.cells[i] !== 0) {
+    if (gameState.value.cells[i]) {
       out.push({
         idx: i,
         x: i % GOMOKU_SIZE,
@@ -99,6 +122,7 @@ function makeMove(idx: number): void {
     turn: gameState.value.turn,
     moves: gameState.value.moves,
     winLine,
+    winner: winLine ? store.myId : undefined,
   })
 }
 
@@ -123,66 +147,73 @@ function getPlayerName(playerIdx: 0 | 1): string {
         </div>
       </div>
 
-      <div class="status-text">
-        <span v-if="gameState.winner">
-          {{ gameState.winner === store.myId ? '🎉 你赢了！' : `${store.displayName(gameState.winner)} 获胜！` }}
-        </span>
-        <span v-else-if="myTurn">轮到你落子</span>
-        <span v-else>等待对手...</span>
+      <div v-if="gameState.winner" class="result">
+        {{ gameState.winner === store.myId ? '你赢了！' : `${store.displayName(gameState.winner)} 赢了！` }}
       </div>
-
-      <div class="move-count">第 {{ gameState.moves }} 手</div>
+      <div v-else-if="props.table.state !== 'playing'" class="waiting">
+        等待游戏开始...
+      </div>
+      <div v-else-if="myTurn" class="turn-hint">
+        轮到你了
+      </div>
+      <div v-else class="turn-hint">
+        等待对手...
+      </div>
     </div>
 
     <svg
+      :width="SIZE"
+      :height="SIZE"
       class="board"
-      :viewBox="`0 0 ${SIZE} ${SIZE}`"
       :class="{ clickable: myTurn }"
       @click="clickBoard"
     >
-      <rect x="0" y="0" :width="SIZE" :height="SIZE" class="wood" rx="10" />
-      <g class="grid">
-        <line
-          v-for="i in GOMOKU_SIZE"
-          :key="`h${i}`"
-          :x1="PAD"
-          :y1="PAD + (i - 1) * CELL"
-          :x2="SIZE - PAD"
-          :y2="PAD + (i - 1) * CELL"
-        />
-        <line
-          v-for="i in GOMOKU_SIZE"
-          :key="`v${i}`"
-          :x1="PAD + (i - 1) * CELL"
-          :y1="PAD"
-          :x2="PAD + (i - 1) * CELL"
-          :y2="SIZE - PAD"
-        />
-      </g>
-      <circle
-        v-for="(s, i) in STARS"
-        :key="`star${i}`"
-        :cx="PAD + s.x * CELL"
-        :cy="PAD + s.y * CELL"
-        r="3"
-        class="star"
+      <!-- 棋盘线 -->
+      <line
+        v-for="i in GOMOKU_SIZE"
+        :key="`h${i}`"
+        :x1="PAD"
+        :y1="PAD + (i - 1) * CELL"
+        :x2="PAD + (GOMOKU_SIZE - 1) * CELL"
+        :y2="PAD + (i - 1) * CELL"
+        stroke="var(--border)"
+        stroke-width="1"
       />
-      <g>
+      <line
+        v-for="i in GOMOKU_SIZE"
+        :key="`v${i}`"
+        :x1="PAD + (i - 1) * CELL"
+        :y1="PAD"
+        :x2="PAD + (i - 1) * CELL"
+        :y2="PAD + (GOMOKU_SIZE - 1) * CELL"
+        stroke="var(--border)"
+        stroke-width="1"
+      />
+
+      <!-- 星位 -->
+      <circle
+        v-for="([x, y], i) in [[3, 3], [11, 3], [7, 7], [3, 11], [11, 11]]"
+        :key="`star${i}`"
+        :cx="PAD + x * CELL"
+        :cy="PAD + y * CELL"
+        r="4"
+        fill="var(--border)"
+      />
+
+      <!-- 棋子 -->
+      <g v-for="p in pieces" :key="p.idx">
         <circle
-          v-for="s in stones"
-          :key="s.idx"
-          :cx="PAD + s.x * CELL"
-          :cy="PAD + s.y * CELL"
-          :r="CELL * 0.42"
-          class="piece"
-          :class="[s.color === 1 ? 'p-black' : 'p-white', { win: winSet.has(s.idx) }]"
+          :cx="PAD + p.x * CELL"
+          :cy="PAD + p.y * CELL"
+          :r="CELL * 0.45"
+          :class="['stone-svg', p.color === 1 ? 'black' : 'white', { win: winSet.has(p.idx) }]"
         />
         <circle
-          v-if="gameState.lastMove !== undefined"
-          :cx="PAD + (gameState.lastMove % GOMOKU_SIZE) * CELL"
-          :cy="PAD + Math.floor(gameState.lastMove / GOMOKU_SIZE) * CELL"
-          r="5"
-          class="lastdot"
+          v-if="p.idx === gameState.lastMove"
+          :cx="PAD + p.x * CELL"
+          :cy="PAD + p.y * CELL"
+          r="6"
+          :fill="p.color === 1 ? 'white' : 'black'"
         />
       </g>
     </svg>
@@ -194,120 +225,100 @@ function getPlayerName(playerIdx: 0 | 1): string {
   display: flex;
   flex-direction: column;
   align-items: center;
-  justify-content: center;
-  height: 100%;
   gap: 20px;
   padding: 20px;
 }
 
 .game-status {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 12px;
-  padding: 16px 24px;
-  background: var(--panel);
-  border-radius: var(--radius);
-  min-width: 300px;
+  text-align: center;
 }
 
 .players {
   display: flex;
   align-items: center;
-  gap: 16px;
+  gap: 20px;
+  margin-bottom: 12px;
 }
 
 .player {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 6px 12px;
-  border-radius: var(--radius-pill);
-  border: 2px solid transparent;
-  transition: all 0.2s;
+  padding: 8px 16px;
+  border-radius: var(--radius);
+  background: var(--bg);
+  opacity: 0.5;
+  transition: opacity 0.3s;
 }
 
 .player.active {
-  border-color: var(--accent);
+  opacity: 1;
   background: var(--accent-weak);
 }
 
 .stone {
-  width: 16px;
-  height: 16px;
+  width: 20px;
+  height: 20px;
   border-radius: 50%;
-  flex-shrink: 0;
+  border: 2px solid var(--border);
 }
 
 .stone.black {
-  background: #262626;
-  border: 1px solid #000;
+  background: #000;
 }
 
 .stone.white {
-  background: #fafafa;
-  border: 1px solid #999;
+  background: #fff;
 }
 
 .vs {
-  font-size: 12px;
-  color: var(--muted);
-}
-
-.status-text {
-  font-size: 15px;
   font-weight: 600;
-  color: var(--text);
+  color: var(--muted);
 }
 
-.move-count {
-  font-size: 12px;
+.result {
+  font-size: 20px;
+  font-weight: 600;
+  color: var(--success);
+}
+
+.waiting {
+  font-size: 16px;
   color: var(--muted);
+}
+
+.turn-hint {
+  font-size: 16px;
+  color: var(--accent);
+  font-weight: 600;
 }
 
 .board {
-  width: min(90vmin, 600px);
-  aspect-ratio: 1;
-  display: block;
-  user-select: none;
+  background: #dcb35c;
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-pop);
 }
 
 .board.clickable {
   cursor: crosshair;
 }
 
-.wood {
-  fill: #e8c88f;
-}
-
-.grid line {
-  stroke: #8a6b3d;
+.stone-svg {
+  stroke: var(--border);
   stroke-width: 1;
+  transition: all 0.2s;
 }
 
-.star {
-  fill: #8a6b3d;
+.stone-svg.black {
+  fill: #000;
 }
 
-.piece.p-black {
-  fill: #1d1d1f;
-  stroke: #000;
-  stroke-width: 1;
+.stone-svg.white {
+  fill: #fff;
 }
 
-.piece.p-white {
-  fill: #fdfdfd;
-  stroke: #9a9a9a;
-  stroke-width: 1;
-}
-
-.piece.win {
-  stroke: var(--danger);
+.stone-svg.win {
+  stroke: var(--success);
   stroke-width: 3;
-}
-
-.lastdot {
-  fill: var(--danger);
-  pointer-events: none;
 }
 </style>
