@@ -20,6 +20,7 @@ const NAV: NavItem[] = [
   { view: 'chat', icon: 'chat', label: '消息', badge: () => store.unreadTotal },
   { view: 'screen', icon: 'monitor', label: '屏幕共享', badge: () => store.unseenShare },
   { view: 'board', icon: 'pen', label: '互动白板', badge: () => store.unseenBoard },
+  { view: 'games', icon: 'gamepad-2', label: '游戏大厅' },
 ]
 
 const SIG_LABEL: Record<string, string> = {

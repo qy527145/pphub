@@ -8,6 +8,7 @@ import ReceiveView from '@/components/ReceiveView.vue'
 import ChatView from '@/components/ChatView.vue'
 import ScreenView from '@/components/ScreenView.vue'
 import BoardView from '@/components/BoardView.vue'
+import GameLobby from '@/components/GameLobby.vue'
 
 const store = useRoomStore()
 
@@ -63,6 +64,7 @@ watch(() => store.activeView, (newView, oldView) => {
       <ReceiveView v-else-if="store.activeView === 'receive'" />
       <ScreenView v-else-if="store.activeView === 'screen'" />
       <BoardView v-else-if="store.activeView === 'board'" />
+      <GameLobby v-else-if="store.activeView === 'games'" />
       <ChatView v-else />
     </main>
   </div>

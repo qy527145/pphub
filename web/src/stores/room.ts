@@ -35,11 +35,21 @@ import { GOMOKU_SIZE, gomokuWinLine } from '@/utils/gomoku'
 import { notifyBackground, requestNotifyPermission } from '@/utils/notify'
 import { normalizeGuess } from '@/utils/words'
 import { zipFolder } from '@/utils/zip'
+import {
+  type GameTable,
+  type GameType,
+  type GameChatMessage,
+  type MousePosition,
+  type PlayerRole,
+  generateTableId,
+  getGameMeta,
+  canStartGame,
+} from '@/core/games'
 
 /** idle=未上线 · connecting=正在进房 · online=已在房间（监听中或已连接对端） */
 export type Status = 'idle' | 'connecting' | 'online'
 
-export type View = 'network' | 'send' | 'receive' | 'chat' | 'screen' | 'board'
+export type View = 'network' | 'send' | 'receive' | 'chat' | 'screen' | 'board' | 'games'
 
 export interface Member {
   peerId: string
@@ -313,6 +323,15 @@ export const useRoomStore = defineStore('room', () => {
   const gomoku = reactive(new Map<string, GomokuGame>())
   /** 打开棋盘面板的对局（对端 peerId）。 */
   const gomokuOpen = ref<string | null>(null)
+
+  // —— 游戏系统（新版，支持游戏桌、旁观等）——
+  const gameTables = reactive(new Map<string, GameTable>())
+  /** 当前加入的游戏桌 ID */
+  const currentTableId = ref<string | null>(null)
+  /** 游戏内聊天消息 */
+  const gameChats = reactive(new Map<string, GameChatMessage[]>())
+  /** 游戏内鼠标位置 */
+  const gameMousePositions = reactive(new Map<string, MousePosition[]>())
 
   /** 文件夹打包中的数量（UI 转圈提示）。 */
   const packing = ref(0)
@@ -2149,6 +2168,159 @@ export const useRoomStore = defineStore('room', () => {
     guessSetupReq.value = true
   }
 
+  // —— 游戏桌管理 ——
+
+  function createGameTable(gameType: GameType, isPublic: boolean): void {
+    const tableId = generateTableId()
+    const table: GameTable = {
+      tableId,
+      gameType,
+      hostId: myId.value,
+      state: 'waiting',
+      visibility: isPublic ? 'public' : 'private',
+      players: [myId.value],
+      spectators: [],
+      config: {},
+    }
+    gameTables.set(tableId, table)
+    currentTableId.value = tableId
+
+    // 广播创建游戏桌消息
+    mesh?.broadcast({
+      kind: 'table-create',
+      tableId,
+      table,
+    })
+
+    // 切换到游戏视图
+    setView('games')
+  }
+
+  function joinGameTable(tableId: string, asSpectator: boolean): void {
+    const table = gameTables.get(tableId)
+    if (!table) return
+
+    if (asSpectator) {
+      if (!table.spectators.includes(myId.value)) {
+        table.spectators.push(myId.value)
+      }
+    } else {
+      if (!table.players.includes(myId.value)) {
+        table.players.push(myId.value)
+      }
+    }
+
+    currentTableId.value = tableId
+
+    // 广播加入消息
+    mesh?.broadcast({
+      kind: asSpectator ? 'table-spectate' : 'table-join',
+      tableId,
+    })
+
+    setView('games')
+  }
+
+  function leaveGameTable(): void {
+    if (!currentTableId.value) return
+
+    const table = gameTables.get(currentTableId.value)
+    if (!table) return
+
+    // 移除自己
+    table.players = table.players.filter((p) => p !== myId.value)
+    table.spectators = table.spectators.filter((p) => p !== myId.value)
+
+    // 广播离开消息
+    mesh?.broadcast({
+      kind: 'table-leave',
+      tableId: currentTableId.value,
+    })
+
+    // 如果是桌主且桌上还有人，转移桌主
+    if (table.hostId === myId.value && table.players.length > 0) {
+      table.hostId = table.players[0]
+    }
+
+    // 如果桌上没人了，删除游戏桌
+    if (table.players.length === 0 && table.spectators.length === 0) {
+      gameTables.delete(currentTableId.value)
+    }
+
+    currentTableId.value = null
+    setView('network')
+  }
+
+  function startGameTable(tableId: string): void {
+    const table = gameTables.get(tableId)
+    if (!table || table.hostId !== myId.value || table.state !== 'waiting') return
+
+    // 检查人数是否满足
+    const meta = getGameMeta(table.gameType)
+    if (!meta || !canStartGame(table.gameType, table.players.length)) {
+      lastError.value = `人数不足，需要 ${meta?.playerCount} 人`
+      return
+    }
+
+    table.state = 'playing'
+    table.startedAt = Date.now()
+
+    // 广播开始游戏消息
+    mesh?.broadcast({
+      kind: 'table-start',
+      tableId,
+    })
+  }
+
+  function sendGameMove(tableId: string, moveData: unknown): void {
+    mesh?.broadcast({
+      kind: 'game-move',
+      tableId,
+      moveData,
+    })
+  }
+
+  function sendGameChat(tableId: string, text: string): void {
+    const table = gameTables.get(tableId)
+    if (!table) return
+
+    const role: PlayerRole = table.players.includes(myId.value) ? 'player' : 'spectator'
+
+    const msg: GameChatMessage = {
+      from: myId.value,
+      text,
+      ts: Date.now(),
+      role,
+    }
+
+    // 添加到本地聊天记录
+    const chats = gameChats.get(tableId) || []
+    chats.push(msg)
+    gameChats.set(tableId, chats)
+
+    // 广播聊天消息
+    mesh?.broadcast({
+      kind: 'game-chat',
+      tableId,
+      chatMsg: msg,
+    })
+  }
+
+  function sendGameMousePos(tableId: string, x: number, y: number): void {
+    const pos: MousePosition = {
+      peerId: myId.value,
+      x,
+      y,
+      ts: Date.now(),
+    }
+
+    mesh?.broadcast({
+      kind: 'mouse-pos',
+      tableId,
+      pos,
+    })
+  }
+
   return {
     capabilities,
     status,
@@ -2172,6 +2344,10 @@ export const useRoomStore = defineStore('room', () => {
     amDrawer,
     gomoku,
     gomokuOpen,
+    gameTables,
+    currentTableId,
+    gameChats,
+    gameMousePositions,
     packing,
     theme,
     activeView,
@@ -2262,5 +2438,12 @@ export const useRoomStore = defineStore('room', () => {
     actionGomoku,
     actionGuess,
     guessSetupReq,
+    createGameTable,
+    joinGameTable,
+    leaveGameTable,
+    startGameTable,
+    sendGameMove,
+    sendGameChat,
+    sendGameMousePos,
   }
 })

@@ -247,3 +247,12 @@ export type ControlMessage =
   /** 落子：n 为手数（从 1 起），用于丢包/乱序防御（control 有序，通常一致）。 */
   | { kind: 'gomoku-move'; gameId: string; n: number; x: number; y: number }
   | { kind: 'gomoku-resign'; gameId: string }
+  // —— 游戏桌系统（支持多种游戏、旁观模式等）——
+  | { kind: 'table-create'; tableId: string; table: unknown }
+  | { kind: 'table-join'; tableId: string }
+  | { kind: 'table-spectate'; tableId: string }
+  | { kind: 'table-leave'; tableId: string }
+  | { kind: 'table-start'; tableId: string }
+  | { kind: 'game-move'; tableId: string; moveData: unknown }
+  | { kind: 'game-chat'; tableId: string; chatMsg: unknown }
+  | { kind: 'mouse-pos'; tableId: string; pos: unknown }
