@@ -75,9 +75,10 @@ async function main() {
     }
     const aId = await a.evaluate(() => window.__pphub.myId)
     const bId = await b.evaluate(() => window.__pphub.myId)
+    const cId = await c.evaluate(() => window.__pphub.myId)
     ok('三端口令房组网，全网状互连')
 
-    // —— 0. 粘贴即发：合成 paste 事件，全程不碰回车/发送按钮 ——
+    // —— 0. 粘贴入待发区：合成 paste 事件 → 不直发，确认（发送键）后才发出 ——
     await b.evaluate(() => window.__pphub.setView('chat'))
     await until(b, () => !!document.querySelector('.composer input'), 'B 聊天页就绪')
     await b.evaluate(() => {
@@ -85,17 +86,30 @@ async function main() {
       dt.items.add(new File([new Uint8Array([137, 80, 78, 71])], '截图.png', { type: 'image/png' }))
       window.dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt }))
     })
+    await until(b, () => document.querySelectorAll('.attach-item').length === 1, 'B 待发区出附件')
+    await b.waitForTimeout(800)
+    const leaked = await a.evaluate(
+      () => window.__pphub.shareList.some((s) => s.name === '截图.png'),
+    )
+    const sentEarly = await b.evaluate(
+      () => window.__pphub.messages.some((m) => m.self && m.file),
+    )
+    if (leaked || sentEarly) throw new Error('附件未经确认就发出去了')
+    ok('粘贴不直发：文件挂到待发区，未经确认对端收不到')
+
+    await b.click('.composer .primary')
     await until(
       b,
       () => window.__pphub.messages.some((m) => m.self && m.file?.name === '截图.png'),
-      'B 粘贴后本地即出文件卡片',
+      'B 确认后本地出卡片',
     )
     await until(
       a,
       () => window.__pphub.shareList.some((s) => s.name === '截图.png'),
-      'A 收到粘贴的共享',
+      'A 收到共享',
     )
-    ok('粘贴即发：paste 事件直接挂出共享并送达对端，无需回车/发送')
+    await until(b, () => document.querySelectorAll('.attach-item').length === 0, '待发区清空')
+    ok('确认发送：点发送后共享送达对端，待发区随之清空')
 
     // —— 1. 表情回应 ——
     await a.evaluate(() => window.__pphub.sendChat('回应我试试'))
@@ -387,6 +401,15 @@ async function main() {
       30000,
       bigId,
     )
+    // 顺带铺垫「成员退出清未读」：C 走之前私聊 B 一句（B 在接收页，未读挂上）。
+    await c.evaluate((to) => window.__pphub.sendChat('走之前说一句', to), bId)
+    await until(
+      b,
+      (id) => (window.__pphub.unread.get(id) ?? 0) > 0,
+      'B 未读挂上',
+      20000,
+      cId,
+    )
     await c.evaluate(() => window.__pphub.disconnect()) // 唯一源中途离线
     const stalled = await until(
       b,
@@ -414,6 +437,21 @@ async function main() {
     )
     if (!canceled) throw new Error('停摆下载未能取消')
     ok('断点续传：停摆中可手动取消，回到待下载')
+
+    // —— 8. 成员退出：TA 的私聊未读一并清除（频道没了，角标不能永远赖着）——
+    await until(
+      b,
+      (id) => !window.__pphub.unread.get(id),
+      '退出成员的未读清除',
+      20000,
+      cId,
+    )
+    const history = await b.evaluate(
+      (id) => window.__pphub.messages.some((m) => m.channel === id && m.text === '走之前说一句'),
+      cId,
+    )
+    if (!history) throw new Error('清未读不应该连消息历史一起删')
+    ok('成员退出：私聊未读随之清除，消息历史保留')
 
     console.log(`\n全部通过（${passed} 项）`)
   } finally {

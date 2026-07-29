@@ -420,9 +420,10 @@ control 通道传 `{t:"chat", from, ts, text|html|imgBlobRef}`；图片/文件�
 - **你画我猜**：公共白板叠加游戏模式，谜底**只在出题人本地**（`guess-start` 只广播提示），`guess-try` 全网可见，出题人归一化比对自动裁决（也可手动判对），`guess-correct` 携带全量比分（胜者 +2 出题 +1）防漂移；猜词回合非出题人画笔锁定只留激光笔，内置 80 词随机抽三 + 自拟词。
 - **五子棋**：私聊内邀请（`gomoku-invite/accept/decline`，撤回复用 decline），邀请方执黑；两端镜像棋盘各自校验（手数 n 连续、轮次、占位），非法落子直接忽略；连五/棋满/认输/对方离线四种终局。SVG 棋盘弹层，最后一手红点、胜形高亮。
 - **游戏入口（后补）**：初版入口藏得深（五子棋在私聊标题栏、你画我猜在白板标题栏），补充网络视图两处显眼入口——节点菜单「五子棋对局」（切私聊 + 发邀请/续局）、全网动作条「你画我猜」（直达公共白板并弹出出题面板；标志用「挂载时与变化时都消费」的模式，规避 v-if 视图晚于置位挂载而错过 watch 的时序坑）。
-- **粘贴加固（后补）**：paste 事件的文件从 `clipboardData.items`（getAsFile）与 `files` 两处收齐——部分复制来源只填 items 不填 files；粘贴文件/截图即发，不需要再按回车（e2e 以合成 ClipboardEvent 实证零按键送达对端）。
+- **粘贴/拖入改为确认后发送（后补，按用户反馈定型）**：聊天页的文件三入口（粘贴 / 选择 / 拖拽）统一先挂到输入框上方的**待发区**（图片即时缩略预览、可逐个移除、切频道自动清空），回车或点「发送」才真正发出——文件夹此时才打包 zip，防误发也给了反悔的机会。粘贴的文件从 `clipboardData.items`（getAsFile）与 `files` 两处收齐——部分复制来源只填 items 不填 files，旧写法会静默漏掉。纯文本粘贴仍进输入框可编辑。
+- **成员退出清未读（后补）**：私聊频道随成员消失，攒着的未读角标没有入口可清、会永远赖在导航上——`peer-removed` 时一并 `unread.delete(peerId)`，消息历史保留。名片编辑弹层回车即保存并关闭（Esc 直接关闭）。
 - **协议/架构**：`messages.ts` 的预留 kind 全部启用（react / voice-note / ping / pong / voice-start / voice-stop / guess-* / gomoku-*），mesh 只做传输与重组、对局与游戏状态全在 store（`GameMessage` 子集事件上抛）；新增 `GomokuPanel.vue`，`utils/` 增 notify / zip / fs / gomoku / words。
-- **验证**：`vue-tsc` + `vite build` + `cargo build` 通过；新增 `web/scripts/e2e-features.mjs` 三端 E2E **21 项全过**：粘贴零按键即发 → 回应加/撤同步 → 200KB 语音分片重组字节一致 → RTT 实测/gossip/视图标注 → 两处游戏入口 → 五子棋全流程（含非法落子拒绝）→ 你画我猜全流程（错猜不计分、标点容忍、比分同步）→ 文件夹 zip 结构校验 → 唯一源掉线停摆保留 + 可取消。原七套件（smoke ×2 + e2e-media/network/relay/http-relay/mixed-context，60+ 断言）无回归。
+- **验证**：`vue-tsc` + `vite build` + `cargo build` 通过；新增 `web/scripts/e2e-features.mjs` 三端 E2E **23 项全过**：粘贴入待发区（未确认对端收不到）→ 确认发送送达 → 回应加/撤同步 → 200KB 语音分片重组字节一致 → RTT 实测/gossip/视图标注 → 两处游戏入口 → 五子棋全流程（含非法落子拒绝）→ 你画我猜全流程（错猜不计分、标点容忍、比分同步）→ 文件夹 zip 结构校验 → 唯一源掉线停摆保留 + 可取消 → 成员退出清未读且历史保留。原七套件（smoke ×2 + e2e-media/network/relay/http-relay/mixed-context，60+ 断言）无回归。
 
 ---
 

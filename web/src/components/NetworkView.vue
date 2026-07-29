@@ -187,6 +187,12 @@ function saveNick(): void {
   store.setNick(nickDraft.value)
 }
 
+/** 回车：保存昵称并关闭编辑弹层（头像/底色本就点选即存）。 */
+function commitAndClose(): void {
+  saveNick()
+  editingSelf.value = false
+}
+
 function pickEmoji(emoji: string): void {
   store.setAvatar({ ...store.myProfile.avatar, kind: 'emoji', value: emoji })
 }
@@ -463,7 +469,13 @@ function stateLabel(m: { state: string; transport: string }): string {
           </header>
           <label class="fld">
             <span>昵称</span>
-            <input v-model="nickDraft" maxlength="20" @blur="saveNick" @keyup.enter="saveNick" />
+            <input
+              v-model="nickDraft"
+              maxlength="20"
+              @blur="saveNick"
+              @keyup.enter="commitAndClose"
+              @keyup.esc="editingSelf = false"
+            />
           </label>
           <div class="fld">
             <span>头像</span>

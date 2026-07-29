@@ -507,6 +507,9 @@ export const useRoomStore = defineStore('room', () => {
       rtts.delete(peerId)
       speaking.delete(peerId)
       dropVoiceEl(peerId)
+      // 私聊频道随成员消失，攒着的未读没有入口可清，一并清掉
+      //（消息本体保留，重开该频道仍能看到历史）。
+      unread.delete(peerId)
       // 进行中的对局：对方离线即终局。
       const game = gomoku.get(peerId)
       if (game && game.state === 'active') {

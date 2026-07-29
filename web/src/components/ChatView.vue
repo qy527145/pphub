@@ -7,6 +7,7 @@ import { useRoomStore, type ChatEntry } from '@/stores/room'
 import { fmtBytes, fmtTime } from '@/utils/format'
 import { copyText } from '@/utils/clipboard'
 import { collectDropped } from '@/utils/fs'
+import type { ZipEntry } from '@/utils/zip'
 import AppIcon from './AppIcon.vue'
 import PeerAvatar from './PeerAvatar.vue'
 import GomokuPanel from './GomokuPanel.vue'
@@ -50,26 +51,78 @@ watch(
   },
 )
 
-function send() {
-  if (!draft.value.trim()) return
-  store.sendChat(draft.value)
+// —— 待发附件（粘贴 / 选文件 / 拖拽都先入队，回车或点发送才真正发出）——
+type PendingItem =
+  | { kind: 'file'; file: File; url?: string }
+  | { kind: 'folder'; name: string; entries: ZipEntry[] }
+
+const pending = ref<PendingItem[]>([])
+
+function queueFiles(files: File[]) {
+  for (const f of files) {
+    pending.value.push({
+      kind: 'file',
+      file: f,
+      // 图片给个即时缩略预览（objectURL 只用于本地预览，发送/移除时回收）。
+      url: f.type.startsWith('image/') ? URL.createObjectURL(f) : undefined,
+    })
+  }
+}
+
+function removePending(i: number) {
+  const it = pending.value[i]
+  if (it?.kind === 'file' && it.url) URL.revokeObjectURL(it.url)
+  pending.value.splice(i, 1)
+}
+
+function clearPending() {
+  for (const it of pending.value) {
+    if (it.kind === 'file' && it.url) URL.revokeObjectURL(it.url)
+  }
+  pending.value = []
+}
+
+// 切频道时清空待发区：附件是对着当前频道挂的，带到别的频道容易误发。
+watch(
+  () => store.activeChannel,
+  () => clearPending(),
+)
+
+const canSend = computed(
+  () => channelReachable.value && (!!draft.value.trim() || pending.value.length > 0),
+)
+
+/** 发送：文本 + 待发附件一起发到当前频道（文件夹此时才打包 zip）。 */
+async function send() {
+  if (!canSend.value) return
+  const text = draft.value.trim()
+  if (text) store.sendChat(text)
   draft.value = ''
+  const items = pending.value
+  if (items.length === 0) return
+  pending.value = []
+  const files: File[] = []
+  const folders: { name: string; entries: ZipEntry[] }[] = []
+  for (const it of items) {
+    if (it.kind === 'file') {
+      files.push(it.file)
+      if (it.url) URL.revokeObjectURL(it.url)
+    } else {
+      folders.push({ name: it.name, entries: it.entries })
+    }
+  }
+  const target = store.activeChannel === 'all' ? 'all' : store.activeChannel
+  await store.dispatchPayload({ files, folders }, 'lazy', target)
 }
 
 function pickFile() {
   fileInput.value?.click()
 }
 
-/** 懒发送：挂共享，对方在接收页下载；scope 跟随当前频道（私聊=单播，群聊=广播）。 */
-function shareToChannel(files: File[]) {
-  const target = store.activeChannel === 'all' ? 'all' : store.activeChannel
-  void store.shareFiles(files, target)
-}
-
 function onFilePicked(ev: Event) {
   const input = ev.target as HTMLInputElement
   if (!input.files?.length) return
-  shareToChannel([...input.files])
+  queueFiles([...input.files])
   input.value = ''
 }
 
@@ -89,7 +142,7 @@ function pastedFiles(dt: DataTransfer): File[] {
   return out
 }
 
-/** 粘贴文件/截图**立即发送**（不需要再按回车）；纯文本仍走输入框默认粘贴。 */
+/** 粘贴文件/截图：挂到待发区等确认（回车/发送键），防误发；纯文本仍走输入框默认粘贴。 */
 function onPaste(ev: ClipboardEvent) {
   const dt = ev.clipboardData
   if (!dt) return
@@ -100,13 +153,14 @@ function onPaste(ev: ClipboardEvent) {
     store.lastError = '对方不可达，暂不能发送文件'
     return
   }
-  shareToChannel(files)
+  queueFiles(files)
 }
 
 onMounted(() => window.addEventListener('paste', onPaste))
 onUnmounted(() => {
   window.removeEventListener('paste', onPaste)
   stopRecord(true)
+  clearPending()
 })
 
 // —— 拖拽发送（文件 / 文件夹，文件夹自动打包 zip）——
@@ -134,8 +188,10 @@ async function onDrop(ev: DragEvent) {
   }
   const payload = await collectDropped(ev.dataTransfer)
   if (payload.files.length === 0 && payload.folders.length === 0) return
-  const target = store.activeChannel === 'all' ? 'all' : store.activeChannel
-  void store.dispatchPayload(payload, 'lazy', target)
+  queueFiles(payload.files)
+  for (const folder of payload.folders) {
+    pending.value.push({ kind: 'folder', name: folder.name, entries: folder.entries })
+  }
 }
 
 // —— 图片灯箱 ——
@@ -496,6 +552,22 @@ function gomokuEntry() {
         </div>
       </div>
 
+      <!-- 待发附件（粘贴/选择/拖入的文件，确认后才发送） -->
+      <div v-if="pending.length" class="attach">
+        <div v-for="(p, i) in pending" :key="i" class="attach-item">
+          <img v-if="p.kind === 'file' && p.url" :src="p.url" alt="" />
+          <AppIcon v-else :name="p.kind === 'folder' ? 'folder' : 'file'" :size="16" />
+          <span class="aname">{{ p.kind === 'file' ? p.file.name : `${p.name}/` }}</span>
+          <span class="asize">
+            {{ p.kind === 'file' ? fmtBytes(p.file.size) : `${p.entries.length} 个文件` }}
+          </span>
+          <button class="arm" title="移除" @click="removePending(i)">
+            <AppIcon name="x" :size="12" />
+          </button>
+        </div>
+        <span class="ahint">回车或点「发送」发出，切换频道会清空</span>
+      </div>
+
       <div class="composer">
         <button
           v-if="canRecord"
@@ -511,7 +583,7 @@ function gomokuEntry() {
         </button>
         <button
           class="ghost clip"
-          title="发送文件（懒发送，对方在接收页下载；也可粘贴或拖拽文件/文件夹）"
+          title="添加文件（也可粘贴或拖入文件/文件夹），确认后发送"
           :disabled="!channelReachable"
           @click="pickFile"
         >
@@ -523,15 +595,18 @@ function gomokuEntry() {
           :placeholder="
             recording
               ? `录音中 ${fmtDur(recordMs)}（松开发送）…`
-              : channelReachable
-                ? '输入消息，回车发送；文件可粘贴或拖入…'
-                : '对方不可达，暂不能发送'
+              : pending.length
+                ? '附件已就绪，回车发送；可继续补充文字…'
+                : channelReachable
+                  ? '输入消息，回车发送；文件可粘贴或拖入…'
+                  : '对方不可达，暂不能发送'
           "
           :disabled="!channelReachable"
           @keyup.enter="send"
         />
-        <button class="primary" :disabled="!draft.trim() || !channelReachable" @click="send">
+        <button class="primary" :disabled="!canSend" @click="send">
           <AppIcon name="send" :size="15" /> 发送
+          <i v-if="pending.length" class="acount">{{ pending.length }}</i>
         </button>
       </div>
 
@@ -541,8 +616,8 @@ function gomokuEntry() {
       <!-- 拖拽遮罩 -->
       <div v-if="dragging" class="dropmask">
         <AppIcon name="upload" :size="40" />
-        <p>松开即发送到「{{ channelName }}」</p>
-        <span>支持多文件与文件夹（自动打包 zip）</span>
+        <p>松开挂到「{{ channelName }}」的待发区</p>
+        <span>支持多文件与文件夹（发送时自动打包 zip），确认后发送</span>
       </div>
     </div>
 
@@ -1057,12 +1132,94 @@ function gomokuEntry() {
   color: var(--accent);
 }
 
+/* —— 待发附件条 —— */
+.attach {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 10px 24px 0;
+  background: var(--panel);
+  border-top: 1px solid var(--border);
+}
+
+.attach-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+  border-radius: var(--radius-pill);
+  padding: 5px 7px 5px 9px;
+  font-size: 12.5px;
+  max-width: 260px;
+}
+
+.attach-item img {
+  width: 24px;
+  height: 24px;
+  border-radius: 6px;
+  object-fit: cover;
+  flex: none;
+}
+
+.aname {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 600;
+}
+
+.asize {
+  color: var(--muted);
+  font-size: 11px;
+  flex: none;
+}
+
+.arm {
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  padding: 3px;
+  border-radius: 50%;
+  flex: none;
+  display: grid;
+  place-items: center;
+}
+
+.arm:hover {
+  background: var(--danger);
+  color: #fff;
+}
+
+.ahint {
+  font-size: 11px;
+  color: var(--faint);
+}
+
+.acount {
+  font-style: normal;
+  background: rgba(255, 255, 255, 0.28);
+  border-radius: var(--radius-pill);
+  font-size: 10.5px;
+  font-weight: 700;
+  line-height: 1;
+  padding: 2px 6px;
+}
+
 .composer {
   display: flex;
   gap: 10px;
   padding: 14px 24px;
   border-top: 1px solid var(--border);
   background: var(--panel);
+}
+
+/* 附件条已带顶边线，紧邻的输入行不再重复画一条。 */
+.attach + .composer {
+  border-top: none;
+  padding-top: 10px;
 }
 
 .composer input {
