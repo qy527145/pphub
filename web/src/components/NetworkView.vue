@@ -493,12 +493,12 @@ function stateLabel(m: { state: string; transport: string }): string {
               v-model="peerCode"
               placeholder="输入对方短码"
               inputmode="numeric"
-              maxlength="8"
+              maxlength="9"
               @keyup.enter="connectByCode"
             />
             <button
               class="primary"
-              :disabled="!/^\d{4,8}$/.test(peerCode.trim()) || store.status === 'connecting'"
+              :disabled="!/^\d{4,9}$/.test(peerCode.trim()) || store.status === 'connecting'"
               @click="connectByCode"
             >
               {{ store.status === 'connecting' ? '连接中…' : '连接' }}

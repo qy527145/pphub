@@ -28,6 +28,15 @@ export interface Profile {
   nick: string
   avatar: Avatar
   rev: number
+  /**
+   * 本端能否解码中继路径的屏幕画面（WebCodecs `VideoDecoder`）。
+   *
+   * 通告它是为了让**发起端**在开采集器之前就知道对方看不看得了：中继路径的
+   * 屏幕共享要求接收端能解码，而非安全上下文（明文 http）下 WebCodecs 不可用。
+   * 缺省视为 true——老版本不带此字段，按「能解码」处理可保持既有行为，
+   * 真解不了时接收端仍有兜底提示。
+   */
+  screenDecode?: boolean
 }
 
 /**

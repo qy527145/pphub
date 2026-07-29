@@ -176,27 +176,22 @@ async function main() {
     ok('聊天双向、96KiB 文件由非安全端 → 安全端完整送达')
 
     // —— 5. 安全端 → 非安全端共享屏幕 ——
-    // 已知缺口：预检只看**本端**能否编码，对端的解码能力协议里从未通告，
-    // 所以这里会误判为可达。真正的兜底在接收端——它会拒绝并给出原因，
-    // 不留黑屏条目。断言按**实际行为**写，缺口在 README 矩阵里如实标注。
+    // 中继路径要求**接收端**能解码，非安全端没有 WebCodecs。对端解码能力经名片
+    // 通告（Profile.screenDecode），故发起端在开采集器之前就该判定为不可达。
     const reach = await s.evaluate(() => window.__pphub.screenReach)
-    if (reach.total !== 1) throw new Error(`对端数应为 1：${JSON.stringify(reach)}`)
+    if (reach.total !== 1 || reach.ok !== 0) {
+      throw new Error(`预检应判定唯一对端不可达：${JSON.stringify(reach)}`)
+    }
+    ok('发起端预检如实判定：对端解不了码，可达 0/1（对端能力经名片通告）')
+
     const before = await i.evaluate(() => window.__pphub.shareList.length)
+    // 不吞异常：startShare 返回 false 或抛错都要看得见，否则这条断言会空过。
     const started = await s.evaluate(() => window.__pphub.startShare('all'))
     await s.waitForTimeout(2500)
     const after = await i.evaluate(() => window.__pphub.shareList.length)
-
+    if (started) throw new Error('一个对端都送不到，不该进入「共享中」状态')
     if (after > before) throw new Error(`非安全端多出了收不到画面的共享条目：${after - before} 个`)
-    ok('接收端兜底生效：非安全端拒绝 codec 共享，不留永远黑屏的条目')
-
-    if (reach.ok === 1 && started) {
-      ok('（已知缺口）发起端预检误判可达 1/1 并进入共享——对端解码能力未在协议中通告')
-    } else {
-      throw new Error(
-        `预检行为与预期的已知缺口不符：reach=${JSON.stringify(reach)} started=${started}；` +
-          '若已修复请更新本断言与 README 矩阵',
-      )
-    }
+    ok('安全端拒绝空转共享，非安全端也没有出现永远黑屏的条目')
 
     // —— 6. 非安全端发起共享：连采集都没有 ——
     if (ic.display) throw new Error('非安全端不该有 getDisplayMedia')

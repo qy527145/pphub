@@ -48,6 +48,11 @@ pub enum ClientMsg {
         room: String,
         peer_id: String,
         nick: Option<String>,
+        /// 以「短码监听者」身份加入：声明对该房间的所有权。
+        /// 已有其他监听者占用时服务端拒绝（撞码保护）；
+        /// 普通拨入方不带此标志，可自由进入等待。
+        #[serde(default)]
+        listen: bool,
     },
     /// 主动离开房间。
     Leave,
@@ -70,9 +75,11 @@ pub const PEER_ID_MAX: usize = 32;
 #[serde(tag = "t", rename_all = "kebab-case", rename_all_fields = "camelCase")]
 pub enum ServerMsg {
     /// 加入成功，附带房间内已有成员列表。
+    /// `code_len` 为按当前在线规模推荐的短码长度（动态防撞码）。
     Joined {
         peer_id: String,
         peers: Vec<PeerInfo>,
+        code_len: u8,
     },
     /// 有新成员加入。
     PeerJoin { peer: PeerInfo },

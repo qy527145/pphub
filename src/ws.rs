@@ -87,6 +87,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 room,
                 peer_id,
                 nick,
+                listen,
             } => {
                 if me.is_some() {
                     let _ = tx
@@ -94,13 +95,14 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         .await;
                     continue;
                 }
-                match state.rooms.join(&room, &peer_id, nick, tx.clone()) {
+                match state.rooms.join(&room, &peer_id, nick, listen, tx.clone()) {
                     Ok(peers) => {
                         let _ = tx
                             .send(
                                 ServerMsg::Joined {
                                     peer_id: peer_id.clone(),
                                     peers,
+                                    code_len: state.rooms.recommended_code_len(),
                                 }
                                 .into(),
                             )
@@ -116,6 +118,13 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     Err(JoinError::Duplicate) => {
                         let _ = tx
                             .send(ServerMsg::error("duplicate-peer", "该 ID 已在房间中").into())
+                            .await;
+                    }
+                    Err(JoinError::CodeTaken) => {
+                        let _ = tx
+                            .send(
+                                ServerMsg::error("code-taken", "该短码已被其他设备监听").into(),
+                            )
                             .await;
                     }
                 }

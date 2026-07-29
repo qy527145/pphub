@@ -105,6 +105,28 @@ export interface ScreenTargets {
   blocked: { peerId: string; reason: string }[]
 }
 
+/** join 的服务端应答。 */
+export interface JoinAck {
+  /** 房间内已有成员数（不含自己）。 */
+  peerCount: number
+  /** 服务端按当前在线规模建议的短码长度。 */
+  codeLen: number
+}
+
+/** join 被服务端拒绝（房满、短码被占等），`code` 为服务端错误码。 */
+export class JoinRejected extends Error {
+  constructor(
+    readonly code: string,
+    msg: string,
+  ) {
+    super(msg)
+    this.name = 'JoinRejected'
+  }
+}
+
+/** 会终结 join 流程的服务端错误码；其余错误与 join 无关，继续等待。 */
+const JOIN_ERRORS = new Set(['code-taken', 'room-full', 'duplicate-peer', 'already-joined'])
+
 export class Mesh extends Emitter<MeshEvents> {
   myId = ''
   room = ''
@@ -113,6 +135,11 @@ export class Mesh extends Emitter<MeshEvents> {
   private readonly signaling: Signaling
   private readonly peers = new Map<string, Peer>()
   private readonly nicks = new Map<string, string | undefined>()
+  /**
+   * 对端通告的「能否解码中继屏幕画面」。名片到达前无记录，此时按能解码处理
+   * （见 Profile.screenDecode）。
+   */
+  private readonly remoteScreenDecode = new Map<string, boolean>()
   private iceServers: RTCIceServer[] = []
 
   // 强制发送（推）登记表（按传输 id 索引；id 全局随机，跨 peer 不冲突）。
@@ -182,8 +209,11 @@ export class Mesh extends Emitter<MeshEvents> {
     })
   }
 
-  /** 加入房间：连接 → 领取 ICE 凭证 → 发送 join。 */
-  async join(room: string, profile: Profile): Promise<void> {
+  /**
+   * 加入房间：连接 → 领取 ICE 凭证 → 发送 join → 等待服务端应答。
+   * `listen` 表示以短码监听者身份声明房间所有权（撞码时服务端拒绝）。
+   */
+  async join(room: string, profile: Profile, listen = false): Promise<JoinAck> {
     this.room = room
     this.profile = profile
     this.myId = genId()
@@ -195,7 +225,28 @@ export class Mesh extends Emitter<MeshEvents> {
     // 内置 STUN/TURN 排在最前：它与本页同主机，必然可达。
     this.iceServers = [...builtinIceServers(builtin), ...iceServers.map(toRtcIceServer)]
 
-    this.signaling.send({ t: 'join', room, peerId: this.myId, nick: profile.nick })
+    const ack = this.waitJoined()
+    this.signaling.send({ t: 'join', room, peerId: this.myId, nick: profile.nick, listen })
+    return ack
+  }
+
+  /** 等待 join 应答：joined 兑现；join 阶段的服务端拒绝则以 JoinRejected 驳回。 */
+  private waitJoined(): Promise<JoinAck> {
+    return new Promise((resolve, reject) => {
+      const offJoined = this.signaling.on('joined', ({ peers, codeLen }) => {
+        cleanup()
+        resolve({ peerCount: peers.length, codeLen })
+      })
+      const offError = this.signaling.on('error', (e) => {
+        if (!JOIN_ERRORS.has(e.code)) return
+        cleanup()
+        reject(new JoinRejected(e.code, e.msg))
+      })
+      const cleanup = () => {
+        offJoined()
+        offError()
+      }
+    })
   }
 
   /** 群聊：向所有对端广播。 */
@@ -211,7 +262,16 @@ export class Mesh extends Emitter<MeshEvents> {
   /** 更新并广播本端名片。 */
   setProfile(profile: Profile): void {
     this.profile = profile
-    this.broadcast({ kind: 'profile', profile })
+    this.broadcast({ kind: 'profile', profile: this.outgoingProfile() })
+  }
+
+  /**
+   * 出站名片：在发送口统一注入本端解码能力，而不是让调用方逐处记得填。
+   * 这是运行环境属性，UI 层不必关心；实时探测也避免了持久化到 localStorage
+   * 后带着过期值跑到别的环境去。
+   */
+  private outgoingProfile(): Profile {
+    return { ...this.profile, screenDecode: canDecodeScreen() }
   }
 
   /** 向所有对端广播任意 control 消息（通道未就绪的对端静默跳过）。 */
@@ -253,16 +313,33 @@ export class Mesh extends Emitter<MeshEvents> {
       const who = this.nicks.get(peer.remoteId) ?? peer.remoteId
       if (peer.connectionState !== 'connected') {
         out.blocked.push({ peerId: peer.remoteId, reason: `${who} 尚未连接` })
-      } else if (peer.transport === 'webrtc' || canEncodeScreen()) {
+      } else if (peer.transport === 'webrtc') {
+        // 原生媒体轨，对端不需要 WebCodecs。
         out.ok.push(peer.remoteId)
-      } else {
+      } else if (!canEncodeScreen()) {
         out.blocked.push({
           peerId: peer.remoteId,
           reason: `与 ${who} 走服务器中继，该路径需要 WebCodecs 编码画面，当前浏览器不支持`,
         })
+      } else if (!this.canRemoteDecode(peer.remoteId)) {
+        // 本端编得了，但对端解不了——中继路径要求接收端也有 WebCodecs。
+        out.blocked.push({
+          peerId: peer.remoteId,
+          reason: `与 ${who} 走服务器中继，该路径需要对方浏览器支持 WebCodecs 解码，但对方不支持（常见于以明文 http 访问）`,
+        })
+      } else {
+        out.ok.push(peer.remoteId)
       }
     }
     return out
+  }
+
+  /**
+   * 对端能否解码中继屏幕画面。名片未到达时返回 true：老版本不通告此字段，
+   * 保持既有行为；真解不了时接收端仍会给出提示。
+   */
+  private canRemoteDecode(peerId: string): boolean {
+    return this.remoteScreenDecode.get(peerId) ?? true
   }
 
   /**
@@ -333,6 +410,17 @@ export class Mesh extends Emitter<MeshEvents> {
       this.emit('error', {
         code: 'screen-codec-unsupported',
         msg: `与 ${who} 的连接走服务器中继，该路径需要 WebCodecs 编码画面，当前浏览器不支持`,
+      })
+      return
+    }
+
+    // 对端解不了码就别发了：白烧一路编码，对面只会看到一条错误提示。
+    // 预检已拦过一次，这里兜住「共享中途才降级到中继」的情形。
+    if (!this.canRemoteDecode(peer.remoteId)) {
+      const who = this.nicks.get(peer.remoteId) ?? peer.remoteId
+      this.emit('error', {
+        code: 'screen-codec-unsupported',
+        msg: `与 ${who} 的连接走服务器中继，但对方浏览器不支持 WebCodecs 解码（常见于以明文 http 访问），TA 看不到你的画面`,
       })
       return
     }
@@ -606,6 +694,7 @@ export class Mesh extends Emitter<MeshEvents> {
     for (const peer of this.peers.values()) peer.close()
     this.peers.clear()
     this.nicks.clear()
+    this.remoteScreenDecode.clear()
     this.signaling.send({ t: 'leave' })
     this.signaling.close()
   }
@@ -648,7 +737,7 @@ export class Mesh extends Emitter<MeshEvents> {
     })
     peer.on('channelopen', () => {
       // 通道就绪：互换名片、邻接表、共享目录；迟到者补挂屏幕。
-      peer.sendControl({ kind: 'profile', profile: this.profile })
+      peer.sendControl({ kind: 'profile', profile: this.outgoingProfile() })
       peer.sendControl({ kind: 'link-state', links: this.linkStates() })
       const visible = [...this.shares.values()]
         .filter((e) => e.local && e.meta.scope === 'all')
@@ -678,12 +767,24 @@ export class Mesh extends Emitter<MeshEvents> {
       case 'chat':
         this.emit('chat', { from, text: msg.text, ts: msg.ts, scope: msg.scope ?? 'all' })
         break
-      case 'profile':
+      case 'profile': {
         this.nicks.set(from, msg.profile.nick)
+        // 名片通常在 channelopen 之后才到，那时 attachScreen 可能已因「未知能力
+        // 默认可解码」而挂过。若通告说解不了，撤掉这个白发的观众。
+        const before = this.canRemoteDecode(from)
+        this.remoteScreenDecode.set(from, msg.profile.screenDecode ?? true)
+        if (before && !this.canRemoteDecode(from) && this.codecViewers.delete(from)) {
+          const who = msg.profile.nick || from
+          this.emit('error', {
+            code: 'screen-codec-unsupported',
+            msg: `与 ${who} 的连接走服务器中继，但对方浏览器不支持 WebCodecs 解码（常见于以明文 http 访问），TA 看不到你的画面`,
+          })
+        }
         this.emit('peer-profile', { peerId: from, profile: msg.profile })
         break
+      }
       case 'profile-req':
-        this.sendTo(from, { kind: 'profile', profile: this.profile })
+        this.sendTo(from, { kind: 'profile', profile: this.outgoingProfile() })
         break
       case 'link-state':
         this.emit('peer-links', { peerId: from, links: msg.links })
@@ -891,6 +992,7 @@ export class Mesh extends Emitter<MeshEvents> {
     peer.close()
     this.peers.delete(remoteId)
     this.nicks.delete(remoteId)
+    this.remoteScreenDecode.delete(remoteId)
     this.screenSenders.delete(remoteId)
     this.codecViewers.delete(remoteId)
     this.dropScreenDecoder(remoteId)

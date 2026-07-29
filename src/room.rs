@@ -36,6 +36,9 @@ struct PeerSlot {
 #[derive(Default)]
 struct Room {
     peers: HashMap<String, PeerSlot>,
+    /// 短码监听者（房主）的 peerId。监听者加入时声明所有权，
+    /// 第二个监听者到来即为撞码，予以拒绝。
+    owner: Option<String>,
 }
 
 /// 加入失败原因。
@@ -45,6 +48,8 @@ pub enum JoinError {
     Full,
     /// 该 peerId 已在房间内。
     Duplicate,
+    /// 短码已被其他监听者占用（生日碰撞）。
+    CodeTaken,
 }
 
 /// 所有房间的注册表。
@@ -64,11 +69,15 @@ impl Rooms {
 
     /// 加入房间。成功时返回房间内**已有**成员列表（不含自己），
     /// 并向已有成员广播 `peer-join`。
+    ///
+    /// `listen` 表示以短码监听者身份声明房间所有权：房间已有
+    /// 其他监听者时拒绝（撞码保护）；普通拨入方不受此限。
     pub fn join(
         &self,
         room: &str,
         peer_id: &str,
         nick: Option<String>,
+        listen: bool,
         tx: mpsc::Sender<Out>,
     ) -> Result<Vec<PeerInfo>, JoinError> {
         let mut rooms = self.inner.lock().unwrap();
@@ -77,8 +86,14 @@ impl Rooms {
         if room.peers.contains_key(peer_id) {
             return Err(JoinError::Duplicate);
         }
+        if listen && room.owner.is_some() {
+            return Err(JoinError::CodeTaken);
+        }
         if room.peers.len() >= self.max_peers {
             return Err(JoinError::Full);
+        }
+        if listen {
+            room.owner = Some(peer_id.to_string());
         }
 
         let existing: Vec<PeerInfo> = room
@@ -132,6 +147,20 @@ impl Rooms {
         Some(rooms.get(room)?.peers.get(peer_id)?.tx.clone())
     }
 
+    /// 按当前在线规模推荐的短码长度：随房间数增长而加长，
+    /// 保证新监听者随机取码的撞码概率 < 10⁻⁴（10^len ≥ 10⁴ × 房间数）。
+    /// 6 位起步、9 位封顶（可覆盖十万级并发监听）。
+    pub fn recommended_code_len(&self) -> u8 {
+        let rooms = self.inner.lock().unwrap().len();
+        let mut len = 6u8;
+        let mut cap = 100usize;
+        while rooms >= cap && len < 9 {
+            len += 1;
+            cap *= 10;
+        }
+        len
+    }
+
     /// 离开房间；向其余成员广播 `peer-left`，房间空则销毁。
     pub fn leave(&self, room: &str, peer_id: &str) {
         let mut rooms = self.inner.lock().unwrap();
@@ -140,6 +169,9 @@ impl Rooms {
         };
         if r.peers.remove(peer_id).is_none() {
             return;
+        }
+        if r.owner.as_deref() == Some(peer_id) {
+            r.owner = None;
         }
         let msg = ServerMsg::PeerLeft {
             peer_id: peer_id.to_string(),

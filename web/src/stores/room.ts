@@ -2,7 +2,7 @@ import { computed, reactive, ref, shallowReactive, shallowRef } from 'vue'
 import { defineStore } from 'pinia'
 
 import { peerColor } from '@/core/draw'
-import { Mesh } from '@/core/mesh'
+import { JoinRejected, Mesh } from '@/core/mesh'
 import type { DrawMessage } from '@/core/mesh'
 import type { PeerTransport } from '@/core/peer'
 import type {
@@ -124,7 +124,11 @@ export interface ShareItem {
 const LS_ALLOW_INCOMING = 'pphub.allowIncoming'
 const LS_DEVICE_NAME = 'pphub.deviceName'
 const SS_MY_CODE = 'pphub.myCode'
+const SS_CODE_LEN = 'pphub.codeLen'
 const SS_CURRENT_ROOM = 'pphub.currentRoom'
+
+const CODE_LEN_MIN = 6
+const CODE_LEN_MAX = 9
 
 function defaultSignalingUrl(): string {
   const fromEnv = import.meta.env.VITE_SIGNALING_URL
@@ -138,19 +142,44 @@ function defaultSignalingUrl(): string {
   return `${proto}://${location.host}${dir}ws`
 }
 
-/** 6 位数字临时短码（会话内稳定，刷新不变、关标签页失效）。 */
+/**
+ * 数字临时短码（会话内稳定，刷新不变、关标签页失效）。
+ * 长度 6 位起步，随服务端按在线规模下发的建议动态加长（防生日碰撞）。
+ */
 function ensureMyCode(): string {
   const saved = sessionStorage.getItem(SS_MY_CODE)
-  if (saved && /^\d{6}$/.test(saved)) return saved
+  if (saved && /^\d{6,9}$/.test(saved)) return saved
   return regenCode()
 }
 
-function regenCode(): string {
-  const buf = new Uint32Array(1)
-  crypto.getRandomValues(buf)
-  const code = String(buf[0] % 1_000_000).padStart(6, '0')
+/** 服务端建议的码长（随 joined 应答更新，会话内记忆）。 */
+function savedCodeLen(): number {
+  const n = Number(sessionStorage.getItem(SS_CODE_LEN))
+  return Number.isInteger(n) && n >= CODE_LEN_MIN && n <= CODE_LEN_MAX ? n : CODE_LEN_MIN
+}
+
+function noteCodeLen(len: number): void {
+  const clamped = Math.min(CODE_LEN_MAX, Math.max(CODE_LEN_MIN, Math.floor(len)))
+  sessionStorage.setItem(SS_CODE_LEN, String(clamped))
+}
+
+function regenCode(len = savedCodeLen()): string {
+  const code = randomDigits(len)
   sessionStorage.setItem(SS_MY_CODE, code)
   return code
+}
+
+/** 密码学随机的数字串；按字节拒绝采样（≥250 丢弃）消除模偏差。 */
+function randomDigits(len: number): string {
+  const buf = new Uint8Array(len * 2)
+  let out = ''
+  while (out.length < len) {
+    crypto.getRandomValues(buf)
+    for (const b of buf) {
+      if (b < 250 && out.length < len) out += String(b % 10)
+    }
+  }
+  return out
 }
 
 /** 从 UA 推导默认设备名（如 “Mac · Chrome”）。 */
@@ -268,11 +297,15 @@ export const useRoomStore = defineStore('room', () => {
 
   /**
    * 屏幕共享可达性（供 UI 决定按钮是否可点）。与 mesh.screenTargets 同一套判据：
-   * 直连/TURN 的对端走原生媒体轨；降级为中继的对端要靠 WebCodecs 自编码。
+   * 直连/TURN 的对端走原生媒体轨，对方不需要 WebCodecs；降级为中继的对端则要求
+   * **本端能编码且对端能解码**（对端能力由名片 screenDecode 通告，缺省视为能解，
+   * 兼容不带该字段的旧版本）。
    */
   const screenReach = computed(() => {
     const ok = connectedPeers.value.filter(
-      (m) => m.transport !== 'relay' || capabilities.screenEncode,
+      (m) =>
+        m.transport !== 'relay' ||
+        (capabilities.screenEncode && (m.profile?.screenDecode ?? true)),
     ).length
     return { total: connectedPeers.value.length, ok }
   })
@@ -1098,30 +1131,58 @@ export const useRoomStore = defineStore('room', () => {
     sessionStorage.removeItem(SS_CURRENT_ROOM)
   }
 
-  /** 加入指定房间（短码房或口令房）。已在线则先离开。 */
-  async function joinRoom(roomName: string): Promise<boolean> {
+  /** joinRoom 的结果：成功时附带服务端应答，失败时附带服务端错误码。 */
+  type JoinOutcome =
+    | { ok: true; peerCount: number; codeLen: number }
+    | { ok: false; code?: string }
+
+  /**
+   * 加入指定房间（短码房或口令房）。已在线则先离开。
+   * `listen` 表示以短码监听者身份声明房间所有权（撞码时服务端拒绝）。
+   */
+  async function joinRoom(roomName: string, listen = false): Promise<JoinOutcome> {
     lastError.value = null
     if (mesh) teardown()
     status.value = 'connecting'
     room.value = roomName
     try {
       mesh = createMesh(defaultSignalingUrl())
-      await mesh.join(roomName, myProfile.value)
+      const ack = await mesh.join(roomName, myProfile.value, listen)
+      noteCodeLen(ack.codeLen)
       status.value = 'online'
       // 持久化当前房间信息，页面刷新后可恢复
       sessionStorage.setItem(SS_CURRENT_ROOM, roomName)
-      return true
+      return { ok: true, ...ack }
     } catch (err) {
-      lastError.value = String(err)
+      lastError.value = err instanceof Error ? err.message : String(err)
       teardown()
-      return false
+      return { ok: false, code: err instanceof JoinRejected ? err.code : undefined }
     }
   }
 
-  /** 打开「允许短码连我」时，进入自己短码的房间等待连入。 */
+  /**
+   * 打开「允许短码连我」时，进入自己短码的房间等待连入。
+   * 短码撞车（生日碰撞）时服务端拒绝监听（code-taken），换码重试即可；
+   * 若服务端按当前规模建议了更长的码且房里没人，主动升长换码。
+   */
   async function listen(): Promise<void> {
     if (status.value !== 'idle') return
-    await joinRoom(myCode.value)
+    let retries = 0
+    while (retries < 3) {
+      const res = await joinRoom(myCode.value, true)
+      if (res.ok) {
+        if (res.peerCount === 0 && myCode.value.length < res.codeLen) {
+          // 升长不计入重试次数：这是主动换码，不是冲突。
+          myCode.value = regenCode(res.codeLen)
+          continue
+        }
+        return
+      }
+      if (res.code !== 'code-taken') return
+      retries++
+      myCode.value = regenCode()
+    }
+    lastError.value = '短码持续冲突，请稍后再试'
   }
 
   /** 用对方短码/口令直连。 */
@@ -1132,7 +1193,7 @@ export const useRoomStore = defineStore('room', () => {
       lastError.value = '这是你自己的短码，请输入对方的短码'
       return false
     }
-    return joinRoom(target)
+    return (await joinRoom(target)).ok
   }
 
   /** 断开并（若开启）回到短码监听。 */
@@ -1209,10 +1270,15 @@ export const useRoomStore = defineStore('room', () => {
       }
     }
     // 尝试恢复刷新前的房间。刷新前若在监听，存的就是自己的短码房，
-    // 直接 joinRoom 恢复监听；connectTo 的自码校验只针对手动输入。
+    // 走 listen 以监听者身份重新声明所有权；connectTo 的自码校验只针对手动输入。
     const savedRoom = sessionStorage.getItem(SS_CURRENT_ROOM)
     if (savedRoom && savedRoom.trim()) {
-      await joinRoom(savedRoom.trim())
+      const target = savedRoom.trim()
+      if (target === myCode.value) {
+        await listen()
+      } else {
+        await joinRoom(target)
+      }
       return
     }
     if (allowIncoming.value) await listen()

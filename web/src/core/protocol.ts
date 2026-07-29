@@ -33,14 +33,14 @@ export interface BuiltinIce {
 
 /** 客户端 → 服务端。 */
 export type ClientMsg =
-  | { t: 'join'; room: string; peerId: string; nick?: string | null }
+  | { t: 'join'; room: string; peerId: string; nick?: string | null; listen?: boolean }
   | { t: 'leave' }
   | { t: 'signal'; to: string; data: SignalData }
   | { t: 'turn-creds' }
 
 /** 服务端 → 客户端。 */
 export type ServerMsg =
-  | { t: 'joined'; peerId: string; peers: PeerInfo[] }
+  | { t: 'joined'; peerId: string; peers: PeerInfo[]; codeLen?: number }
   | { t: 'peer-join'; peer: PeerInfo }
   | { t: 'peer-left'; peerId: string }
   | { t: 'signal'; from: string; data: SignalData }

@@ -25,7 +25,7 @@ export interface TurnCredsPayload {
 
 type SignalingEvents = {
   state: SignalingState
-  joined: { peerId: string; peers: PeerInfo[] }
+  joined: { peerId: string; peers: PeerInfo[]; codeLen: number }
   'peer-join': PeerInfo
   'peer-left': string
   signal: { from: string; data: SignalData }
@@ -112,7 +112,7 @@ export class Signaling extends Emitter<SignalingEvents> {
   private dispatch(msg: ServerMsg): void {
     switch (msg.t) {
       case 'joined':
-        this.emit('joined', { peerId: msg.peerId, peers: msg.peers })
+        this.emit('joined', { peerId: msg.peerId, peers: msg.peers, codeLen: msg.codeLen ?? 6 })
         break
       case 'peer-join':
         this.emit('peer-join', msg.peer)
