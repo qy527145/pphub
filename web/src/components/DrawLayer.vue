@@ -278,7 +278,7 @@ function deleteSelection(): void {
 // 旋转/缩放都以图片中心为锚点；角度与距离在 aspect 折算空间计算，
 // 与像素空间的渲染旋转保持角度一致。
 interface XformState {
-  type: 'move' | 'scale' | 'rotate'
+  type: 'move' | 'scale' | 'scale-x' | 'scale-y' | 'rotate'
   id: string
   startX: number
   startY: number
@@ -350,7 +350,7 @@ function beginXform(img: WbImage, type: XformState['type'], p: { x: number; y: n
   }
 }
 
-function startHandle(ev: PointerEvent, type: 'scale' | 'rotate'): void {
+function startHandle(ev: PointerEvent, type: Exclude<XformState['type'], 'move'>): void {
   const img = activeImage.value
   const p = norm(ev)
   if (!img || !p) return
@@ -374,6 +374,39 @@ function applyXform(p: { x: number; y: number }): void {
   const a = aspect.value
   const cx = o.x + o.width / 2
   const cy = o.y + o.height / 2
+
+  // 单轴拉伸：在图片本地坐标系里比较指针到中心的分量（旋转感知）
+  if (xform.type === 'scale-x' || xform.type === 'scale-y') {
+    const s = toLocalFrac({ x: xform.startX, y: xform.startY }, o)
+    const c = toLocalFrac(p, o)
+    if (xform.type === 'scale-x') {
+      const d0 = Math.abs(s.fx - 0.5)
+      if (d0 < 1e-4) return
+      const k = Math.max(0.15, Math.abs(c.fx - 0.5) / d0)
+      const w = o.width * k
+      store.updateImage(props.board, xform.id, {
+        x: cx - w / 2,
+        y: o.y,
+        width: w,
+        height: o.height,
+        rotation: o.rotation,
+      })
+    } else {
+      const d0 = Math.abs(s.fy - 0.5)
+      if (d0 < 1e-4) return
+      const k = Math.max(0.15, Math.abs(c.fy - 0.5) / d0)
+      const h = o.height * k
+      store.updateImage(props.board, xform.id, {
+        x: o.x,
+        y: cy - h / 2,
+        width: o.width,
+        height: h,
+        rotation: o.rotation,
+      })
+    }
+    return
+  }
+
   const dx = p.x - cx
   const dy = (p.y - cy) * a
   const sdx = xform.startX - cx
@@ -437,7 +470,10 @@ function cancelCrop(): void {
 }
 
 /** 把层归一化坐标换算到图片本地 [0,1] 分数坐标（旋转感知）。 */
-function toLocalFrac(p: { x: number; y: number }, img: WbImage): { fx: number; fy: number } {
+function toLocalFrac(
+  p: { x: number; y: number },
+  img: { x: number; y: number; width: number; height: number; rotation?: number },
+): { fx: number; fy: number } {
   const a = aspect.value
   const cx = img.x + img.width / 2
   const cyS = (img.y + img.height / 2) * a
@@ -679,12 +715,15 @@ function insertImageFile(file: Blob, x: number, y: number, centered = false): vo
       return
     }
 
+    // 目标显示尺寸：w/h 是归一化值，像素等比要求 h 除以层宽高比折算，
+    // 否则非正方形画布上图片会被拉伸
+    const a = aspect.value || 1
     const ratio = cw / ch
     let w = 0.3
-    let h = w / ratio
+    let h = w / (ratio * a)
     if (h > 0.3) {
       h = 0.3
-      w = h * ratio
+      w = h * ratio * a
     }
     const px = centered ? Math.min(Math.max(x - w / 2, 0), Math.max(0, 1 - w)) : x
     const py = centered ? Math.min(Math.max(y - h / 2, 0), Math.max(0, 1 - h)) : y
@@ -985,7 +1024,9 @@ function getArrowPoints(): string {
       <template v-if="!cropMode">
         <span class="rot-line" />
         <span class="handle rot" title="旋转" @pointerdown.stop.prevent="startHandle($event, 'rotate')" />
-        <span class="handle scale" title="缩放" @pointerdown.stop.prevent="startHandle($event, 'scale')" />
+        <span class="handle scale" title="等比缩放" @pointerdown.stop.prevent="startHandle($event, 'scale')" />
+        <span class="handle sx" title="横向拉伸" @pointerdown.stop.prevent="startHandle($event, 'scale-x')" />
+        <span class="handle sy" title="纵向拉伸" @pointerdown.stop.prevent="startHandle($event, 'scale-y')" />
         <div class="xf-actions">
           <button class="xf-btn" title="裁剪" @pointerdown.stop @click.stop="startCrop">
             <AppIcon name="crop" :size="13" />
@@ -1137,6 +1178,22 @@ function getArrowPoints(): string {
   right: -7px;
   bottom: -7px;
   cursor: nwse-resize;
+}
+
+.img-xform .handle.sx {
+  right: -7px;
+  top: 50%;
+  transform: translateY(-50%);
+  border-radius: 3px;
+  cursor: ew-resize;
+}
+
+.img-xform .handle.sy {
+  bottom: -7px;
+  left: 50%;
+  transform: translateX(-50%);
+  border-radius: 3px;
+  cursor: ns-resize;
 }
 
 .img-xform .xf-actions {
