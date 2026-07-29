@@ -11,14 +11,16 @@ src/
     emitter.ts        极简类型化事件发射器
     signaling.ts      信令 WebSocket 客户端（自动重连 + 领取 TURN 凭证）
     peer.ts           单个 RTCPeerConnection：完美协商 / trickle ICE / ICE 重启 / SAS / 媒体轨
-    relay-transport.ts WS 应用层中继：ECDH+AES-GCM 加密与多通道复用（control/file/swarm/screen）
+    relay-transport.ts WS 应用层中继：X25519+ChaCha20-Poly1305 加密与多通道复用（control/file/swarm/screen）
     mesh.ts           房间会话：编排信令与多个 Peer、按通路分流屏幕共享
     screencodec.ts    中继路径的屏幕共享：WebCodecs 编解码 + 分片线格式
     channels.ts       数据通道参数与背压工具（文件传输复用）
     messages.ts       control 通道上的应用层消息（判别式联合：聊天/文件/屏幕/绘制/指针）
     filetransfer.ts   文件收发（分块 + 背压 + 取消）
     draw.ts           白板/批注共用：笔画渲染、坐标归一化、成员配色
-    security.ts       SAS 短认证串：从双方 DTLS 指纹派生 emoji/数字供带外核对
+    security.ts       SAS 短认证串：从双方指纹派生 emoji/数字供带外核对
+    crypto.ts         纯 JS 加密原语（X25519 / HKDF / ChaCha20-Poly1305 / SHA-256），
+                      不依赖 crypto.subtle，故明文 http 下中继与 SAS 照常可用
     capabilities.ts   运行环境能力探测（安全上下文 / 屏幕共享 / WebCodecs / 文件系统等）
   stores/
     room.ts           Pinia：把 Mesh 事件映射为响应式 UI 状态
@@ -61,9 +63,10 @@ Vite 已把 `/ws` 代理到 `ws://localhost:8848`，因此前端始终用同源 
 与一体化部署一致；也可用 `.env` 里的 `VITE_SIGNALING_URL` 覆盖。
 
 > `localhost` 天然算「安全上下文」，开发时无需 https。经局域网 IP 明文访问时
-> `crypto.subtle`（SAS + WS 中继加密）、`getDisplayMedia`、WebCodecs、剪贴板 API
-> 会被浏览器禁用，进入网络页会显示一条黄色横幅说明受限项；`RTCPeerConnection`
-> 与数据通道本身不受影响，同网段直连、聊天、文件、白板都正常。
+> `crypto.subtle`、`getDisplayMedia`、WebCodecs、剪贴板 API 会被浏览器禁用，
+> 进入网络页会显示一条黄色横幅说明情况。实际受影响的只有屏幕共享：
+> `RTCPeerConnection`、WS 中继（加密改用纯 JS，见 `crypto.ts`）与 SAS 核验都照常，
+> 同网段直连、跨网段中继、聊天、文件、白板全部正常。
 
 ## 脚本
 
@@ -83,9 +86,25 @@ Vite 已把 `/ws` 代理到 `ws://localhost:8848`，因此前端始终用同源 
   （不加 `--stun-turn`，只监听 HTTP 端口），浏览器打开 `pphub:force:relay`
   跳过 WebRTC，验证中继下的 SAS 一致性、聊天、白板、文件、分块下载，以及
   WebCodecs 自编码的屏幕共享（含「对端解不了码时不留黑屏条目」的回归）
+- `node scripts/e2e-http-relay.mjs` —— **非安全上下文**下的中继 E2E：经本机局域网 IP
+  以明文 http 访问（`127.0.0.1` 不行，那算安全上下文），断言 `crypto.subtle` 确实缺失、
+  中继照常建立、SAS 两端一致、聊天/白板/文件送达，并钩住 `WebSocket.send` 检查出站
+  字节里不含明文（带阴性对照，防止探测函数失效导致空过）
+- `node scripts/e2e-mixed-context.mjs` —— **混合上下文** E2E：一端 `127.0.0.1`（算安全
+  上下文）、一端局域网 IP（非安全），同一服务器同一房间，验证一端有 `crypto.subtle`
+  一端没有时中继仍能协商、SAS 仍一致、数据双向送达；并固定屏幕共享的不对称行为
+  （含「发起端预检不检查对端解码能力」这个已知缺口）
 
 ## 安全模型（务必理解）
 
 - 信令服务器**只**转发 SDP/ICE 与签发 TURN 凭证，不经手任何业务数据。
 - WebRTC 的 DTLS 已对数据/媒体端到端加密，但信令服务器理论上能替换 SDP 指纹发起中间人攻击。
   因此「端到端加密」成立的前提是：**两端用户带外核对 SAS**（成员卡片里的 emoji / 数字）一致。
+- 降级到 WS 中继时数据经服务器转发，故在应用层再加一层端到端加密：X25519 协商 +
+  ChaCha20-Poly1305，收发两个方向各用一把 HKDF 派生的子密钥，nonce 用计数器而非随机数
+  （同一把密钥下 nonce 重用会直接摧毁 AEAD 的安全性）。服务器只看得到密文与 peerId。
+  这里的 SAS 由双方公钥派生，同样需要带外核对。
+- 上述加密用纯 JS 实现（`crypto.ts`），不依赖 `crypto.subtle`，因此**明文 http 下也是
+  真加密，不存在退化成明文转发的分支**。但要清楚它的边界：页面本身经明文传输时，
+  **能篡改 http 流量的攻击者可以替换页面脚本**，从而绕过加密与 SAS。它防的是服务器
+  窥探和链路旁观者，不是主动的中间人。传敏感内容仍应配 https。

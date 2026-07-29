@@ -58,8 +58,6 @@ type PeerEvents = {
   sas: Sas
   /** 实际使用的传输通路发生变化（降级到 WS 中继时触发）。 */
   transport: PeerTransport
-  /** 需要降级到中继，但环境不允许（非安全上下文无 WebCrypto）。 */
-  relayblocked: string
   close: void
 }
 
@@ -77,7 +75,6 @@ export class Peer extends Emitter<PeerEvents> {
   private readonly cfg: PeerConfig
   private relay: RelayTransport | null = null
   private fallbackTimer: ReturnType<typeof setTimeout> | null = null
-  private relayBlocked = false
   private closed = false
 
   // 完美协商状态机标志。
@@ -173,7 +170,7 @@ export class Peer extends Emitter<PeerEvents> {
       const state = pc.connectionState
       if (state === 'connected') {
         this.clearFallbackTimer()
-        void this.maybeComputeSas()
+        this.maybeComputeSas()
       } else if (state === 'failed') {
         this.enableRelay('WebRTC 连接失败')
       }
@@ -199,7 +196,7 @@ export class Peer extends Emitter<PeerEvents> {
     // 对端已降级到 WS 中继：本端跟随，并用其公钥完成密钥协商。
     if (data.relayKey) {
       this.enableRelay('对端已降级到 WS 中继')
-      void this.relay?.acceptRemoteKey(data.relayKey)
+      this.relay?.acceptRemoteKey(data.relayKey)
       return
     }
 
@@ -222,7 +219,7 @@ export class Peer extends Emitter<PeerEvents> {
           await pc.setLocalDescription()
           if (pc.localDescription) this.sendSignal({ description: pc.localDescription })
         }
-        void this.maybeComputeSas()
+        this.maybeComputeSas()
       } else {
         try {
           await pc.addIceCandidate(data.candidate ?? undefined)
@@ -315,33 +312,20 @@ export class Peer extends Emitter<PeerEvents> {
    * WebRTC 的**媒体轨**仍然过不去（SRTP 由浏览器内部收发，JS 拿不到编码帧），
    * 但屏幕共享另有一条路：mesh 会改用 WebCodecs 自行编码，编码字节经本通道的
    * KIND_SCREEN 转发（见 screencodec.ts）。代价是只有视频没有音频。
+   *
+   * 载荷由 relay-transport 自行加密（纯 JS，明文 http 下同样可用），因此这里
+   * 不再有「加密不可用就拒绝降级」的分支。
    */
   private enableRelay(reason: string): void {
     if (this.relay || this.closed) return
     this.clearFallbackTimer()
-
-    // 中继路径的载荷由本模块自行加密（服务器会看到字节流，DTLS 不再覆盖）。
-    // 非安全上下文里 crypto.subtle 不存在，无法加密——此时宁可明确失败，
-    // 也不退化成明文中继。
-    if (typeof crypto === 'undefined' || !crypto.subtle) {
-      if (!this.relayBlocked) {
-        this.relayBlocked = true
-        this.emit(
-          'relayblocked',
-          '无法 P2P 直连，需经服务器中继；但当前以 http 访问（非 localhost），'
-            + '浏览器禁用了 WebCrypto，中继无法端到端加密。请改用 https 访问，'
-            + '或让服务端以 --stun-turn 启动并放行 UDP/TCP 3478，使 WebRTC 直接打通。',
-        )
-      }
-      return
-    }
 
     console.warn(`[peer] ${this.remoteId} 降级到 WS 中继：${reason}`)
 
     const relay = new RelayTransport({
       remoteId: this.remoteId,
       sendFrame: (frame) => this.cfg.sendRelay(frame),
-      sendKey: (jwk) => this.sendSignal({ relayKey: jwk }),
+      sendKey: (key) => this.sendSignal({ relayKey: key }),
       bufferedAmount: () => this.cfg.relayBuffered(),
     })
     relay.onControl = (msg) => this.emit('control', msg as ControlMessage)
@@ -364,7 +348,7 @@ export class Peer extends Emitter<PeerEvents> {
   handleRelayFrame(frame: ArrayBuffer): void {
     // 对端可能先于本端降级：首帧到达即视为降级信号。
     this.enableRelay('收到对端的中继数据')
-    void this.relay?.handleFrame(frame)
+    this.relay?.handleFrame(frame)
   }
 
   private clearFallbackTimer(): void {
@@ -388,18 +372,17 @@ export class Peer extends Emitter<PeerEvents> {
   }
 
   /** 本端与对端 DTLS 指纹都就绪后，派生并广播 SAS（仅一次）。 */
-  private async maybeComputeSas(): Promise<void> {
+  private maybeComputeSas(): void {
     if (this.sasDone) return
     const localSdp = this.pc.currentLocalDescription?.sdp ?? this.pc.localDescription?.sdp
     const remoteSdp = this.pc.currentRemoteDescription?.sdp ?? this.pc.remoteDescription?.sdp
     const local = extractFingerprint(localSdp)
     const remote = extractFingerprint(remoteSdp)
     if (!local || !remote) return
-    if (typeof crypto === 'undefined' || !crypto.subtle) return
 
     this.sasDone = true
     try {
-      this.emit('sas', await computeSas(local, remote))
+      this.emit('sas', computeSas(local, remote))
     } catch (err) {
       this.sasDone = false
       console.error('[peer] computeSas', err)

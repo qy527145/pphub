@@ -50,9 +50,9 @@ export type ServerMsg =
 /**
  * 端到端信令负载：服务端仅透传，不解析。
  * 前两种取自 MDN「完美协商」示例；relayKey 是降级到 WS 中继时交换的
- * ECDH 公钥——收到它同时意味着「对端已降级」，本端应一并切到中继。
+ * X25519 公钥（base64）——收到它同时意味着「对端已降级」，本端应一并切到中继。
  */
 export type SignalData =
   | { description: RTCSessionDescriptionInit; candidate?: undefined; relayKey?: undefined }
   | { candidate: RTCIceCandidateInit | null; description?: undefined; relayKey?: undefined }
-  | { relayKey: JsonWebKey; description?: undefined; candidate?: undefined }
+  | { relayKey: string; description?: undefined; candidate?: undefined }

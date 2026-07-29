@@ -6,13 +6,16 @@ import { canDecodeScreen, canEncodeScreen } from './screencodec'
 export interface Capabilities {
   /**
    * 是否安全上下文（https / localhost）。注意 RTCPeerConnection 本身**不**依赖它
-   * （明文 http 下数据通道照常可用），受影响的是 crypto.subtle（SAS + WS 中继
-   * 加密）、getDisplayMedia、剪贴板等。
+   * （明文 http 下数据通道照常可用），WS 中继与 SAS 也不依赖（改用纯 JS 加密，
+   * 见 crypto.ts）；真正受影响的是 getDisplayMedia、WebCodecs、剪贴板等。
    */
   secureContext: boolean
   /** RTCPeerConnection 是否可用。 */
   webrtc: boolean
-  /** crypto.subtle 是否可用（SAS 指纹校验依赖它）。 */
+  /**
+   * crypto.subtle 是否可用。**仅供诊断展示**——SAS 与中继加密都已改用纯 JS
+   * 实现，不再依赖它；明文 http 下两者照常工作。
+   */
   webCrypto: boolean
   /** 屏幕共享 getDisplayMedia 是否存在（移动端浏览器普遍缺失）。 */
   displayMedia: boolean

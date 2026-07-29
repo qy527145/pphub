@@ -263,9 +263,11 @@ function stateLabel(m: { state: string; transport: string }): string {
     <div v-if="showInsecureHint" class="banner warn" @click.stop>
       <span>
         当前以 http 访问（非 localhost），浏览器判定为<b>非安全上下文</b>：
-        <b>安全核验（SAS）</b>、<b>发起屏幕共享</b>、以及 WebRTC 打不通时的
-        <b>服务器中继兜底</b>均不可用——跨网段的设备可能因此连不上。
-        同网段直连与聊天 / 文件 / 白板不受影响。改用 https 访问可恢复全部功能。
+        <b>发起屏幕共享</b>不可用（采集与编码 API 被禁用）。聊天 / 文件 / 白板、
+        同网段直连、安全核验（SAS）以及打不通时的<b>服务器中继兜底</b>都照常可用，
+        中继载荷仍是端到端加密。但请注意：页面本身经明文 http 送达，
+        <b>能篡改流量的攻击者可以替换页面脚本</b>，此时加密与 SAS 都会被绕过。
+        在不完全可信的网络里请改用 https。
       </span>
       <button class="ghost close" title="不再提示" @click="insecureDismissed = true">
         <AppIcon name="x" :size="14" />

@@ -643,7 +643,6 @@ export class Mesh extends Emitter<MeshEvents> {
         this.attachScreen(peer)
       }
     })
-    peer.on('relayblocked', (msg) => this.emit('error', { code: 'relay-blocked', msg }))
     peer.on('track', ({ streams }) => {
       if (streams[0]) this.emit('screen-stream', { peerId: remoteId, stream: streams[0] })
     })

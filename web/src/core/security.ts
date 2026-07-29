@@ -5,6 +5,12 @@
 // **带外**核对一段由双方 DTLS 证书指纹派生的短串（emoji / 数字）。
 //
 // 本模块只负责「从两端指纹派生稳定、顺序无关的 SAS」；带外核对由 UI 呈现。
+//
+// 哈希用纯 JS 的 sha256（见 crypto.ts）而非 crypto.subtle：后者在明文 http
+// 下不存在，会让 SAS 在最需要它的场景里恰好失效。改为同步实现后 computeSas
+// 不再可能因环境而失败。
+
+import { sha256Hex } from './crypto'
 
 /** 从一段 SDP 中提取 DTLS 证书指纹（sha-256）。 */
 export function extractFingerprint(sdp: string | undefined | null): string | null {
@@ -34,15 +40,14 @@ const EMOJI = [
 /**
  * 从两端指纹派生 SAS。对指纹排序后再哈希，保证两端得到完全相同的结果
  * （与谁是主叫无关）。取摘要前若干字节映射到 emoji 与十进制数字。
+ *
+ * 同步实现，任何上下文都能算（调用方沿用 await 亦无妨）。
  */
-export async function computeSas(
-  fpA: string,
-  fpB: string,
-  emojiCount = 5,
-): Promise<Sas> {
+export function computeSas(fpA: string, fpB: string, emojiCount = 5): Sas {
   const [x, y] = [fpA.toUpperCase(), fpB.toUpperCase()].sort()
-  const data = new TextEncoder().encode(`pphub-sas-v1|${x}|${y}`)
-  const buf = new Uint8Array(await crypto.subtle.digest('SHA-256', data))
+  const hex = sha256Hex(new TextEncoder().encode(`pphub-sas-v1|${x}|${y}`))
+  const buf = new Uint8Array(32)
+  for (let i = 0; i < 32; i++) buf[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16)
 
   const emoji: string[] = []
   for (let i = 0; i < emojiCount; i++) {

@@ -2,15 +2,20 @@
 // 让业务数据经信令 WebSocket 中转，从而只依赖服务器已经暴露的 HTTP/WS 端口。
 //
 // 与 WebRTC 路径的关键差异：中继节点是 pphub 服务器本身，DTLS 不再覆盖这段
-// 链路，因此本模块自带端到端加密——ECDH(P-256) 协商共享密钥 + AES-GCM 逐帧
-// 加密，服务器只看得到密文与路由用的 peerId。SAS 由双方公钥派生，与 WebRTC
-// 路径一样可带外核对（见 security.ts）。
+// 链路，因此本模块自带端到端加密——X25519 协商共享密钥 + ChaCha20-Poly1305
+// 逐帧加密（纯 JS，见 crypto.ts），服务器只看得到密文与路由用的 peerId。
+// SAS 由双方公钥派生，与 WebRTC 路径一样可带外核对（见 security.ts）。
+//
+// 用纯 JS 而非 WebCrypto 是刻意的：`crypto.subtle` 在明文 http 下不存在，
+// 而那恰是最需要中继的部署方式（局域网 IP 直接访问）。纯 JS 实现只依赖
+// `crypto.getRandomValues`，于是 http 下的中继同样是密文而非明文转发。
+// 边界见 crypto.ts 顶部注释：防窥探与被动监听，防不了能改 http 流量的主动攻击者。
 //
 // 外层线格式（与 src/ws.rs 的 relay_binary 一一对应）：
 //   [0]        版本 = 1
 //   [1]        peerId 字节长度 n
 //   [2..2+n]   发送时 = 目标 peerId；收到时 = 服务器改写后的来源 peerId
-//   [2+n..]    12 字节 IV + AES-GCM 密文
+//   [2+n..]    12 字节 nonce + ChaCha20-Poly1305 密文（含 16 字节标签）
 //
 // 密文明文再分一层轻头部，用一条中继复用多个逻辑通道：
 //   [0]        kind：0=control(JSON) 1=swarm 2=file 数据 3=file 关闭 4=屏幕编码帧
@@ -20,6 +25,19 @@
 // 仍然无法经此中继（SRTP 由浏览器内部收发，JS 拿不到编码帧），两者是不同的东西。
 
 import type { ChannelLike } from './channels'
+import {
+  type KeyPair,
+  NONCE_LEN,
+  NonceGen,
+  type SessionKeys,
+  deriveSessionKeys,
+  fromBase64,
+  generateKeyPair,
+  open,
+  seal,
+  sha256Hex,
+  toBase64,
+} from './crypto'
 import { type Sas, computeSas } from './security'
 
 const KIND_CONTROL = 0
@@ -40,7 +58,7 @@ export interface RelayTransportConfig {
   /** 把一帧中继数据（含外层帧头）交给信令层发出。 */
   sendFrame: (frame: ArrayBuffer) => void
   /** 经普通 JSON 信令把本端公钥发给对端（量极小，无需走二进制通道）。 */
-  sendKey: (jwk: JsonWebKey) => void
+  sendKey: (key: string) => void
   /** 当前底层 WebSocket 的积压字节数，用作文件传输的背压信号。 */
   bufferedAmount: () => number
 }
@@ -52,10 +70,10 @@ export interface RelayTransportConfig {
 export class RelayTransport {
   readonly remoteId: string
   private readonly cfg: RelayTransportConfig
-  private key: CryptoKey | null = null
-  private localKeys: CryptoKeyPair | null = null
-  private localJwk: JsonWebKey | null = null
-  private remoteJwk: JsonWebKey | null = null
+  private keys: SessionKeys | null = null
+  private readonly localKeys: KeyPair
+  private remotePub: Uint8Array | null = null
+  private readonly nonces = new NonceGen()
   private pending: Array<{ kind: number; id?: string; payload: ArrayBuffer }> = []
   private readonly channels = new Map<string, RelayChannel>()
   private closed = false
@@ -71,12 +89,14 @@ export class RelayTransport {
   constructor(cfg: RelayTransportConfig) {
     this.cfg = cfg
     this.remoteId = cfg.remoteId
-    void this.beginKeyExchange()
+    // 纯 JS 实现，任何上下文都能生成密钥，不存在「加密不可用」的分支。
+    this.localKeys = generateKeyPair()
+    this.cfg.sendKey(toBase64(this.localKeys.publicKey))
   }
 
   /** 密钥已协商完成，可收发业务数据。 */
   get ready(): boolean {
-    return this.key !== null && !this.closed
+    return this.keys !== null && !this.closed
   }
 
   get bufferedAmount(): number {
@@ -85,46 +105,31 @@ export class RelayTransport {
 
   // —— 密钥协商 ——
 
-  private async beginKeyExchange(): Promise<void> {
-    if (typeof crypto === 'undefined' || !crypto.subtle) {
-      console.error('[relay] 当前上下文没有 WebCrypto（需 https 或 localhost），中继不可用')
+  /** 收到对端公钥（由 Peer 从信令中转入）。重复收到以首次为准。 */
+  acceptRemoteKey(key: string): void {
+    if (this.remotePub || this.closed) return
+    let pub: Uint8Array
+    try {
+      pub = fromBase64(key)
+    } catch {
+      console.error('[relay] 对端公钥格式非法')
       return
     }
-    try {
-      this.localKeys = await crypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, false, [
-        'deriveKey',
-      ])
-      this.localJwk = await crypto.subtle.exportKey('jwk', this.localKeys.publicKey)
-      this.cfg.sendKey(this.localJwk)
-      await this.tryDerive()
-    } catch (err) {
-      console.error('[relay] 密钥协商失败', err)
+    if (pub.length !== 32) {
+      console.error('[relay] 对端公钥长度异常', pub.length)
+      return
     }
+    this.remotePub = pub
+    this.derive()
   }
 
-  /** 收到对端公钥（由 Peer 从信令中转入）。重复收到以首次为准。 */
-  async acceptRemoteKey(jwk: JsonWebKey): Promise<void> {
-    if (this.remoteJwk || this.closed) return
-    this.remoteJwk = jwk
-    await this.tryDerive()
-  }
-
-  private async tryDerive(): Promise<void> {
-    if (this.key || !this.localKeys || !this.remoteJwk || !this.localJwk || this.closed) return
+  private derive(): void {
+    if (this.keys || !this.remotePub || this.closed) return
     try {
-      const remotePub = await crypto.subtle.importKey(
-        'jwk',
-        this.remoteJwk,
-        { name: 'ECDH', namedCurve: 'P-256' },
-        false,
-        [],
-      )
-      this.key = await crypto.subtle.deriveKey(
-        { name: 'ECDH', public: remotePub },
-        this.localKeys.privateKey,
-        { name: 'AES-GCM', length: 256 },
-        false,
-        ['encrypt', 'decrypt'],
+      this.keys = deriveSessionKeys(
+        this.localKeys.secret,
+        this.localKeys.publicKey,
+        this.remotePub,
       )
     } catch (err) {
       console.error('[relay] 派生共享密钥失败', err)
@@ -132,22 +137,20 @@ export class RelayTransport {
     }
 
     // SAS 走与 WebRTC 路径同一套派生（computeSas 内部排序，两端结果一致）。
-    void this.emitSas()
+    this.emitSas()
 
     const queued = this.pending
     this.pending = []
-    for (const f of queued) void this.encryptAndSend(f.kind, f.payload, f.id)
+    for (const f of queued) this.encryptAndSend(f.kind, f.payload, f.id)
     this.onReady?.()
   }
 
-  private async emitSas(): Promise<void> {
-    if (!this.onSas || !this.localJwk || !this.remoteJwk) return
+  private emitSas(): void {
+    if (!this.onSas || !this.remotePub) return
     try {
-      const [a, b] = await Promise.all([
-        jwkDigest(this.localJwk),
-        jwkDigest(this.remoteJwk),
-      ])
-      this.onSas(await computeSas(a, b))
+      this.onSas(
+        computeSas(sha256Hex(this.localKeys.publicKey), sha256Hex(this.remotePub)),
+      )
     } catch (err) {
       console.error('[relay] computeSas', err)
     }
@@ -169,7 +172,7 @@ export class RelayTransport {
    * 实时画面积压下来只会变成一堆过期帧，等就绪后的关键帧即可恢复。
    */
   sendScreen(packet: ArrayBuffer): boolean {
-    if (!this.key || this.closed) return false
+    if (!this.keys || this.closed) return false
     return this.queue(KIND_SCREEN, packet)
   }
 
@@ -200,18 +203,18 @@ export class RelayTransport {
       console.error('[relay] 帧超过上限，已丢弃', payload.byteLength)
       return false
     }
-    if (!this.key) {
+    if (!this.keys) {
       if (this.pending.length >= MAX_PENDING) return false
       this.pending.push({ kind, id, payload })
       return true
     }
-    void this.encryptAndSend(kind, payload, id)
+    this.encryptAndSend(kind, payload, id)
     return true
   }
 
-  private async encryptAndSend(kind: number, payload: ArrayBuffer, id?: string): Promise<void> {
-    const key = this.key
-    if (!key || this.closed) return
+  private encryptAndSend(kind: number, payload: ArrayBuffer, id?: string): void {
+    const keys = this.keys
+    if (!keys || this.closed) return
 
     const withId = kind === KIND_FILE_DATA || kind === KIND_FILE_CLOSE
     const idBytes = withId ? new TextEncoder().encode(id ?? '') : EMPTY
@@ -224,51 +227,49 @@ export class RelayTransport {
     }
     plain.set(new Uint8Array(payload), head)
 
-    const iv = crypto.getRandomValues(new Uint8Array(12))
-    let cipher: ArrayBuffer
+    const nonce = this.nonces.next()
+    let cipher: Uint8Array
     try {
-      cipher = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, plain)
+      cipher = seal(keys.send, nonce, plain)
     } catch (err) {
       console.error('[relay] 加密失败', err)
       return
     }
-    if (this.closed) return
 
     const to = new TextEncoder().encode(this.remoteId)
-    const frame = new Uint8Array(2 + to.length + 12 + cipher.byteLength)
+    const frame = new Uint8Array(2 + to.length + NONCE_LEN + cipher.length)
     frame[0] = 1
     frame[1] = to.length
     frame.set(to, 2)
-    frame.set(iv, 2 + to.length)
-    frame.set(new Uint8Array(cipher), 2 + to.length + 12)
+    frame.set(nonce, 2 + to.length)
+    frame.set(cipher, 2 + to.length + NONCE_LEN)
     this.cfg.sendFrame(frame.buffer)
   }
 
   // —— 入站 ——
 
   /** 处理一帧服务器转来的中继数据（外层帧头的 peerId 已被改写为来源）。 */
-  async handleFrame(frame: ArrayBuffer): Promise<void> {
-    const key = this.key
-    if (!key || this.closed) return
+  handleFrame(frame: ArrayBuffer): void {
+    const keys = this.keys
+    if (!keys || this.closed) return
     const buf = new Uint8Array(frame)
     if (buf.length < 2 || buf[0] !== 1) return
     const bodyAt = 2 + buf[1]
-    if (buf.length < bodyAt + 12) return
+    if (buf.length < bodyAt + NONCE_LEN) return
 
-    let plainBuf: ArrayBuffer
+    let plain: Uint8Array
     try {
-      plainBuf = await crypto.subtle.decrypt(
-        { name: 'AES-GCM', iv: buf.subarray(bodyAt, bodyAt + 12) },
-        key,
-        buf.subarray(bodyAt + 12),
+      plain = open(
+        keys.recv,
+        buf.subarray(bodyAt, bodyAt + NONCE_LEN),
+        buf.subarray(bodyAt + NONCE_LEN),
       )
     } catch {
-      // GCM 认证失败：帧被篡改或密钥不匹配，静默丢弃。
+      // AEAD 认证失败：帧被篡改或密钥不匹配，静默丢弃。
       return
     }
     if (this.closed) return
 
-    const plain = new Uint8Array(plainBuf)
     switch (plain[0]) {
       case KIND_CONTROL:
         try {
@@ -313,7 +314,7 @@ export class RelayTransport {
   close(): void {
     this.closed = true
     this.pending = []
-    this.key = null
+    this.keys = null
     for (const ch of this.channels.values()) ch.remoteClosed()
     this.channels.clear()
   }
@@ -390,13 +391,6 @@ class RelayChannel extends EventTarget implements ChannelLike {
 }
 
 const EMPTY = new Uint8Array(0)
-
-/** 公钥的稳定摘要：只取 ECDH 公钥的定义性字段，顺序固定。 */
-async function jwkDigest(jwk: JsonWebKey): Promise<string> {
-  const raw = `${jwk.kty}|${jwk.crv}|${jwk.x}|${jwk.y}`
-  const buf = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(raw)))
-  return [...buf].map((b) => b.toString(16).padStart(2, '0')).join('')
-}
 
 /** 取视图对应的独立 ArrayBuffer，避免把整块底层缓冲连带传出去。 */
 function detach(v: Uint8Array): ArrayBuffer {

@@ -230,7 +230,7 @@ coturn 的 `use-auth-secret` 模式：`username = "<expiry>:<peerId>"`，`creden
 |------|-----------|
 | `showSaveFilePicker`（仅 Chromium） | Safari/FF → OPFS 暂存后 `<a download>` 导出 |
 | `getDisplayMedia`（桌面限定） | 移动端隐藏「屏幕共享」入口 |
-| 安全上下文（HTTPS/localhost） | http 局域网 IP → 禁用摄像头/屏幕/剪贴板，仅留数据通道 |
+| 安全上下文（HTTPS/localhost） | http 局域网 IP → 禁用摄像头/屏幕/剪贴板；数据通道、WS 中继（纯 JS 加密）、SAS 均照常 |
 | 剪贴板后台监听（不存在） | 一律用「发送/聚焦同步/粘贴按钮」 |
 
 ---
@@ -373,9 +373,17 @@ control 通道传 `{t:"chat", from, ts, text|html|imgBlobRef}`；图片/文件�
 
 - **问题**：默认单端口部署下打不通的对端会降级到 WS 应用层中继，此时屏幕共享彻底不可用——WebRTC 媒体轨由浏览器内部 SRTP 栈收发，JS 拿不到编码帧，无法经应用层转发。原实现还会给这类对端照发 `screen-start`，对方于是挂出一个**永远黑屏**的画面条目；发起端即使一个对端都送不到也照样进入「共享中」。
 - **绕开媒体轨**：新增 `core/screencodec.ts`，中继路径改用 **WebCodecs 自编码**——`MediaStreamTrackProcessor` 取原始 `VideoFrame` → `VideoEncoder`（候选 `avc1.42E01F` / `vp8` / `vp09`，`latencyMode:'realtime'`，H.264 用 annexb 让每个关键帧自带 SPS/PPS）→ 编码字节走中继 → 对端 `VideoDecoder` → 画布 `captureStream()` 变回 `MediaStream`。**关键收益**：出口仍是 `MediaStream`，接收端的渲染、Tab 切换、批注/远程指针链路一行不用改。参数：≤1600 宽、15fps、1.8Mbps、4s 关键帧，128KiB 分片，编码队列 >2 帧或中继积压 >2MiB 时丢帧。
-- **通道与分流**：`relay-transport.ts` 增 `KIND_SCREEN=4`（与 control/file/swarm 并列，同一把 AES-GCM 密钥）；密钥未就绪时屏幕包**直接丢弃而非排队**——实时画面积压只会变成一堆过期帧，等就绪后补一个关键帧即可恢复。`mesh.ts` 按 `peer.transport` 分流：webrtc 走 `addTrack` + `screen-start{via:'track'}`；relay 走编码器 + `screen-start{via:'codec'}`。编码器全局唯一，按 `codecViewers` 扇出同一个 ArrayBuffer（`encryptAndSend` 在首个 await 前同步复制，可安全共享）。中途降级的对端由 `transport` 事件触发重新挂载，新观众到达时补一个关键帧。
+- **通道与分流**：`relay-transport.ts` 增 `KIND_SCREEN=4`（与 control/file/swarm 并列，同一把会话密钥）；密钥未就绪时屏幕包**直接丢弃而非排队**——实时画面积压只会变成一堆过期帧，等就绪后补一个关键帧即可恢复。`mesh.ts` 按 `peer.transport` 分流：webrtc 走 `addTrack` + `screen-start{via:'track'}`；relay 走编码器 + `screen-start{via:'codec'}`。编码器全局唯一，按 `codecViewers` 扇出同一个 ArrayBuffer（`encryptAndSend` 同步复制后再发，可安全共享）。中途降级的对端由 `transport` 事件触发重新挂载，新观众到达时补一个关键帧。
 - **诚实降级**：`screenTargets()` 在开采集器**之前**预检每个对端可达性，一个都没有就不进入共享状态并给出原因；部分可达则照常共享但说明少了谁。对端解不了码时给明确提示而非黑屏条目，`ScreenView` 的共享按钮在不可用时禁用并用 `title` 说明原因。代价说清楚：**无音频**（系统音频轨没有对应的 AudioEncoder 路径）、无拥塞控制、需要安全上下文。
 - **验证**：`vue-tsc` + `vite build` + `cargo clippy` 通过；`e2e-relay.mjs` 扩到 13 项全过，新增 4 项覆盖本次改动：预检判定 → B 端解出 640×360 画面 → 画面**持续更新**（比对像素，证明不是只解出首帧）→ 无解码能力的节点只收到提示、不生成黑屏条目 → 停止共享后编解码器一并释放。`e2e-media` / `e2e-network` / 两个 smoke 无回归。修复一处漏判：拒绝黑屏条目的分支把「只提示一次」的去重条件写进了同一个 `if`，导致第二条 `screen-start` 直接落到正常分支——提示要去重，拒绝必须每次都拒。后端**零改动**。
+
+### 明文 http 下的中继加密（纯 JS）落地记录（2026-07-29）
+
+- **问题**：中继加密原用 `crypto.subtle` 的 ECDH(P-256) + AES-GCM，而浏览器只在安全上下文提供 `crypto.subtle`。以明文 http + 局域网 IP 访问时中继无法加密，实现选择**拒绝降级**（不明文转发），后果是这种部署下打不通的对端彻底连不上、SAS 也失效——「只有同网段能互连」。
+- **不降级为明文，改让加密始终可用**：实测非安全上下文下 `crypto.getRandomValues` 仍在（被砍的只有 `subtle`），故用审计过的纯 JS 实现替换：X25519（`@noble/curves`）+ HKDF-SHA256 + ChaCha20-Poly1305（`@noble/ciphers`），新增 `core/crypto.ts`。实测 192KiB 帧上 **186 MB/s**，远快于它喂的那条 WebSocket，因此**不按 `crypto.subtle` 是否存在分叉**，统一走一条路径——少一个只在特定环境触发、平时测不到的分支。代价是 gzip 后 +21KB。
+- **顺带修正的设计**：收发两个方向各派生一把子密钥（HKDF info 分别为 `pphub-relay-v1|a2b` / `|b2a`，方向由双方公钥字典序决定），nonce 改用**计数器**而非随机数——同一把密钥下 nonce 重用会直接摧毁 AEAD 的安全性，计数器在结构上就排除了这种可能。`computeSas` 随之从 async 变同步（不再 `await subtle.digest`），这也顺手修好了**直连路径**在 http 下拿不到 SAS 的问题。信令的 `relayKey` 从 JWK 变成 base64 公钥字符串；服务器把 `data` 当作不透明 `serde_json::Value`，故后端**零改动**。
+- **诚实标注边界**：`peer.ts` 里「加密不可用就拒绝降级」的分支连同 `relayblocked` 事件一并删除——加密不再有不可用的情况。但 `NetworkView` 的横幅必须说清楚它防不住什么：**页面本身经明文 http 传输时，能篡改流量的攻击者可以替换页面脚本，从而绕过页面内的一切加密与核验**。它防的是服务器窥探与链路旁观者，不是主动中间人；浏览器限制 `crypto.subtle` 正是这个道理。
+- **验证**：新增 `web/scripts/e2e-http-relay.mjs`，经本机局域网 IP 以明文 http 访问（`127.0.0.1` 不行，那本身算安全上下文——原 `e2e-relay` 全程跑在安全上下文里，证不了这次改动），6 项全过：确认 `crypto.subtle` 确实缺失 → 中继照常建立 → SAS 两端一致 → 聊天/白板/128KiB 文件送达 → 钩住 `WebSocket.send` 检查出站字节**不含明文**（带阴性对照，避免探测函数失效导致空过）→ 屏幕共享如实标为不可用。原五套件（含 `e2e-relay` 13 项）+ `cargo clippy` 无回归。
 
 ---
 
@@ -383,7 +391,8 @@ control 通道传 `{t:"chat", from, ts, text|html|imgBlobRef}`；图片/文件�
 
 1. **TURN 带宽成本 vs「零带宽」定位**：约 17%（移动 30–40%）连接必须中继，产生真实流量费。需在文档/UI 诚实说明「零带宽」是 P2P 直连时成立。自建 coturn 控制成本。
 2. **「E2EE」宣称**：不做 SAS 校验就只是「传输加密 + 信令可 MITM」。SAS 校验必须在 Phase 1 落地，否则不应对外宣称端到端加密。
-3. **局域网直连脆弱**：mDNS 组播 + 访客隔离会静默失败；http 局域网 IP 下媒体功能不可用——需清晰的错误引导，避免用户困惑。
+3. **局域网直连脆弱**：mDNS 组播 + 访客隔离会静默失败；http 局域网 IP 下屏幕共享等媒体功能不可用（连通性本身不受影响，中继与 SAS 已改用纯 JS 加密）——需清晰的错误引导，避免用户困惑。此外，明文 http 下页面脚本可被在途篡改，页面内加密防不住主动中间人，横幅须如实说明。
 4. **Safari/iOS 文件落盘**：无 FSA、无 SW 流式下载、无可转移流，大文件只能 OPFS 暂存后导出，且有 7 天 ITP 清除风险；iOS 内存约 1–1.5GB 会被杀进程——大文件在 iOS 上需限制或分卷。
 5. **CRDT 文档膨胀**：白板长会话只增不减，需快照/轮换策略。
 6. **主线程瓶颈**：WebRTC 栈锁死主线程，重活必须进 Worker，否则大文件传输时 UI 卡顿。
+7. **屏幕共享预检不看对端解码能力**：`screenTargets()` 只检查本端 `canEncodeScreen()`，对端能否解码从未在协议里通告（`canDecodeScreen()` 仅在接收端本地调用）。于是安全上下文的一端向非安全上下文的一端发起**中继**共享时，预检误判为可达并进入「共享中」，实际对面收不到画面。兜底在接收端——拒绝并给出原因，不留黑屏条目，故不至于干等，但发起端状态显示不准。修法：在 hello/名片消息里带上 `screenDecode`，`screenTargets()` 改用对端通告值。该行为由 `web/scripts/e2e-mixed-context.mjs` 固定，修复时同步更新该断言与 README 的混合场景矩阵。
