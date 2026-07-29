@@ -8,6 +8,7 @@ import {
   isChompGameOver,
   findBestChompMove,
   clearChompCache,
+  boundaryToGrid,
   type ChompState,
   type ChompMove,
 } from '@/utils/chomp'
@@ -97,11 +98,16 @@ function restart() {
   gameState.value = null
 }
 
-// 获取巧克力块的状态
+// 获取巧克力块的状态（使用边界转网格）
+const gridState = computed(() => {
+  if (!gameState.value) return []
+  return boundaryToGrid(gameState.value)
+})
+
 function getBlockState(row: number, col: number): 'available' | 'eaten' | 'poison' {
   if (!gameState.value) return 'eaten'
   const idx = row * gameState.value.cols + col
-  if (!gameState.value.grid[idx]) return 'eaten'
+  if (!gridState.value[idx]) return 'eaten'
   // 左下角是有毒的
   if (row === gameState.value.rows - 1 && col === 0) return 'poison'
   return 'available'
@@ -209,7 +215,7 @@ onMounted(() => {
         </div>
         <div class="stat">
           <span class="stat-label">剩余格子:</span>
-          <span class="stat-value">{{ gameState?.grid.filter(v => v).length || 0 }}</span>
+          <span class="stat-value">{{ gridState.filter(v => v).length || 0 }}</span>
         </div>
       </div>
     </div>

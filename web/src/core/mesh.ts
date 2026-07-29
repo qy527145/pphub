@@ -109,10 +109,14 @@ export type DrawMessage = Extract<
   { kind: `draw-${string}` } | { kind: `ptr-${string}` }
 >
 
-/** ControlMessage 中的游戏子集（你画我猜 / 五子棋）。 */
+/** ControlMessage 中的游戏子集（你画我猜 / 五子棋 / 游戏桌）。 */
 export type GameMessage = Extract<
   ControlMessage,
-  { kind: `guess-${string}` } | { kind: `gomoku-${string}` }
+  | { kind: `guess-${string}` }
+  | { kind: `gomoku-${string}` }
+  | { kind: `table-${string}` }
+  | { kind: `game-${string}` }
+  | { kind: 'mouse-pos' }
 >
 
 /** 供 store 查询的共享条目视图。 */
@@ -1008,6 +1012,17 @@ export class Mesh extends Emitter<MeshEvents> {
       case 'gomoku-decline':
       case 'gomoku-move':
       case 'gomoku-resign':
+      case 'table-create':
+      case 'table-join':
+      case 'table-spectate':
+      case 'table-leave':
+      case 'table-start':
+      case 'table-sit':
+      case 'table-standup':
+      case 'table-invite':
+      case 'game-move':
+      case 'game-chat':
+      case 'mouse-pos':
         this.emit('game', { from, msg })
         break
       case 'profile': {

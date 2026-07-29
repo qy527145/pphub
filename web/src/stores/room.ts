@@ -1586,6 +1586,103 @@ export const useRoomStore = defineStore('room', () => {
         }
         break
       }
+      // —— 游戏桌消息处理 ——
+      case 'table-create': {
+        const table = msg.table as GameTable
+        if (table && table.tableId) {
+          gameTables.set(table.tableId, table)
+        }
+        break
+      }
+      case 'table-join': {
+        const table = gameTables.get(msg.tableId)
+        if (table && !table.players.includes(from)) {
+          table.players.push(from)
+        }
+        break
+      }
+      case 'table-spectate': {
+        const table = gameTables.get(msg.tableId)
+        if (table && !table.spectators.includes(from)) {
+          table.spectators.push(from)
+        }
+        break
+      }
+      case 'table-leave': {
+        const table = gameTables.get(msg.tableId)
+        if (table) {
+          table.players = table.players.filter(p => p !== from)
+          table.spectators = table.spectators.filter(p => p !== from)
+          // 如果桌主离开，转移给第一个玩家
+          if (table.hostId === from && table.players.length > 0) {
+            table.hostId = table.players[0]
+          }
+          // 如果桌子空了，删除
+          if (table.players.length === 0 && table.spectators.length === 0) {
+            gameTables.delete(msg.tableId)
+          }
+        }
+        break
+      }
+      case 'table-start': {
+        const table = gameTables.get(msg.tableId)
+        if (table) {
+          table.state = 'playing'
+          table.startedAt = Date.now()
+        }
+        break
+      }
+      case 'table-sit': {
+        const table = gameTables.get(msg.tableId)
+        if (table) {
+          table.spectators = table.spectators.filter(p => p !== from)
+          if (!table.players.includes(from)) {
+            table.players.push(from)
+          }
+        }
+        break
+      }
+      case 'table-standup': {
+        const table = gameTables.get(msg.tableId)
+        if (table) {
+          table.players = table.players.filter(p => p !== from)
+          if (!table.spectators.includes(from)) {
+            table.spectators.push(from)
+          }
+        }
+        break
+      }
+      case 'table-invite': {
+        // 收到邀请通知
+        notifyBackground('游戏邀请', `${displayName(from)} 邀请你加入 ${msg.gameName}`)
+        lastError.value = `${displayName(from)} 邀请你加入游戏桌`
+        break
+      }
+      case 'game-move': {
+        // 游戏动作，由具体游戏组件处理
+        // 这里可以添加通用的同步逻辑
+        break
+      }
+      case 'game-chat': {
+        const chatMsg = msg.chatMsg as GameChatMessage
+        if (chatMsg && msg.tableId) {
+          const chats = gameChats.get(msg.tableId) || []
+          chats.push(chatMsg)
+          gameChats.set(msg.tableId, chats)
+        }
+        break
+      }
+      case 'mouse-pos': {
+        const pos = msg.pos as MousePosition
+        if (pos && msg.tableId) {
+          const positions = gameMousePositions.get(msg.tableId) || []
+          // 只保留最近的位置
+          const filtered = positions.filter(p => p.peerId !== pos.peerId || Date.now() - p.ts < 5000)
+          filtered.push(pos)
+          gameMousePositions.set(msg.tableId, filtered)
+        }
+        break
+      }
     }
   }
 
