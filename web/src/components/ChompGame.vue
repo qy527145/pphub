@@ -45,7 +45,27 @@ function makeMove(row: number, col: number) {
     return
   }
 
+  // 检查走步前是否只剩有毒巧克力（玩家被迫吃有毒的，玩家输）
+  if (isChompGameOver(gameState.value)) {
+    gameState.value.winner = 'ai'
+    return
+  }
+
   const move: ChompMove = { row, col }
+
+  // 检查是否点击了有毒巧克力
+  if (move.row === gameState.value.rows - 1 && move.col === 0) {
+    // 吃掉有毒巧克力，玩家输
+    const newState = applyChompMove(gameState.value, move)
+    gameState.value = {
+      ...newState,
+      currentPlayer: 'ai',
+      winner: 'ai',
+      moveHistory: [...gameState.value.moveHistory, move],
+    }
+    return
+  }
+
   const newState = applyChompMove(gameState.value, move)
 
   gameState.value = {
@@ -53,13 +73,6 @@ function makeMove(row: number, col: number) {
     currentPlayer: 'ai',
     winner: gameState.value.winner,
     moveHistory: [...gameState.value.moveHistory, move],
-  }
-
-  // 检查人类是否输了（吃掉了有毒的巧克力）
-  if (isChompGameOver(newState)) {
-    gameState.value.winner = 'ai'
-    gameState.value.currentPlayer = 'human'
-    return
   }
 
   // AI 走步
@@ -74,8 +87,18 @@ function aiMove() {
     return
   }
 
+  // 检查走步前是否只剩有毒巧克力（AI 被迫吃有毒的，AI 输）
+  if (isChompGameOver(gameState.value)) {
+    gameState.value.winner = 'human'
+    return
+  }
+
   const bestMove = findBestChompMove(gameState.value)
-  if (!bestMove) return
+  if (!bestMove) {
+    // AI 无法找到有效走法，AI 输
+    gameState.value.winner = 'human'
+    return
+  }
 
   const newState = applyChompMove(gameState.value, bestMove)
 
@@ -84,11 +107,6 @@ function aiMove() {
     currentPlayer: 'human',
     winner: gameState.value.winner,
     moveHistory: [...gameState.value.moveHistory, bestMove],
-  }
-
-  // 检查 AI 是否输了（理论上不会发生，因为 AI 用最佳策略）
-  if (isChompGameOver(newState)) {
-    gameState.value.winner = 'human'
   }
 }
 
