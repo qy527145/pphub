@@ -41,10 +41,11 @@ import {
   type GameChatMessage,
   type MousePosition,
   type PlayerRole,
-  generateTableId,
   getGameMeta,
   canStartGame,
 } from '@/core/games'
+import { tableManager } from '@/core/table-manager'
+import { inviteManager, type Invitation } from '@/core/invite-manager'
 
 /** idle=未上线 · connecting=正在进房 · online=已在房间（监听中或已连接对端） */
 export type Status = 'idle' | 'connecting' | 'online'
@@ -338,6 +339,10 @@ export const useRoomStore = defineStore('room', () => {
   const myMatchingGame = ref<GameType | null>(null)
   /** 游戏状态：tableId -> 游戏特定状态 */
   const gameStates = reactive(new Map<string, any>())
+
+  // —— 邀请系统 ——
+  /** 待处理的邀请列表 */
+  const pendingInvites = ref<Invitation[]>([])
 
   /** 文件夹打包中的数量（UI 转圈提示）。 */
   const packing = ref(0)
@@ -1610,12 +1615,20 @@ export const useRoomStore = defineStore('room', () => {
         console.log('[GameTable] 收到 table-create:', {
           from,
           tableId: table?.tableId,
+          tableNumber: table?.tableNumber,
           gameType: table?.gameType,
           visibility: table?.visibility,
           players: table?.players,
         })
         if (table && table.tableId) {
           gameTables.set(table.tableId, table)
+
+          // 同步到 TableManager（用于桌号查询）
+          if (table.tableNumber && table.tableId !== tableManager.getTableByNumber(table.tableNumber)?.tableId) {
+            // 远端创建的桌子，需要在本地 TableManager 中注册
+            tableManager.registerRemoteTable(table.tableId, table.tableNumber)
+          }
+
           console.log('[GameTable] 已添加到 gameTables, 当前桌子数:', gameTables.size)
         }
         break
@@ -1646,6 +1659,8 @@ export const useRoomStore = defineStore('room', () => {
           // 如果桌子空了，删除
           if (table.players.length === 0 && table.spectators.length === 0) {
             gameTables.delete(msg.tableId)
+            // 同步到 TableManager
+            tableManager.destroyTable(msg.tableId)
           }
         }
         break
@@ -1678,8 +1693,38 @@ export const useRoomStore = defineStore('room', () => {
         }
         break
       }
+      // —— 邀请消息 ——
+      case 'invite-send': {
+        const invite = (msg as any).invite as Invitation
+        if (!invite) break
+
+        console.log('[Invite] 收到邀请:', invite.inviteId, 'from', from)
+
+        // 添加到待处理列表
+        pendingInvites.value.push(invite)
+
+        // 触发回调（显示通知）
+        inviteManager.triggerInviteCallback(invite)
+
+        // 系统通知
+        const gameName = getGameMeta(invite.gameType)?.name || '游戏'
+        notifyBackground('游戏邀请', `${displayName(from)} 邀请你加入 ${gameName}`)
+        break
+      }
+      case 'invite-accept': {
+        const inviteId = (msg as any).inviteId as string
+        console.log('[Invite] 邀请被接受:', inviteId, 'by', from)
+        // 可以显示提示：XXX 已加入游戏
+        break
+      }
+      case 'invite-decline': {
+        const inviteId = (msg as any).inviteId as string
+        console.log('[Invite] 邀请被拒绝:', inviteId, 'by', from)
+        lastError.value = `${displayName(from)} 拒绝了邀请`
+        break
+      }
       case 'table-invite': {
-        // 收到邀请通知
+        // 兼容旧消息（逐步废弃）
         notifyBackground('游戏邀请', `${displayName(from)} 邀请你加入 ${msg.gameName}`)
         lastError.value = `${displayName(from)} 邀请你加入游戏桌`
         break
@@ -1746,14 +1791,21 @@ export const useRoomStore = defineStore('room', () => {
       }
       case 'match-found': {
         const tableId = (msg as any).tableId as string
+        const tableNumber = (msg as any).tableNumber as string
         const gameType = (msg as any).gameType as GameType
 
-        console.log('[Matching] 匹配成功，加入游戏桌:', tableId, gameType)
+        console.log('[Matching] 匹配成功，加入游戏桌:', tableNumber || tableId, gameType)
 
-        if (tableId && myMatchingGame.value === gameType) {
+        if (myMatchingGame.value === gameType) {
           myMatchingGame.value = null
-          // 自动加入游戏桌
-          joinGameTable(tableId, false)
+
+          // 优先使用桌号加入（更可靠）
+          if (tableNumber) {
+            joinGameTableByNumber(tableNumber)
+          } else if (tableId) {
+            // 回退：直接使用 tableId
+            joinGameTable(tableId, false)
+          }
         }
         break
       }
@@ -2341,25 +2393,28 @@ export const useRoomStore = defineStore('room', () => {
 
   // —— 游戏桌管理 ——
 
-  function createGameTable(gameType: GameType, isPublic: boolean): void {
-    const tableId = generateTableId()
-    const table: GameTable = {
-      tableId,
+  function createGameTable(gameType: GameType, isPublic: boolean, password?: string): void {
+    // 使用 TableManager 创建桌子并生成桌号
+    const { table, tableNumber } = tableManager.createTable({
       gameType,
       hostId: myId.value,
-      state: 'waiting',
       visibility: isPublic ? 'public' : 'private',
-      players: [myId.value],
-      spectators: [],
-      config: {},
-    }
-    gameTables.set(tableId, table)
-    currentTableId.value = tableId
+      password,
+    })
+
+    // 添加桌号和密码标记到 table
+    table.tableNumber = tableNumber
+    table.hasPassword = !!password
+
+    gameTables.set(table.tableId, table)
+    currentTableId.value = table.tableId
 
     console.log('[GameTable] 创建游戏桌:', {
-      tableId,
+      tableId: table.tableId,
+      tableNumber,
       gameType,
       visibility: table.visibility,
+      hasPassword: table.hasPassword,
       players: table.players,
       mesh: !!mesh,
       peerCount: connectedPeers.value.length,
@@ -2369,7 +2424,7 @@ export const useRoomStore = defineStore('room', () => {
     if (mesh) {
       mesh.broadcast({
         kind: 'table-create',
-        tableId,
+        tableId: table.tableId,
         table,
       })
       console.log('[GameTable] 已广播 table-create 消息到', connectedPeers.value.length, '个节点')
@@ -2379,6 +2434,28 @@ export const useRoomStore = defineStore('room', () => {
 
     // 切换到游戏视图
     setView('games')
+  }
+
+  function joinGameTableByNumber(tableNumber: string, password?: string): boolean {
+    console.log('[GameTable] 尝试通过桌号加入:', tableNumber)
+
+    // 使用 TableManager 查找桌子
+    const table = tableManager.getTableByNumber(tableNumber)
+
+    if (!table) {
+      lastError.value = `桌号 #${tableNumber} 不存在`
+      return false
+    }
+
+    // 验证密码
+    if (!tableManager.verifyPassword(tableNumber, password || '')) {
+      lastError.value = '密码错误'
+      return false
+    }
+
+    // 加入桌子
+    joinGameTable(table.tableId, false)
+    return true
   }
 
   function joinGameTable(tableId: string, asSpectator: boolean): void {
@@ -2436,7 +2513,11 @@ export const useRoomStore = defineStore('room', () => {
 
     // 如果桌上没人了，删除游戏桌
     if (table.players.length === 0 && table.spectators.length === 0) {
-      gameTables.delete(currentTableId.value)
+      const tableId = currentTableId.value
+      gameTables.delete(tableId)
+
+      // 同步到 TableManager
+      tableManager.destroyTable(tableId)
     }
 
     currentTableId.value = null
@@ -2549,14 +2630,61 @@ export const useRoomStore = defineStore('room', () => {
 
   function inviteToTable(tableId: string, peerId: string): void {
     const table = gameTables.get(tableId)
-    if (!table) return
+    if (!table || !table.tableNumber) return
+
+    // 使用 InviteManager 创建邀请
+    const invite = inviteManager.createInvite(
+      myId.value,
+      peerId,
+      tableId,
+      table.tableNumber,
+      table.gameType,
+      `${myProfile.value.nick || '我'} 邀请你加入游戏`,
+    )
 
     // 发送邀请消息给指定玩家
     mesh?.sendTo(peerId, {
-      kind: 'table-invite',
-      tableId,
-      gameName: getGameMeta(table.gameType)?.name || '游戏',
+      kind: 'invite-send',
+      invite,
     })
+
+    console.log('[Invite] 已发送邀请:', invite.inviteId, 'to', peerId)
+  }
+
+  function acceptInvite(inviteId: string): void {
+    const invite = inviteManager.acceptInvite(inviteId)
+    if (!invite) {
+      lastError.value = '邀请已过期或无效'
+      return
+    }
+
+    // 通知邀请者
+    mesh?.sendTo(invite.fromPeerId, {
+      kind: 'invite-accept',
+      inviteId,
+    })
+
+    // 加入游戏桌（使用桌号）
+    joinGameTableByNumber(invite.tableNumber)
+
+    // 从待处理列表移除
+    pendingInvites.value = pendingInvites.value.filter(i => i.inviteId !== inviteId)
+  }
+
+  function declineInvite(inviteId: string): void {
+    const invite = inviteManager.getInvite(inviteId)
+    if (!invite) return
+
+    inviteManager.declineInvite(inviteId)
+
+    // 通知邀请者
+    mesh?.sendTo(invite.fromPeerId, {
+      kind: 'invite-decline',
+      inviteId,
+    })
+
+    // 从待处理列表移除
+    pendingInvites.value = pendingInvites.value.filter(i => i.inviteId !== inviteId)
   }
 
   // —— 匹配功能 ——
@@ -2565,7 +2693,31 @@ export const useRoomStore = defineStore('room', () => {
     if (!mesh || myMatchingGame.value) return
 
     myMatchingGame.value = gameType
-    console.log('[Matching] 开始匹配:', gameType)
+    console.log('[Matching] 开始快速匹配:', gameType)
+
+    // 1. 先查找等待中的公开桌
+    const waitingTables = tableManager.getWaitingTables(gameType)
+    const meta = getGameMeta(gameType)
+
+    if (!meta) {
+      lastError.value = `未知游戏类型: ${gameType}`
+      myMatchingGame.value = null
+      return
+    }
+
+    // 找到有空位的桌子
+    for (const table of waitingTables) {
+      if (table.players.length < meta.playerCount) {
+        console.log('[Matching] 找到等待桌:', table.tableId, table.tableNumber)
+        joinGameTable(table.tableId, false)
+        myMatchingGame.value = null
+        return
+      }
+    }
+
+    // 2. 没有合适的桌子，创建新桌并等待
+    console.log('[Matching] 创建新桌等待匹配')
+    createGameTable(gameType, true) // 创建公开桌
 
     // 广播匹配请求
     mesh.broadcast({
@@ -2573,37 +2725,20 @@ export const useRoomStore = defineStore('room', () => {
       gameType,
     })
 
-    // 检查是否有人在等待
-    const queue = matchingQueues.get(gameType) || []
-    if (queue.length > 0) {
-      // 立即匹配到第一个等待者
-      const partnerId = queue[0]
-      console.log('[Matching] 找到等待者:', partnerId)
-      matchWith(partnerId, gameType)
-    } else {
-      // 加入等待队列
-      queue.push(myId.value)
-      matchingQueues.set(gameType, queue)
-      console.log('[Matching] 加入等待队列:', queue.length)
-    }
+    // 设置60秒超时
+    setTimeout(() => {
+      if (myMatchingGame.value === gameType) {
+        console.log('[Matching] 匹配超时')
+        lastError.value = '匹配超时，建议邀请好友加入'
+        myMatchingGame.value = null
+      }
+    }, 60 * 1000)
   }
 
   function cancelMatching(gameType: GameType): void {
     if (!mesh || myMatchingGame.value !== gameType) return
 
     console.log('[Matching] 取消匹配:', gameType)
-
-    // 从队列中移除
-    const queue = matchingQueues.get(gameType)
-    if (queue) {
-      const index = queue.indexOf(myId.value)
-      if (index >= 0) {
-        queue.splice(index, 1)
-        if (queue.length === 0) {
-          matchingQueues.delete(gameType)
-        }
-      }
-    }
 
     // 广播取消匹配
     mesh.broadcast({
@@ -2612,34 +2747,49 @@ export const useRoomStore = defineStore('room', () => {
     })
 
     myMatchingGame.value = null
+
+    // 如果已经创建了桌子，离开桌子
+    if (currentTableId.value) {
+      const table = gameTables.get(currentTableId.value)
+      if (table && table.gameType === gameType && table.state === 'waiting' && table.players.length === 1) {
+        leaveGameTable()
+      }
+    }
   }
 
   function matchWith(partnerId: string, gameType: GameType): void {
-    console.log('[Matching] 匹配成功，创建游戏桌:', partnerId, gameType)
-
-    // 从队列中移除双方
-    const queue = matchingQueues.get(gameType)
-    if (queue) {
-      const idx1 = queue.indexOf(myId.value)
-      const idx2 = queue.indexOf(partnerId)
-      if (idx1 >= 0) queue.splice(idx1, 1)
-      if (idx2 >= 0) queue.splice(idx2, 1)
-      if (queue.length === 0) {
-        matchingQueues.delete(gameType)
-      }
-    }
+    console.log('[Matching] 匹配成功，邀请玩家:', partnerId, gameType)
 
     myMatchingGame.value = null
 
-    // 创建游戏桌（公开）
+    // 如果当前已在等待桌中，邀请对方加入
+    if (currentTableId.value) {
+      const table = gameTables.get(currentTableId.value)
+      if (table && table.gameType === gameType && table.state === 'waiting') {
+        // 通知对方加入
+        mesh?.sendTo(partnerId, {
+          kind: 'match-found',
+          tableId: currentTableId.value,
+          tableNumber: table.tableNumber,
+          gameType,
+        })
+        return
+      }
+    }
+
+    // 否则创建新桌
     createGameTable(gameType, true)
 
     // 通知对方加入
-    mesh?.sendTo(partnerId, {
-      kind: 'match-found',
-      tableId: currentTableId.value!,
-      gameType,
-    })
+    if (currentTableId.value) {
+      const table = gameTables.get(currentTableId.value)
+      mesh?.sendTo(partnerId, {
+        kind: 'match-found',
+        tableId: currentTableId.value,
+        tableNumber: table?.tableNumber,
+        gameType,
+      })
+    }
   }
 
   return {
@@ -2670,6 +2820,7 @@ export const useRoomStore = defineStore('room', () => {
     gameChats,
     gameMousePositions,
     gameStates,
+    pendingInvites,
     packing,
     theme,
     activeView,
@@ -2762,6 +2913,7 @@ export const useRoomStore = defineStore('room', () => {
     guessSetupReq,
     createGameTable,
     joinGameTable,
+    joinGameTableByNumber,
     leaveGameTable,
     startGameTable,
     sendGameMove,
@@ -2770,6 +2922,8 @@ export const useRoomStore = defineStore('room', () => {
     sitDownAtTable,
     standUpFromTable,
     inviteToTable,
+    acceptInvite,
+    declineInvite,
     startMatching,
     cancelMatching,
     myMatchingGame,

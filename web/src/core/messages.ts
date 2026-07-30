@@ -262,4 +262,8 @@ export type ControlMessage =
   // —— 匹配系统 ——
   | { kind: 'match-request'; gameType: string }
   | { kind: 'match-cancel'; gameType: string }
-  | { kind: 'match-found'; tableId: string; gameType: string }
+  | { kind: 'match-found'; tableId: string; tableNumber?: string; gameType: string }
+  // —— 邀请系统 ——
+  | { kind: 'invite-send'; invite: unknown }
+  | { kind: 'invite-accept'; inviteId: string }
+  | { kind: 'invite-decline'; inviteId: string }

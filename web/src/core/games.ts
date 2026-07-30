@@ -29,6 +29,8 @@ export type PlayerRole = 'player' | 'spectator'
 /** 游戏桌（一局游戏的容器） */
 export interface GameTable {
   tableId: string
+  /** 4-6位数字桌号（用户友好的加入方式） */
+  tableNumber?: string
   gameType: GameType
   /** 桌主（创建者） */
   hostId: string
@@ -36,6 +38,8 @@ export interface GameTable {
   state: TableState
   /** 公开/私有 */
   visibility: TableVisibility
+  /** 是否有密码保护 */
+  hasPassword?: boolean
   /** 玩家列表（peerId[]，按座位顺序） */
   players: string[]
   /** 旁观者列表 */

@@ -109,7 +109,7 @@ export type DrawMessage = Extract<
   { kind: `draw-${string}` } | { kind: `ptr-${string}` }
 >
 
-/** ControlMessage 中的游戏子集（你画我猜 / 五子棋 / 游戏桌 / 匹配）。 */
+/** ControlMessage 中的游戏子集（你画我猜 / 五子棋 / 游戏桌 / 匹配 / 邀请）。 */
 export type GameMessage = Extract<
   ControlMessage,
   | { kind: `guess-${string}` }
@@ -117,6 +117,7 @@ export type GameMessage = Extract<
   | { kind: `table-${string}` }
   | { kind: `game-${string}` }
   | { kind: `match-${string}` }
+  | { kind: `invite-${string}` }
   | { kind: 'mouse-pos' }
 >
 

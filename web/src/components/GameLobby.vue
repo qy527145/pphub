@@ -6,6 +6,7 @@ import { GAME_CATALOG, getGameMeta, type GameType, type GameTable } from '@/core
 import PeerAvatar from './PeerAvatar.vue'
 import GameTableView from './GameTable.vue'
 import AppIcon from './AppIcon.vue'
+import TableJoinDialog from './TableJoinDialog.vue'
 
 const store = useRoomStore()
 
@@ -16,6 +17,11 @@ const inGameTable = computed(() => !!store.currentTableId)
 const showCreateDialog = ref(false)
 const selectedGameType = ref<GameType>('gomoku')
 const isPublicTable = ref(true)
+const usePassword = ref(false)
+const password = ref('')
+
+// 加入桌子对话框
+const showJoinDialog = ref(false)
 
 // 匹配功能
 const matching = ref(false)
@@ -36,6 +42,9 @@ const publicTables = computed(() => {
 
 function openCreateDialog() {
   showCreateDialog.value = true
+  // 重置表单
+  usePassword.value = false
+  password.value = ''
 }
 
 function closeCreateDialog() {
@@ -43,7 +52,8 @@ function closeCreateDialog() {
 }
 
 function createTable() {
-  store.createGameTable(selectedGameType.value, isPublicTable.value)
+  const pwd = usePassword.value && password.value.trim() ? password.value.trim() : undefined
+  store.createGameTable(selectedGameType.value, isPublicTable.value, pwd)
   closeCreateDialog()
 }
 
@@ -137,10 +147,16 @@ watch(() => store.gameTables.size, () => {
         <h2>🎮 游戏大厅</h2>
         <p class="subtitle">加入公开桌子，或创建自己的游戏桌</p>
       </div>
-      <button class="btn-create" @click="openCreateDialog">
-        <AppIcon name="plus" :size="16" />
-        创建游戏桌
-      </button>
+      <div class="header-actions">
+        <button class="btn-join-number" @click="showJoinDialog = true">
+          <AppIcon name="hash" :size="16" />
+          输入桌号
+        </button>
+        <button class="btn-create" @click="openCreateDialog">
+          <AppIcon name="plus" :size="16" />
+          创建游戏桌
+        </button>
+      </div>
     </header>
 
     <div class="lobby-content">
@@ -198,7 +214,11 @@ watch(() => store.gameTables.size, () => {
             <div class="table-game">
               <span class="game-icon">{{ getGameMeta(table.gameType)?.icon }}</span>
               <div class="game-info">
-                <h3>{{ getGameMeta(table.gameType)?.name }}</h3>
+                <div class="game-title">
+                  <h3>{{ getGameMeta(table.gameType)?.name }}</h3>
+                  <span v-if="table.tableNumber" class="table-number">#{{ table.tableNumber }}</span>
+                  <span v-if="table.hasPassword" class="password-badge" title="需要密码">🔒</span>
+                </div>
                 <p>{{ getGameMeta(table.gameType)?.description }}</p>
               </div>
             </div>
@@ -308,6 +328,23 @@ watch(() => store.gameTables.size, () => {
           </div>
 
           <div class="form-group">
+            <label>
+              <input type="checkbox" v-model="usePassword" class="checkbox" />
+              设置密码保护
+            </label>
+            <div v-if="usePassword" class="password-input-group">
+              <input
+                v-model="password"
+                type="password"
+                placeholder="输入密码（4-16位）"
+                maxlength="16"
+                class="password-input"
+              />
+              <p class="hint">设置密码后，只有知道密码的人才能加入</p>
+            </div>
+          </div>
+
+          <div class="form-group">
             <label>选择游戏</label>
             <div class="game-select-scroll">
               <div
@@ -337,6 +374,9 @@ watch(() => store.gameTables.size, () => {
         </footer>
       </div>
     </div>
+
+    <!-- 加入游戏桌对话框 -->
+    <TableJoinDialog v-if="showJoinDialog" @close="showJoinDialog = false" />
   </div>
 </template>
 
@@ -369,6 +409,12 @@ watch(() => store.gameTables.size, () => {
   color: var(--muted);
 }
 
+.header-actions {
+  display: flex;
+  gap: 12px;
+}
+
+.btn-join-number,
 .btn-create,
 .btn-create-big {
   display: flex;
@@ -377,12 +423,27 @@ watch(() => store.gameTables.size, () => {
   padding: 10px 20px;
   border: none;
   border-radius: var(--radius);
-  background: var(--accent);
-  color: white;
   font-size: 14px;
   font-weight: 600;
   cursor: pointer;
   transition: all 0.2s;
+}
+
+.btn-join-number {
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--border);
+}
+
+.btn-join-number:hover {
+  background: var(--hover);
+  border-color: var(--accent);
+}
+
+.btn-create,
+.btn-create-big {
+  background: var(--accent);
+  color: white;
 }
 
 .btn-create:hover,
@@ -676,10 +737,31 @@ watch(() => store.gameTables.size, () => {
   min-width: 0;
 }
 
+.game-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+
 .game-info h3 {
-  margin: 0 0 4px 0;
+  margin: 0;
   font-size: 16px;
   color: var(--text);
+}
+
+.table-number {
+  padding: 2px 8px;
+  background: var(--accent-weak);
+  color: var(--accent-strong);
+  border-radius: var(--radius-pill);
+  font-size: 12px;
+  font-weight: 600;
+  font-family: monospace;
+}
+
+.password-badge {
+  font-size: 14px;
 }
 
 .game-info p {
@@ -915,11 +997,46 @@ watch(() => store.gameTables.size, () => {
 }
 
 .form-group label {
-  display: block;
+  display: flex;
+  align-items: center;
+  gap: 8px;
   margin-bottom: 12px;
   font-size: 14px;
   font-weight: 600;
   color: var(--text);
+}
+
+.checkbox {
+  width: 18px;
+  height: 18px;
+  cursor: pointer;
+}
+
+.password-input-group {
+  margin-top: 12px;
+}
+
+.password-input {
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg);
+  color: var(--text);
+  font-size: 14px;
+  transition: all 0.2s;
+}
+
+.password-input:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-weak);
+}
+
+.hint {
+  margin: 6px 0 0 0;
+  font-size: 12px;
+  color: var(--muted);
 }
 
 .game-select-scroll {

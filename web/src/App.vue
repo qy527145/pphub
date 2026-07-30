@@ -9,6 +9,7 @@ import ChatView from '@/components/ChatView.vue'
 import ScreenView from '@/components/ScreenView.vue'
 import BoardView from '@/components/BoardView.vue'
 import GameLobby from '@/components/GameLobby.vue'
+import InviteNotification from '@/components/InviteNotification.vue'
 
 const store = useRoomStore()
 
@@ -67,6 +68,9 @@ watch(() => store.activeView, (newView, oldView) => {
       <GameLobby v-else-if="store.activeView === 'games'" />
       <ChatView v-else />
     </main>
+
+    <!-- 邀请通知（全局浮动） -->
+    <InviteNotification />
   </div>
 </template>
 

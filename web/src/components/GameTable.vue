@@ -129,7 +129,10 @@ const showInviteDialog = ref(false)
   <div v-if="currentTable && gameMeta" class="game-table">
     <header class="table-header">
       <div class="table-info">
-        <h2>{{ gameMeta.icon }} {{ gameMeta.name }}</h2>
+        <h2>
+          {{ gameMeta.icon }} {{ gameMeta.name }}
+          <span v-if="currentTable.tableNumber" class="table-number">#{{ currentTable.tableNumber }}</span>
+        </h2>
         <span class="table-state">
           {{ currentTable.state === 'waiting' ? '等待中' : currentTable.state === 'playing' ? '游戏中' : '已结束' }}
         </span>
@@ -352,6 +355,19 @@ const showInviteDialog = ref(false)
   margin: 0;
   font-size: 20px;
   color: var(--text);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.table-number {
+  padding: 2px 8px;
+  background: var(--accent-weak);
+  color: var(--accent-strong);
+  border-radius: var(--radius-pill);
+  font-size: 14px;
+  font-weight: 600;
+  font-family: monospace;
 }
 
 .table-state {
