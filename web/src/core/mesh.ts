@@ -464,7 +464,7 @@ export class Mesh extends Emitter<MeshEvents> {
   /** 向所有对端广播任意 control 消息（通道未就绪的对端静默跳过）。 */
   broadcast(msg: ControlMessage): void {
     if (this.topology.getMode() === 'hierarchical') {
-      // 分层模式：智能路由
+      // 分层模式：智能路由，但保持所有 P2P 连接
       this.broadcastHierarchical(msg)
     } else {
       // 全连接模式：直接广播
@@ -475,48 +475,25 @@ export class Mesh extends Emitter<MeshEvents> {
   /** 分层模式下的智能广播 */
   private broadcastHierarchical(msg: ControlMessage): void {
     const sent = new Set<string>()
+    const required = this.topology.getRequiredConnections()
 
-    // 1. 向同组所有成员直接发送
-    const myGroupId = this.topology.getGroupId(this.myId)
-    if (myGroupId) {
-      const myGroup = this.topology.getGroupsList().find((g) => g.id === myGroupId)
-      if (myGroup) {
-        for (const member of myGroup.members) {
-          if (member !== this.myId) {
-            this.peers.get(member)?.sendControl(msg)
-            sent.add(member)
-          }
-        }
+    // 优先使用拓扑要求的连接
+    for (const peerId of required) {
+      const peer = this.peers.get(peerId)
+      if (peer) {
+        peer.sendControl(msg)
+        sent.add(peerId)
       }
     }
 
-    // 2. 如果我是组长，向其他组长发送
-    if (this.topology.isLeader()) {
-      const leaders = this.topology.getLeaders()
-      for (const leader of leaders) {
-        if (leader !== this.myId && !sent.has(leader)) {
-          // 包装为中继消息，由对方组长转发给组员
-          const relayMsg: ControlMessage = {
-            kind: 'relay-forward',
-            originalFrom: this.myId,
-            finalTo: '*', // 广播标记
-            payload: msg,
-          }
-          this.peers.get(leader)?.sendControl(relayMsg)
-          sent.add(leader)
+    // 注意：不需要向非必需节点发送，因为他们会通过拓扑路由收到消息
+    // 但如果是拓扑通告等特殊消息，可能需要广播到所有人
+    if (msg.kind === 'topo-announce' || msg.kind === 'leader-elect') {
+      // 拓扑消息：发给所有人
+      for (const [peerId, peer] of this.peers) {
+        if (!sent.has(peerId)) {
+          peer.sendControl(msg)
         }
-      }
-    } else {
-      // 3. 如果我是组员，向我的组长发送（由组长转发到其他组）
-      const myLeader = this.topology.getMyLeader()
-      if (myLeader && myLeader !== this.myId && !sent.has(myLeader)) {
-        const relayMsg: ControlMessage = {
-          kind: 'relay-forward',
-          originalFrom: this.myId,
-          finalTo: '*',
-          payload: msg,
-        }
-        this.peers.get(myLeader)?.sendControl(relayMsg)
       }
     }
   }
@@ -1065,41 +1042,35 @@ export class Mesh extends Emitter<MeshEvents> {
     const required = this.topology.getRequiredConnections()
     const current = new Set(this.peers.keys())
 
-    let closedCount = 0
-    let keptCount = 0
+    console.log('[mesh] Topology optimization: marking inactive connections...')
+    console.log('[mesh] Required connections:', required.size)
+    console.log('[mesh] Current connections:', current.size)
+
+    // 重要：不关闭连接，只标记为"不活跃"
+    // 这样保持 P2P 通道，避免降级到服务器中继
+    let markedCount = 0
+    let activeCount = 0
 
     for (const peerId of current) {
-      if (!required.has(peerId)) {
-        // 使用字典序规则保证对称性：
-        // 只有 myId > peerId 时才关闭连接
-        // 这样保证 A->B 和 B->A 只有一个方向被关闭
-        if (this.myId > peerId) {
-          const peer = this.peers.get(peerId)
-          if (peer) {
-            console.log(
-              `[mesh] Closing → ${peerId.slice(0, 8)} ` +
-              `(${this.myId.slice(0, 8)} > ${peerId.slice(0, 8)})`
-            )
-            peer.close()
-            this.peers.delete(peerId)
-            closedCount++
-          }
-        } else {
-          console.log(
-            `[mesh] Keeping → ${peerId.slice(0, 8)} ` +
-            `(${this.myId.slice(0, 8)} < ${peerId.slice(0, 8)}, peer should close)`
-          )
-          keptCount++
-        }
+      if (required.has(peerId)) {
+        // 必需的连接：标记为活跃
+        activeCount++
+      } else {
+        // 不需要的连接：不关闭，但标记为备用
+        // 这些连接仍然可用于冗余路由
+        markedCount++
+        console.log(
+          `[mesh] Marking as backup: ${peerId.slice(0, 8)} ` +
+          `(keeping WebRTC, not using for primary routing)`
+        )
       }
     }
 
     console.log(
-      `[mesh] Symmetric optimization: ` +
-      `closed ${closedCount}, ` +
-      `kept ${keptCount} (waiting for peer), ` +
-      `active ${this.peers.size} ` +
-      `(saved ~${closedCount > 0 ? Math.round((closedCount / (closedCount + keptCount)) * 100) : 0}%)`
+      `[mesh] Topology ready: ` +
+      `${activeCount} active, ` +
+      `${markedCount} backup, ` +
+      `total ${this.peers.size} WebRTC connections maintained`
     )
 
     // 广播更新后的邻接表
