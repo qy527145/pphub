@@ -38,6 +38,7 @@ import {
   packChunk,
   unpackChunk,
 } from './swarm'
+import { TopologyManager, type TopologyMode, type NetworkGroup } from './topology'
 
 type MeshEvents = {
   self: string
@@ -53,6 +54,10 @@ type MeshEvents = {
   'peer-links': { peerId: string; links: { peerId: string; state: string; rtt?: number }[] }
   /** 某对端的 control 通道就绪（可向其补发状态同步，如白板全量）。 */
   'peer-channel-open': string
+  /** 拓扑模式变化 */
+  'topology-mode': TopologyMode
+  /** 网络分组更新 */
+  'topology-groups': NetworkGroup[]
   chat: { from: string; msgId: string; text: string; ts: number; scope: 'all' | 'dm' }
   /** 对端对某条消息的表情回应。 */
   react: { from: string; msgId: string; emoji: string; op: 'add' | 'remove'; scope: 'all' | 'dm' }
@@ -175,6 +180,9 @@ export class Mesh extends Emitter<MeshEvents> {
   private readonly remoteScreenDecode = new Map<string, boolean>()
   private iceServers: RTCIceServer[] = []
 
+  // 拓扑管理器（网络优化）
+  private readonly topology: TopologyManager
+
   // 强制发送（推）登记表（按传输 id 索引；id 全局随机，跨 peer 不冲突）。
   private readonly pendingOffers = new Map<string, { peerId: string; offer: FileOffer }>()
   private readonly pendingChannels = new Map<string, ChannelLike>()
@@ -215,12 +223,25 @@ export class Mesh extends Emitter<MeshEvents> {
   /** 已就「本机无法解码」报过警的对端，避免每个包刷一条错误。 */
   private readonly decodeWarned = new Set<string>()
 
-  constructor(signaling: Signaling) {
+  constructor(signaling: Signaling, topologyMode: TopologyMode = 'hierarchical') {
     super()
     this.signaling = signaling
+    this.topology = new TopologyManager()
     this.wireSignaling()
+    this.wireTopology()
     // RTT 探测 + 邻接表（含 RTT）周期广播；leave 时清除。
     this.pingTimer = setInterval(() => this.pingAll(), 5000)
+
+    // 从 localStorage 读取拓扑模式配置，默认使用分层模式
+    const savedMode = localStorage.getItem('pphub:topology:mode') as TopologyMode | null
+    if (savedMode === 'hierarchical' || savedMode === 'full-mesh') {
+      topologyMode = savedMode
+    } else if (!savedMode) {
+      // 首次使用，默认分层模式
+      topologyMode = 'hierarchical'
+      localStorage.setItem('pphub:topology:mode', 'hierarchical')
+    }
+    this.topology.setMode(topologyMode)
   }
 
   /** 向所有通道就绪的对端发一轮 ping；久未应答的记录顺带过期。 */
@@ -240,6 +261,14 @@ export class Mesh extends Emitter<MeshEvents> {
       this.lastLinksBroadcast = now
       this.broadcastLinks()
     }
+
+    // 如果我是组长，定期广播拓扑信息
+    if (this.topology.isLeader()) {
+      const announce = this.topology.generateAnnounce()
+      if (announce) {
+        this.broadcast(announce)
+      }
+    }
   }
 
   private lastLinksBroadcast = 0
@@ -248,6 +277,8 @@ export class Mesh extends Emitter<MeshEvents> {
     this.signaling.on('joined', ({ peerId, peers }) => {
       this.myId = peerId
       this.emit('self', peerId)
+      // 初始化拓扑管理器
+      this.topology.initialize(peerId, this.topology.getMode())
       for (const p of peers) {
         this.nicks.set(p.peerId, p.nick ?? undefined)
         this.addPeer(p.peerId)
@@ -279,6 +310,45 @@ export class Mesh extends Emitter<MeshEvents> {
     })
   }
 
+  /** 连接拓扑管理器的事件 */
+  private wireTopology(): void {
+    this.topology.on('mode-change', (mode) => {
+      this.emit('topology-mode', mode)
+      // 保存到 localStorage
+      localStorage.setItem('pphub:topology:mode', mode)
+    })
+
+    this.topology.on('groups-update', (groups) => {
+      this.emit('topology-groups', groups)
+    })
+
+    this.topology.on('leader-change', ({ groupId, newLeader }) => {
+      console.log(`[mesh] Group ${groupId} leader changed to ${newLeader}`)
+      // 如果新组长是本节点，需要建立与其他组长的连接
+      if (newLeader === this.myId) {
+        const leaders = this.topology.getLeaders()
+        for (const leader of leaders) {
+          if (leader !== this.myId && !this.peers.has(leader)) {
+            this.addPeer(leader)
+          }
+        }
+      }
+    })
+
+    this.topology.on('connect-peer', (peerId) => {
+      console.log(`[mesh] Topology requires connection to ${peerId}`)
+      if (!this.peers.has(peerId)) {
+        this.addPeer(peerId)
+      }
+    })
+
+    this.topology.on('disconnect-peer', (peerId) => {
+      console.log(`[mesh] Topology allows disconnection from ${peerId}`)
+      // 注意：不立即断开，避免频繁震荡
+      // 可以在下次拓扑评估时再决定是否真正断开
+    })
+  }
+
   /**
    * 加入房间：连接 → 领取 ICE 凭证 → 发送 join → 等待服务端应答。
    * `listen` 表示以短码监听者身份声明房间所有权（撞码时服务端拒绝）。
@@ -297,6 +367,18 @@ export class Mesh extends Emitter<MeshEvents> {
 
     const ack = this.waitJoined()
     this.signaling.send({ t: 'join', room, peerId: this.myId, nick: profile.nick, listen })
+
+    // 延迟进行拓扑优化（如果是分层或树状模式）
+    ack.then(() => {
+      if (this.topology.getMode() !== 'full-mesh') {
+        // 等待 10 秒让所有连接建立并收集 RTT 数据
+        setTimeout(() => {
+          console.log('[mesh] Starting topology optimization...')
+          this.optimizeTopology()
+        }, 10000)
+      }
+    })
+
     return ack
   }
 
@@ -381,12 +463,108 @@ export class Mesh extends Emitter<MeshEvents> {
 
   /** 向所有对端广播任意 control 消息（通道未就绪的对端静默跳过）。 */
   broadcast(msg: ControlMessage): void {
-    for (const peer of this.peers.values()) peer.sendControl(msg)
+    if (this.topology.getMode() === 'hierarchical') {
+      // 分层模式：智能路由
+      this.broadcastHierarchical(msg)
+    } else {
+      // 全连接模式：直接广播
+      for (const peer of this.peers.values()) peer.sendControl(msg)
+    }
+  }
+
+  /** 分层模式下的智能广播 */
+  private broadcastHierarchical(msg: ControlMessage): void {
+    const sent = new Set<string>()
+
+    // 1. 向同组所有成员直接发送
+    const myGroupId = this.topology.getGroupId(this.myId)
+    if (myGroupId) {
+      const myGroup = this.topology.getGroupsList().find((g) => g.id === myGroupId)
+      if (myGroup) {
+        for (const member of myGroup.members) {
+          if (member !== this.myId) {
+            this.peers.get(member)?.sendControl(msg)
+            sent.add(member)
+          }
+        }
+      }
+    }
+
+    // 2. 如果我是组长，向其他组长发送
+    if (this.topology.isLeader()) {
+      const leaders = this.topology.getLeaders()
+      for (const leader of leaders) {
+        if (leader !== this.myId && !sent.has(leader)) {
+          // 包装为中继消息，由对方组长转发给组员
+          const relayMsg: ControlMessage = {
+            kind: 'relay-forward',
+            originalFrom: this.myId,
+            finalTo: '*', // 广播标记
+            payload: msg,
+          }
+          this.peers.get(leader)?.sendControl(relayMsg)
+          sent.add(leader)
+        }
+      }
+    } else {
+      // 3. 如果我是组员，向我的组长发送（由组长转发到其他组）
+      const myLeader = this.topology.getMyLeader()
+      if (myLeader && myLeader !== this.myId && !sent.has(myLeader)) {
+        const relayMsg: ControlMessage = {
+          kind: 'relay-forward',
+          originalFrom: this.myId,
+          finalTo: '*',
+          payload: msg,
+        }
+        this.peers.get(myLeader)?.sendControl(relayMsg)
+      }
+    }
   }
 
   /** 向指定对端发送一条 control 消息；未就绪返回 false。 */
   sendTo(peerId: string, msg: ControlMessage): boolean {
-    return this.peers.get(peerId)?.sendControl(msg) ?? false
+    if (this.topology.getMode() === 'hierarchical') {
+      return this.sendToHierarchical(peerId, msg)
+    } else {
+      return this.peers.get(peerId)?.sendControl(msg) ?? false
+    }
+  }
+
+  /** 分层模式下的点对点发送 */
+  private sendToHierarchical(peerId: string, msg: ControlMessage): boolean {
+    // 同组：直接发送
+    if (this.topology.inSameGroup(this.myId, peerId)) {
+      return this.peers.get(peerId)?.sendControl(msg) ?? false
+    }
+
+    // 跨组：通过组长中继
+    const myLeader = this.topology.getMyLeader()
+    const targetLeader = this.topology.getLeader(peerId)
+
+    if (!myLeader || !targetLeader) {
+      // 拓扑尚未就绪，降级为直接发送
+      return this.peers.get(peerId)?.sendControl(msg) ?? false
+    }
+
+    // 我是组长：直接发给对方组长
+    if (this.topology.isLeader() && myLeader === this.myId) {
+      const relayMsg: ControlMessage = {
+        kind: 'relay-forward',
+        originalFrom: this.myId,
+        finalTo: peerId,
+        payload: msg,
+      }
+      return this.peers.get(targetLeader)?.sendControl(relayMsg) ?? false
+    }
+
+    // 我是组员：发给我的组长
+    const relayMsg: ControlMessage = {
+      kind: 'relay-forward',
+      originalFrom: this.myId,
+      finalTo: peerId,
+      payload: msg,
+    }
+    return this.peers.get(myLeader)?.sendControl(relayMsg) ?? false
   }
 
   /** 当前各对端连接状态（link-state 广播 + 本端网络视图），附实测 RTT。 */
@@ -820,6 +998,119 @@ export class Mesh extends Emitter<MeshEvents> {
     }
   }
 
+  /** 设置拓扑模式 */
+  setTopologyMode(mode: TopologyMode): void {
+    this.topology.setMode(mode)
+  }
+
+  /** 获取当前拓扑模式 */
+  getTopologyMode(): TopologyMode {
+    return this.topology.getMode()
+  }
+
+  /** 获取拓扑统计信息 */
+  getTopologyStats() {
+    return this.topology.getStats()
+  }
+
+  /** 优化拓扑连接：关闭不需要的连接 */
+  private optimizeTopology(): void {
+    const mode = this.topology.getMode()
+    console.log(`[mesh] Optimizing topology (mode: ${mode})`)
+
+    if (mode === 'full-mesh') {
+      // 全连接模式：保持所有连接
+      console.log('[mesh] Full-mesh mode: keeping all connections')
+      return
+    }
+
+    // 获取拓扑要求的连接
+    const required = this.topology.getRequiredConnections()
+    const current = new Set(this.peers.keys())
+
+    console.log(`[mesh] Required connections: ${required.size}`)
+    console.log(`[mesh] Current connections: ${current.size}`)
+
+    // 重要：广播拓扑信息到所有节点，确保一致性
+    console.log('[mesh] Broadcasting topology information...')
+    this.broadcastTopologyInfo()
+
+    // 延迟关闭连接，等待拓扑信息同步
+    setTimeout(() => {
+      this.closeUnnecessaryConnections()
+    }, 2000)
+  }
+
+  /** 广播拓扑信息（分组结果） */
+  private broadcastTopologyInfo(): void {
+    const groups = this.topology.getGroupsList()
+
+    // 构造拓扑信息消息
+    for (const group of groups) {
+      const topoMsg: ControlMessage = {
+        kind: 'topo-announce',
+        groupId: group.id,
+        leader: group.leader,
+        members: Array.from(group.members),
+        version: Date.now(), // 使用时间戳作为版本号
+      }
+
+      // 广播到所有节点
+      this.broadcast(topoMsg)
+    }
+  }
+
+  /** 关闭不需要的连接（在同步后执行） */
+  private closeUnnecessaryConnections(): void {
+    const required = this.topology.getRequiredConnections()
+    const current = new Set(this.peers.keys())
+
+    let closedCount = 0
+    let keptCount = 0
+
+    for (const peerId of current) {
+      if (!required.has(peerId)) {
+        // 使用字典序规则保证对称性：
+        // 只有 myId > peerId 时才关闭连接
+        // 这样保证 A->B 和 B->A 只有一个方向被关闭
+        if (this.myId > peerId) {
+          const peer = this.peers.get(peerId)
+          if (peer) {
+            console.log(
+              `[mesh] Closing → ${peerId.slice(0, 8)} ` +
+              `(${this.myId.slice(0, 8)} > ${peerId.slice(0, 8)})`
+            )
+            peer.close()
+            this.peers.delete(peerId)
+            closedCount++
+          }
+        } else {
+          console.log(
+            `[mesh] Keeping → ${peerId.slice(0, 8)} ` +
+            `(${this.myId.slice(0, 8)} < ${peerId.slice(0, 8)}, peer should close)`
+          )
+          keptCount++
+        }
+      }
+    }
+
+    console.log(
+      `[mesh] Symmetric optimization: ` +
+      `closed ${closedCount}, ` +
+      `kept ${keptCount} (waiting for peer), ` +
+      `active ${this.peers.size} ` +
+      `(saved ~${closedCount > 0 ? Math.round((closedCount / (closedCount + keptCount)) * 100) : 0}%)`
+    )
+
+    // 广播更新后的邻接表
+    this.broadcastLinks()
+  }
+
+  /** 手动触发拓扑优化（用于测试或手动控制） */
+  triggerTopologyOptimization(): void {
+    this.optimizeTopology()
+  }
+
   getNick(peerId: string): string | undefined {
     return this.nicks.get(peerId)
   }
@@ -831,6 +1122,7 @@ export class Mesh extends Emitter<MeshEvents> {
     }
     this.pendingPings.clear()
     this.rtts.clear()
+    this.topology.dispose()
     if (this.voiceStream) {
       for (const track of this.voiceStream.getTracks()) track.stop()
       this.voiceStream = null
@@ -871,6 +1163,9 @@ export class Mesh extends Emitter<MeshEvents> {
   private addPeer(remoteId: string): Peer {
     const existing = this.peers.get(remoteId)
     if (existing) return existing
+
+    // 在分层模式下，暂时延迟建立连接，等待拓扑计算完成
+    // 注意：这里仍然创建 Peer，但可以在后续优化中实现按需连接
 
     const initiator = this.myId < remoteId
     const peer = new Peer({
@@ -993,6 +1288,14 @@ export class Mesh extends Emitter<MeshEvents> {
           const rtt = Math.max(0, Math.round(performance.now() - p.sentAt))
           this.rtts.set(from, rtt)
           this.emit('peer-rtt', { peerId: from, rtt })
+
+          // 更新拓扑管理器的质量数据
+          const peer = this.peers.get(from)
+          this.topology.updateQuality(from, {
+            rtt,
+            state: peer?.connectionState ?? 'new',
+            iceType: this.getIceType(peer),
+          })
         }
         break
       }
@@ -1171,7 +1474,151 @@ export class Mesh extends Emitter<MeshEvents> {
           if (dl.ownsReq(msg.reqId)) dl.onNak(from, msg.reqId)
         })
         break
+      // —— 拓扑管理消息 ——
+      case 'topo-announce':
+        // 收到拓扑通告：同步远端的分组信息
+        console.log(`[mesh] Received topology from ${from.slice(0, 8)}:`, msg)
+        this.handleTopologyAnnounce(from, msg)
+        break
+      case 'leader-elect':
+        this.topology.handleLeaderElect(from, msg)
+        break
+      case 'leader-ack':
+        // 组长确认消息（预留，当前选举逻辑较简单）
+        break
+      case 'relay-forward':
+        // 收到中继消息：如果是发给我的，解包；如果我是组长且需要转发，继续转发
+        this.handleRelayForward(from, msg)
+        break
     }
+  }
+
+  /** 处理拓扑通告消息 */
+  private handleTopologyAnnounce(
+    from: string,
+    msg: Extract<ControlMessage, { kind: 'topo-announce' }>
+  ): void {
+    // 传递给拓扑管理器
+    this.topology.handleTopologyAnnounce(from, msg)
+
+    // 同步拓扑信息：根据收到的分组信息更新本地视图
+    // 注意：为了保持一致性，使用字典序最小的节点作为"协调者"
+    const allPeers = [this.myId, ...Array.from(this.peers.keys())].sort()
+    const coordinator = allPeers[0]
+
+    if (from === coordinator) {
+      // 收到协调者的拓扑信息，以此为准
+      console.log(`[mesh] Syncing topology from coordinator ${coordinator.slice(0, 8)}`)
+      // TODO: 应用协调者的拓扑决策
+    }
+  }
+
+  /** 处理中继转发消息 */
+  private handleRelayForward(from: string, msg: Extract<ControlMessage, { kind: 'relay-forward' }>): void {
+    const { originalFrom, finalTo, payload } = msg
+
+    // 如果是发给我的，直接处理
+    if (finalTo === this.myId) {
+      this.handleControl(originalFrom, payload)
+      return
+    }
+
+    // 如果是广播消息 (finalTo === '*')
+    if (finalTo === '*') {
+      // 1. 本节点处理一次
+      this.handleControl(originalFrom, payload)
+
+      // 2. 如果我是组长，转发给我的组员（除了来源）
+      if (this.topology.isLeader()) {
+        const myGroupId = this.topology.getGroupId(this.myId)
+        if (myGroupId) {
+          const myGroup = this.topology.getGroupsList().find((g) => g.id === myGroupId)
+          if (myGroup) {
+            for (const member of myGroup.members) {
+              if (member !== this.myId && member !== from && member !== originalFrom) {
+                this.peers.get(member)?.sendControl(msg)
+              }
+            }
+          }
+        }
+
+        // 3. 转发给其他组的组长（除了来源）
+        const leaders = this.topology.getLeaders()
+        for (const leader of leaders) {
+          if (leader !== this.myId && leader !== from && leader !== originalFrom) {
+            this.peers.get(leader)?.sendControl(msg)
+          }
+        }
+      }
+      return
+    }
+
+    // 如果是点对点消息，且我是组长，需要转发
+    if (this.topology.isLeader()) {
+      // 检查目标是否在我的组内
+      if (this.topology.inSameGroup(this.myId, finalTo)) {
+        // 目标在我的组内，直接转发
+        this.peers.get(finalTo)?.sendControl(payload)
+      } else {
+        // 目标在其他组，转发给目标的组长
+        const targetLeader = this.topology.getLeader(finalTo)
+        if (targetLeader && targetLeader !== this.myId) {
+          this.peers.get(targetLeader)?.sendControl(msg)
+        }
+      }
+    }
+  }
+
+  /** 获取 peer 的 ICE 类型（用于拓扑质量评估） */
+  private getIceType(peer: Peer | undefined): 'host' | 'srflx' | 'relay' | 'unknown' {
+    if (!peer) return 'unknown'
+    // 简化版：根据 transport 推断
+    // WebRTC relay 通常通过 TURN
+    // 实际实现可以从 ICE 候选中获取更精确的类型
+    if (peer.transport === 'relay') return 'relay'
+    // 默认假设是直连或 srflx
+    return 'host'
+  }
+
+  private removePeer(remoteId: string): void {
+    const peer = this.peers.get(remoteId)
+    if (!peer) return
+
+    // 从拓扑管理器移除
+    this.topology.removePeer(remoteId)
+
+    peer.close()
+    this.peers.delete(remoteId)
+    this.nicks.delete(remoteId)
+    this.remoteScreenDecode.delete(remoteId)
+    this.screenSenders.delete(remoteId)
+    this.codecViewers.delete(remoteId)
+    this.dropScreenDecoder(remoteId)
+    this.voiceSenders.delete(remoteId)
+    this.remoteVoiceStreams.delete(remoteId)
+    this.rtts.delete(remoteId)
+    for (const key of [...this.voiceParts.keys()]) {
+      if (key.startsWith(`${remoteId}|`)) this.voiceParts.delete(key)
+    }
+    // 该对端的未决 offer 不会再有数据通道了，直接清理。
+    for (const [id, p] of this.pendingOffers) {
+      if (p.peerId === remoteId) {
+        this.pendingOffers.delete(id)
+        this.emit('file-error', { id, reason: '对方已离线', canceled: false })
+      }
+    }
+    // 共享目录：把它从持有者中移除；无人持有的远端共享作废（下载中的除外，
+    // 留给会话内续传等源恢复）。
+    for (const [fileId, entry] of [...this.shares]) {
+      if (!entry.holders.delete(remoteId)) continue
+      this.downloads.get(fileId)?.dropSource(remoteId)
+      if (!entry.local && entry.holders.size === 0 && !this.downloads.has(fileId)) {
+        this.shares.delete(fileId)
+        this.emit('share-removed', { fileId })
+      }
+    }
+    this.broadcastLinks()
+    this.emit('peer-removed', remoteId)
   }
 
   /** 收到远端的 share-offer / share-list：登记为可下载条目。 */
@@ -1248,43 +1695,6 @@ export class Mesh extends Emitter<MeshEvents> {
       },
     })
     this.activeRecvs.set(offer.id, { peerId, handle })
-  }
-
-  private removePeer(remoteId: string): void {
-    const peer = this.peers.get(remoteId)
-    if (!peer) return
-    peer.close()
-    this.peers.delete(remoteId)
-    this.nicks.delete(remoteId)
-    this.remoteScreenDecode.delete(remoteId)
-    this.screenSenders.delete(remoteId)
-    this.codecViewers.delete(remoteId)
-    this.dropScreenDecoder(remoteId)
-    this.voiceSenders.delete(remoteId)
-    this.remoteVoiceStreams.delete(remoteId)
-    this.rtts.delete(remoteId)
-    for (const key of [...this.voiceParts.keys()]) {
-      if (key.startsWith(`${remoteId}|`)) this.voiceParts.delete(key)
-    }
-    // 该对端的未决 offer 不会再有数据通道了，直接清理。
-    for (const [id, p] of this.pendingOffers) {
-      if (p.peerId === remoteId) {
-        this.pendingOffers.delete(id)
-        this.emit('file-error', { id, reason: '对方已离线', canceled: false })
-      }
-    }
-    // 共享目录：把它从持有者中移除；无人持有的远端共享作废（下载中的除外，
-    // 留给会话内续传等源恢复）。
-    for (const [fileId, entry] of [...this.shares]) {
-      if (!entry.holders.delete(remoteId)) continue
-      this.downloads.get(fileId)?.dropSource(remoteId)
-      if (!entry.local && entry.holders.size === 0 && !this.downloads.has(fileId)) {
-        this.shares.delete(fileId)
-        this.emit('share-removed', { fileId })
-      }
-    }
-    this.broadcastLinks()
-    this.emit('peer-removed', remoteId)
   }
 }
 

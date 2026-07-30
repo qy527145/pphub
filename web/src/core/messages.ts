@@ -267,3 +267,12 @@ export type ControlMessage =
   | { kind: 'invite-send'; invite: unknown }
   | { kind: 'invite-accept'; inviteId: string }
   | { kind: 'invite-decline'; inviteId: string }
+  // —— 分层拓扑（网络优化）——
+  /** 拓扑通告：组长定期广播本组信息 */
+  | { kind: 'topo-announce'; groupId: string; leader: string; members: string[]; version: number }
+  /** 组长选举：发起新一轮选举 */
+  | { kind: 'leader-elect'; groupId: string; candidate: string; term: number }
+  /** 确认新组长 */
+  | { kind: 'leader-ack'; groupId: string; leader: string; term: number }
+  /** 消息中继：跨组消息通过组长转发 */
+  | { kind: 'relay-forward'; originalFrom: string; finalTo: string; payload: ControlMessage }

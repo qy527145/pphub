@@ -58,7 +58,7 @@ impl Config {
             max_peers: std::env::var("PPHUB_MAX_PEERS")
                 .ok()
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(6),
+                .unwrap_or(100), // 提高到 100，支持分层和树状拓扑
         }
     }
 }
