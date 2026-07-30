@@ -28,6 +28,15 @@
 浏览器支持 WebCodecs（https/localhost 下的现代 Chromium 系；Safari 17+）。
 不支持时 pphub 会直说原因，而不是给一个永远黑屏的画面。
 
+## 📚 文档
+
+- **[文档中心](./docs/README.md)** - 完整文档导航
+- **[网络拓扑优化](./docs/topology/)** - 支持 100+ 人大规模网络
+  - [快速开始](./docs/topology/02-QUICKSTART.md) - 5分钟上手
+  - [模式对比](./docs/topology/03-COMPARISON.md) - 三种拓扑模式详解
+  - [P2P 修复说明](./docs/topology/01-P2P-FIX.md) - 最新修复
+- **[游戏大厅](./docs/game-lobby/)** - 游戏功能文档
+
 ## 快速开始
 
 ```bash
