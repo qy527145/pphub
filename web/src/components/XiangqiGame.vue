@@ -1,6 +1,6 @@
 <script setup lang="ts">
 // 中国象棋游戏组件
-import { computed, ref, watch } from 'vue'
+import { computed, ref, watch, onMounted, onUnmounted } from 'vue'
 import { useRoomStore } from '@/stores/room'
 import type { GameTable } from '@/core/games'
 import {
@@ -9,6 +9,10 @@ import {
   getXiangqiMoves,
   isValidXiangqiMove,
   applyXiangqiMove,
+  createClock,
+  tickClockOnMove,
+  clockRemaining,
+  isTimedOut,
   XIANGQI_ROWS,
   XIANGQI_COLS,
   type XiangqiState,
@@ -28,14 +32,21 @@ const gameState = ref<XiangqiState>(
 const selectedPos = ref<Position | null>(null)
 const validMoves = ref<Position[]>([])
 
+// 实时时钟：now 每 250ms 刷新一次，驱动倒计时显示与超时判定。
+const now = ref(Date.now())
+let timer: ReturnType<typeof setInterval> | null = null
+
 // 消费对端走法：game-move 广播后存入 store.gameStates，这里合并进本地棋局。
-// 以 history.length 作为进度判据（对端更靠后才采纳），避免旧状态回灌。
+// 进度判据：对端 history 更长才采纳；长度相同但状态位变化（超时判负等无落子的终局）也采纳。
 // 缺了这个 watch，对手的走子永远不会显示、轮次也不会推进，整局会卡死。
 watch(
   () => store.gameStates.get(props.table.tableId) as XiangqiState | undefined,
   (remote) => {
     if (!remote || !Array.isArray(remote.board)) return
-    if ((remote.history?.length ?? 0) <= gameState.value.history.length) return
+    const rl = remote.history?.length ?? 0
+    const ll = gameState.value.history.length
+    if (rl < ll) return
+    if (rl === ll && remote.status === gameState.value.status) return
     gameState.value = remote
     // 对端落子后本地的选择态已失效，清掉高亮。
     selectedPos.value = null
@@ -48,10 +59,20 @@ const players = computed(() => {
   return [props.table.players[0] || '', props.table.players[1] || '']
 })
 
+// 开局协商配置（table.config）。redSeat 决定谁执红/先手。
+const cfg = computed(() => (props.table.config as any) || {})
+const redSeat = computed<0 | 1>(() => (cfg.value.redSeat === 1 ? 1 : 0))
+
+const mySeat = computed(() => players.value.indexOf(store.myId))
+
 const myColor = computed((): PieceColor | null => {
-  const idx = players.value.indexOf(store.myId)
-  return idx === 0 ? 'red' : idx === 1 ? 'black' : null
+  const seat = mySeat.value
+  if (seat !== 0 && seat !== 1) return null
+  return seat === redSeat.value ? 'red' : 'black'
 })
+
+// 黑方视角翻转棋盘：让本方棋子始终在下方。旁观者用默认（红在下）朝向。
+const flip = computed(() => myColor.value === 'black')
 
 const myTurn = computed(() => {
   return (
@@ -61,11 +82,99 @@ const myTurn = computed(() => {
   )
 })
 
+// —— 开局协商 ——
+const isPlayer = computed(() => mySeat.value === 0 || mySeat.value === 1)
+const agreed = computed(() => !!cfg.value.agreed)
+const pendingProposal = computed(() => cfg.value.proposal || null)
+// 待我处理的提议（对方发来、尚未确认）
+const proposalForMe = computed(
+  () => pendingProposal.value && pendingProposal.value.by !== store.myId,
+)
+
+// 协商表单（本地编辑值）
+const formRedSeat = ref<0 | 1>(0)
+const formGameMin = ref(10)
+const formMoveSec = ref(60)
+
+// 表单初值随配置刷新（收到新提议时同步展示，方便直接接受或改动）
+watch(
+  () => [cfg.value.redSeat, cfg.value.gameTimeSec, cfg.value.moveTimeSec, pendingProposal.value],
+  () => {
+    const src = pendingProposal.value || cfg.value
+    if (src.redSeat === 0 || src.redSeat === 1) formRedSeat.value = src.redSeat
+    if (typeof src.gameTimeSec === 'number') formGameMin.value = Math.round(src.gameTimeSec / 60)
+    if (typeof src.moveTimeSec === 'number') formMoveSec.value = src.moveTimeSec
+  },
+  { immediate: true },
+)
+
+function sendProposal(): void {
+  store.proposeXiangqiConfig(props.table.tableId, {
+    redSeat: formRedSeat.value,
+    gameTimeSec: Math.max(0, Math.round(formGameMin.value * 60)),
+    moveTimeSec: Math.max(0, Math.round(formMoveSec.value)),
+  })
+}
+
+function acceptProposal(): void {
+  store.acceptXiangqiConfig(props.table.tableId)
+}
+
+function seatName(seat: number): string {
+  return store.displayName(players.value[seat] || '') || `座位 ${seat + 1}`
+}
+
+// —— 时钟：开局时按配置生成本地时钟 ——
+watch(
+  () => props.table.state,
+  (s) => {
+    if (s !== 'playing') return
+    if (gameState.value.clock) return
+    if (!agreed.value) return
+    const clock = createClock(
+      {
+        redSeat: redSeat.value,
+        gameTimeSec: Number(cfg.value.gameTimeSec) || 0,
+        moveTimeSec: Number(cfg.value.moveTimeSec) || 0,
+      },
+      Date.now(),
+    )
+    if (clock) gameState.value = { ...gameState.value, clock }
+  },
+  { immediate: true },
+)
+
+const clockOn = computed(() => !!gameState.value.clock)
+
+function fmtTime(sec: number): string {
+  const s = Math.max(0, Math.ceil(sec))
+  const m = Math.floor(s / 60)
+  return `${m}:${String(s % 60).padStart(2, '0')}`
+}
+
+function displayClock(color: PieceColor): { move: number; game: number } | null {
+  const clock = gameState.value.clock
+  if (!clock) return null
+  const active = gameState.value.status === 'playing' && gameState.value.turn === color
+  const { moveLeft, gameLeft } = clockRemaining(clock, color, active, now.value)
+  return { move: moveLeft, game: gameLeft }
+}
+
 const CELL_W = 50
 const CELL_H = 55
 const PAD = 30
 const BOARD_W = CELL_W * (XIANGQI_COLS - 1) + PAD * 2
 const BOARD_H = CELL_H * (XIANGQI_ROWS - 1) + PAD * 2
+
+// 逻辑坐标 → 屏幕坐标（黑方视角整体旋转 180°）
+function dispX(col: number): number {
+  const c = flip.value ? XIANGQI_COLS - 1 - col : col
+  return PAD + c * CELL_W
+}
+function dispY(row: number): number {
+  const r = flip.value ? XIANGQI_ROWS - 1 - row : row
+  return PAD + r * CELL_H
+}
 
 const PIECE_NAMES: Record<string, string> = {
   'K-red': '帅',
@@ -123,48 +232,129 @@ function clickBoard(row: number, col: number): void {
 function makeMove(from: Position, to: Position): void {
   if (!isValidXiangqiMove(gameState.value, { from, to })) return
 
-  const newState = applyXiangqiMove(gameState.value, { from, to })
+  let newState = applyXiangqiMove(gameState.value, { from, to })
+  // 结算走子方的时钟（消耗步时，溢出扣局时），并为对手重置步时。
+  if (newState.clock && myColor.value) {
+    newState = { ...newState, clock: tickClockOnMove(newState.clock, myColor.value, Date.now()) }
+  }
   gameState.value = newState
 
-  // 广播走法
-  store.sendGameMove(props.table.tableId, {
-    from,
-    to,
-    state: newState,
-  })
+  // 广播完整棋局状态（含时钟），对端据 history 长度合并。
+  store.sendGameMove(props.table.tableId, newState)
 }
+
+// 超时判负：只有当前行棋方在自己本地时钟上判定并广播（无跨端时钟偏差问题）。
+function checkTimeout(): void {
+  const gs = gameState.value
+  if (!gs.clock || gs.status !== 'playing' || !myTurn.value || !myColor.value) return
+  if (!isTimedOut(gs.clock, myColor.value, Date.now())) return
+  const winner: PieceColor = myColor.value === 'red' ? 'black' : 'red'
+  const newState: XiangqiState = { ...gs, status: 'timeout', winner }
+  gameState.value = newState
+  store.sendGameMove(props.table.tableId, newState)
+}
+
+onMounted(() => {
+  timer = setInterval(() => {
+    now.value = Date.now()
+    checkTimeout()
+  }, 250)
+})
+onUnmounted(() => {
+  if (timer) clearInterval(timer)
+})
 
 function isSelected(row: number, col: number): boolean {
   return selectedPos.value?.row === row && selectedPos.value?.col === col
 }
 
 function getPlayerName(color: PieceColor): string {
-  const idx = color === 'red' ? 0 : 1
-  return store.displayName(players.value[idx])
+  const seat = color === 'red' ? redSeat.value : redSeat.value === 0 ? 1 : 0
+  return store.displayName(players.value[seat] || '')
 }
+
+const statusText = computed(() => {
+  const gs = gameState.value
+  if (gs.status === 'checkmate') {
+    return gs.winner === myColor.value ? '🎉 你赢了！' : '😢 你输了！'
+  }
+  if (gs.status === 'timeout') {
+    return gs.winner === myColor.value ? '🎉 对方超时，你赢了！' : '⏰ 超时判负，你输了！'
+  }
+  if (props.table.state !== 'playing') return ''
+  return myTurn.value ? '轮到你走棋' : '等待对手...'
+})
 </script>
 
 <template>
   <div class="xiangqi-game">
+    <!-- 开局协商（等待中，仅玩家可见） -->
+    <div v-if="props.table.state === 'waiting' && isPlayer" class="negotiate">
+      <h3>开局设置</h3>
+      <div v-if="agreed" class="nego-agreed">
+        <p>✅ 已确认：{{ seatName(redSeat) }} 执红先手</p>
+        <p>
+          局时 {{ cfg.gameTimeSec ? Math.round(cfg.gameTimeSec / 60) + ' 分' : '不限' }} ·
+          步时 {{ cfg.moveTimeSec ? cfg.moveTimeSec + ' 秒' : '不限' }}
+        </p>
+        <p class="nego-hint">可再次调整后重新提议；等待桌主开始游戏。</p>
+      </div>
+      <div v-else-if="proposalForMe" class="nego-incoming">
+        <p>📩 对方提议：{{ seatName(pendingProposal.redSeat) }} 执红先手</p>
+        <p>
+          局时 {{ pendingProposal.gameTimeSec ? Math.round(pendingProposal.gameTimeSec / 60) + ' 分' : '不限' }} ·
+          步时 {{ pendingProposal.moveTimeSec ? pendingProposal.moveTimeSec + ' 秒' : '不限' }}
+        </p>
+        <div class="nego-actions">
+          <button class="btn-accept" @click="acceptProposal">接受</button>
+          <span class="nego-or">或修改后重新提议 ↓</span>
+        </div>
+      </div>
+      <p v-else-if="pendingProposal" class="nego-hint">已发出提议，等待对方确认…</p>
+
+      <div class="nego-form">
+        <label>
+          先手（执红）
+          <select v-model.number="formRedSeat">
+            <option :value="0">{{ seatName(0) }}</option>
+            <option :value="1">{{ seatName(1) }}</option>
+          </select>
+        </label>
+        <label>
+          局时（分钟，0=不限）
+          <input type="number" v-model.number="formGameMin" min="0" max="120" />
+        </label>
+        <label>
+          步时（秒，0=不限）
+          <input type="number" v-model.number="formMoveSec" min="0" max="600" />
+        </label>
+        <button class="btn-propose" @click="sendProposal">发送提议</button>
+      </div>
+    </div>
+
     <div class="game-status">
       <div class="players">
-        <div class="player" :class="{ active: gameState.turn === 'red' }">
+        <div class="player" :class="{ active: gameState.turn === 'red' && gameState.status === 'playing' }">
           <span class="piece-label red">红</span>
           <span>{{ getPlayerName('red') }}</span>
+          <span v-if="clockOn" class="clock">
+            ⏱ {{ fmtTime(displayClock('red')!.game) }}
+            <span v-if="cfg.moveTimeSec" class="move-clock">/ {{ fmtTime(displayClock('red')!.move) }}</span>
+          </span>
         </div>
         <span class="vs">VS</span>
-        <div class="player" :class="{ active: gameState.turn === 'black' }">
+        <div class="player" :class="{ active: gameState.turn === 'black' && gameState.status === 'playing' }">
           <span class="piece-label black">黑</span>
           <span>{{ getPlayerName('black') }}</span>
+          <span v-if="clockOn" class="clock">
+            ⏱ {{ fmtTime(displayClock('black')!.game) }}
+            <span v-if="cfg.moveTimeSec" class="move-clock">/ {{ fmtTime(displayClock('black')!.move) }}</span>
+          </span>
         </div>
       </div>
 
       <div class="status-text">
-        <span v-if="gameState.status === 'checkmate'">
-          {{ gameState.winner === myColor ? '🎉 你赢了！' : '😢 你输了！' }}
-        </span>
-        <span v-else-if="myTurn">轮到你走棋</span>
-        <span v-else>等待对手...</span>
+        <span>{{ statusText }}</span>
       </div>
 
       <div class="move-count">第 {{ gameState.history.length }} 回合</div>
@@ -220,8 +410,8 @@ function getPlayerName(color: PieceColor): string {
       <circle
         v-for="(move, i) in validMoves"
         :key="`move${i}`"
-        :cx="PAD + move.col * CELL_W"
-        :cy="PAD + move.row * CELL_H"
+        :cx="dispX(move.col)"
+        :cy="dispY(move.row)"
         r="8"
         class="valid-move"
       />
@@ -232,8 +422,8 @@ function getPlayerName(color: PieceColor): string {
           <template v-for="r in XIANGQI_ROWS" :key="`${r}-${c}`">
             <circle
               v-if="getPiece(gameState, { row: r - 1, col: c - 1 })"
-              :cx="PAD + (c - 1) * CELL_W"
-              :cy="PAD + (r - 1) * CELL_H"
+              :cx="dispX(c - 1)"
+              :cy="dispY(r - 1)"
               r="22"
               class="piece-bg"
               :class="{
@@ -244,8 +434,8 @@ function getPlayerName(color: PieceColor): string {
             />
             <text
               v-if="getPiece(gameState, { row: r - 1, col: c - 1 })"
-              :x="PAD + (c - 1) * CELL_W"
-              :y="PAD + (r - 1) * CELL_H + 6"
+              :x="dispX(c - 1)"
+              :y="dispY(r - 1) + 6"
               class="piece-text"
               :class="{
                 red: getPiece(gameState, { row: r - 1, col: c - 1 })?.color === 'red',
@@ -265,8 +455,8 @@ function getPlayerName(color: PieceColor): string {
           <rect
             v-for="r in XIANGQI_ROWS"
             :key="`hit-${r}-${c}`"
-            :x="PAD + (c - 1) * CELL_W - CELL_W / 2"
-            :y="PAD + (r - 1) * CELL_H - CELL_H / 2"
+            :x="dispX(c - 1) - CELL_W / 2"
+            :y="dispY(r - 1) - CELL_H / 2"
             :width="CELL_W"
             :height="CELL_H"
             class="hit-cell"
@@ -437,5 +627,118 @@ function getPlayerName(color: PieceColor): string {
 
 .clickable {
   cursor: pointer;
+}
+
+/* 开局协商 */
+.negotiate {
+  width: min(90vw, 420px);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 16px 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.negotiate h3 {
+  margin: 0;
+  font-size: 15px;
+  color: var(--text);
+}
+
+.negotiate p {
+  margin: 0;
+  font-size: 13px;
+  color: var(--text);
+}
+
+.nego-hint {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.nego-incoming,
+.nego-agreed {
+  padding: 10px 12px;
+  border-radius: var(--radius);
+  background: var(--accent-weak);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.nego-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 4px;
+}
+
+.nego-or {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.nego-form {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+}
+
+.nego-form label {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.nego-form select,
+.nego-form input {
+  width: 140px;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg);
+  color: var(--text);
+  font-size: 13px;
+}
+
+.btn-propose,
+.btn-accept {
+  padding: 8px 16px;
+  border: none;
+  border-radius: var(--radius);
+  background: var(--accent);
+  color: white;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.btn-propose {
+  margin-top: 4px;
+}
+
+.btn-propose:hover,
+.btn-accept:hover {
+  background: var(--accent-strong);
+}
+
+.clock {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--accent-strong);
+  font-variant-numeric: tabular-nums;
+}
+
+.move-clock {
+  color: var(--muted);
+  font-weight: 500;
 }
 </style>

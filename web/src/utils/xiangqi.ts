@@ -29,6 +29,32 @@ export interface XiangqiMove {
   captured?: Piece
 }
 
+/** 对局时钟（局时 + 步时，超时判负） */
+export interface XiangqiClock {
+  /** 局时上限（秒），0=不限 */
+  gameTimeSec: number
+  /** 步时上限（秒），0=不限 */
+  moveTimeSec: number
+  /** 红方局时剩余（秒） */
+  redLeft: number
+  /** 黑方局时剩余（秒） */
+  blackLeft: number
+  /** 当前回合步时剩余（秒） */
+  moveLeft: number
+  /** 当前回合开始时间戳（ms，走子方本地时间） */
+  turnStartedAt: number
+}
+
+/** 开局设置（先后手 + 时限），开局前双方协商一致 */
+export interface XiangqiConfig {
+  /** 执红（先手）的座位号（table.players 下标 0/1） */
+  redSeat: 0 | 1
+  /** 局时上限（秒），0=不限 */
+  gameTimeSec: number
+  /** 步时上限（秒），0=不限 */
+  moveTimeSec: number
+}
+
 /** 象棋棋盘状态 */
 export interface XiangqiState {
   /** 棋盘（展平，行优先，null=空位） */
@@ -38,9 +64,11 @@ export interface XiangqiState {
   /** 走法历史 */
   history: XiangqiMove[]
   /** 游戏状态 */
-  status: 'playing' | 'checkmate' | 'stalemate' | 'draw'
+  status: 'playing' | 'checkmate' | 'stalemate' | 'draw' | 'timeout'
   /** 获胜方 */
   winner?: PieceColor
+  /** 对局时钟（未设置时限则为空） */
+  clock?: XiangqiClock
 }
 
 /** 初始化象棋棋盘 */
@@ -216,6 +244,7 @@ export function applyXiangqiMove(state: XiangqiState, move: XiangqiMove): Xiangq
     history: [...state.history, move],
     status: state.status,
     winner: state.winner,
+    clock: state.clock,
   }
 
   const piece = getPiece(newState, move.from)
@@ -270,4 +299,65 @@ export function isInCheck(state: XiangqiState, color: PieceColor): boolean {
   }
 
   return false
+}
+
+// ===== 时钟（局时 + 步时） =====
+
+/** 依据开局设置创建初始时钟；无任何时限时返回 undefined。 */
+export function createClock(config: XiangqiConfig, now: number): XiangqiClock | undefined {
+  if (config.gameTimeSec <= 0 && config.moveTimeSec <= 0) return undefined
+  return {
+    gameTimeSec: config.gameTimeSec,
+    moveTimeSec: config.moveTimeSec,
+    redLeft: config.gameTimeSec,
+    blackLeft: config.gameTimeSec,
+    moveLeft: config.moveTimeSec,
+    turnStartedAt: now,
+  }
+}
+
+/**
+ * 走子方结束本回合时结算时钟：先消耗步时，步时用尽的溢出部分再扣局时；
+ * 随后为下一回合重置步时并记录新的回合开始时间。返回结算后的新时钟。
+ */
+export function tickClockOnMove(
+  clock: XiangqiClock,
+  mover: PieceColor,
+  now: number,
+): XiangqiClock {
+  const elapsed = Math.max(0, (now - clock.turnStartedAt) / 1000)
+  const overflow = Math.max(0, elapsed - clock.moveLeft)
+  const nextGameLeft = mover === 'red' ? clock.redLeft : clock.blackLeft
+  const remaining = clock.gameTimeSec > 0 ? Math.max(0, nextGameLeft - overflow) : nextGameLeft
+  return {
+    ...clock,
+    redLeft: mover === 'red' ? remaining : clock.redLeft,
+    blackLeft: mover === 'black' ? remaining : clock.blackLeft,
+    moveLeft: clock.moveTimeSec,
+    turnStartedAt: now,
+  }
+}
+
+/** 计算某方在 now 时刻的实时剩余（步时、局时）。仅对当前行棋方 elapsed 才有意义。 */
+export function clockRemaining(
+  clock: XiangqiClock,
+  color: PieceColor,
+  isActive: boolean,
+  now: number,
+): { moveLeft: number; gameLeft: number } {
+  const bank = color === 'red' ? clock.redLeft : clock.blackLeft
+  if (!isActive) {
+    return { moveLeft: clock.moveTimeSec, gameLeft: bank }
+  }
+  const elapsed = Math.max(0, (now - clock.turnStartedAt) / 1000)
+  const moveLeft = Math.max(0, clock.moveLeft - elapsed)
+  const overflow = Math.max(0, elapsed - clock.moveLeft)
+  const gameLeft = clock.gameTimeSec > 0 ? Math.max(0, bank - overflow) : bank
+  return { moveLeft, gameLeft }
+}
+
+/** 当前行棋方是否已超时（局时耗尽判负）。局时不限则永不超时。 */
+export function isTimedOut(clock: XiangqiClock, color: PieceColor, now: number): boolean {
+  if (clock.gameTimeSec <= 0) return false
+  return clockRemaining(clock, color, true, now).gameLeft <= 0
 }

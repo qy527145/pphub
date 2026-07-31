@@ -43,7 +43,14 @@ const canStart = computed(() => {
 
   const playerCount = currentTable.value.players.length
   if (meta.category === 'single') return playerCount === 1
-  if (meta.category === 'double') return playerCount === meta.playerCount
+  if (meta.category === 'double') {
+    if (playerCount !== meta.playerCount) return false
+    // 象棋需双方协商确认开局设置后才能开始
+    if (currentTable.value.gameType === 'xiangqi') {
+      return !!(currentTable.value.config as any)?.agreed
+    }
+    return true
+  }
   return playerCount >= meta.playerCount
 })
 
@@ -227,7 +234,13 @@ const showInviteDialog = ref(false)
             开始游戏
           </button>
           <p v-if="!canStart" class="start-hint">
-            需要 {{ gameMeta.playerCount }} 名玩家
+            {{
+              currentTable.players.length < gameMeta.playerCount
+                ? `需要 ${gameMeta.playerCount} 名玩家`
+                : currentTable.gameType === 'xiangqi'
+                  ? '等待双方协商确认开局设置'
+                  : '等待玩家就绪'
+            }}
           </p>
         </div>
       </aside>

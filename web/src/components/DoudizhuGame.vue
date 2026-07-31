@@ -3,7 +3,7 @@
 // 同步模型：桌主（hostId）在游戏开始时发牌并广播全量状态；此后每次叫分/出牌/过牌
 // 都由「当前行动玩家」推进纯函数后广播新状态。各端以 moveCount 单调递增判断新旧，
 // 避免旧状态回灌。座位号取 table.players 中的下标，与 DoudizhuState 的 0/1/2 对应。
-import { computed, ref, watch } from 'vue'
+import { computed, ref, watch, onMounted, onUnmounted } from 'vue'
 import { useRoomStore } from '@/stores/room'
 import type { GameTable } from '@/core/games'
 import {
@@ -73,26 +73,30 @@ const myTurn = computed(() => {
   return gs.currentPlayer === mySeat.value
 })
 
-// 我的手牌（已排序）
+// 我的手牌（按大→小排列，左边大右边小）
 const myHand = computed<Card[]>(() => {
   const gs = gameState.value
   if (!gs || mySeat.value < 0) return []
-  return sortHand(gs.hands[mySeat.value])
+  return sortHand(gs.hands[mySeat.value]).reverse()
 })
 
-// 其他两个座位的牌数（只展示数量，不泄露牌面）
+// 其他两个座位。相对位置固定：上家(我之前出牌者)在左、下家(我之后)在右，
+// 保证每个玩家看到的相对布局一致（旁观者按 0/1/2 顺序）。
 const opponents = computed(() => {
   const gs = gameState.value
   if (!gs) return []
-  return [0, 1, 2]
-    .filter((seat) => seat !== mySeat.value)
-    .map((seat) => ({
-      seat,
-      peerId: props.table.players[seat] || '',
-      count: gs.hands[seat]?.length ?? 0,
-      isLord: gs.lordIndex === seat,
-      isTurn: gs.currentPlayer === seat && gs.phase !== 'finished',
-    }))
+  const seats =
+    mySeat.value < 0
+      ? [0, 1, 2]
+      : [(mySeat.value + 2) % 3, (mySeat.value + 1) % 3]
+  return seats.map((seat, i) => ({
+    seat,
+    peerId: props.table.players[seat] || '',
+    count: gs.hands[seat]?.length ?? 0,
+    isLord: gs.lordIndex === seat,
+    isTurn: gs.currentPlayer === seat && gs.phase !== 'finished',
+    posLabel: mySeat.value < 0 ? '' : i === 0 ? '上家' : '下家',
+  }))
 })
 
 const selectedCards = computed<Card[]>(() =>
@@ -112,14 +116,37 @@ const canPass = computed(() => {
   return gs.lastPlay !== null && Number(gs.lastPlay.player) !== mySeat.value
 })
 
-function toggleCard(c: Card): void {
-  if (!myTurn.value || phase.value !== 'playing') return
+// 拖拽快速连选：按下起始牌确定「选中/取消」模式，拖过的牌沿用同一模式，
+// 松开结束。单击（按下即松开且未移动）等价于切换该张牌。
+const dragging = ref(false)
+const dragSelecting = ref(true)
+
+function setCard(c: Card, select: boolean): void {
   const key = cardKey(c)
   const next = new Set(selectedKeys.value)
-  if (next.has(key)) next.delete(key)
-  else next.add(key)
+  if (select) next.add(key)
+  else next.delete(key)
   selectedKeys.value = next
 }
+
+function startDrag(c: Card): void {
+  if (!myTurn.value || phase.value !== 'playing') return
+  dragging.value = true
+  dragSelecting.value = !selectedKeys.value.has(cardKey(c))
+  setCard(c, dragSelecting.value)
+}
+
+function dragOver(c: Card): void {
+  if (!dragging.value) return
+  setCard(c, dragSelecting.value)
+}
+
+function endDrag(): void {
+  dragging.value = false
+}
+
+onMounted(() => window.addEventListener('mouseup', endDrag))
+onUnmounted(() => window.removeEventListener('mouseup', endDrag))
 
 function commit(next: DoudizhuState): void {
   gameState.value = next
@@ -183,6 +210,17 @@ function seatName(seat: number): string {
 
 const myIsLord = computed(() => gameState.value?.lordIndex === mySeat.value)
 
+// 底牌：定完地主后公开的 3 张（大→小展示）。叫地主阶段不泄露。
+const showBottomCards = computed(() => {
+  const gs = gameState.value
+  return !!gs && gs.lordIndex !== null && gs.phase !== 'bidding'
+})
+const bottomCards = computed<Card[]>(() => {
+  const gs = gameState.value
+  if (!gs) return []
+  return sortHand(gs.lordCards).reverse()
+})
+
 const resultText = computed(() => {
   const gs = gameState.value
   if (!gs || gs.phase !== 'finished' || !gs.winner) return ''
@@ -212,12 +250,29 @@ function bidLabel(b: number | undefined): string {
           class="opponent"
           :class="{ active: op.isTurn }"
         >
+          <span v-if="op.posLabel" class="op-pos">{{ op.posLabel }}</span>
           <span class="op-name">{{ seatName(op.seat) }}</span>
           <span v-if="op.isLord" class="lord-badge">地主</span>
           <span class="op-cards">🂠 × {{ op.count }}</span>
           <span v-if="gameState.phase === 'bidding'" class="op-bid">
             {{ bidLabel(gameState.bids[op.seat]) }}
           </span>
+        </div>
+      </div>
+
+      <!-- 底牌（定完地主后公开） -->
+      <div v-if="showBottomCards" class="bottom-cards">
+        <span class="bottom-label">底牌</span>
+        <div class="card-row small">
+          <div
+            v-for="(c, i) in bottomCards"
+            :key="`bc-${i}`"
+            class="card mini"
+            :class="{ red: isRed(c) }"
+          >
+            <span class="card-rank">{{ rankLabel(c) }}</span>
+            <span class="card-suit">{{ suitSymbol(c) }}</span>
+          </div>
         </div>
       </div>
 
@@ -268,7 +323,8 @@ function bidLabel(b: number | undefined): string {
             :key="cardKey(c)"
             class="card"
             :class="{ red: isRed(c), selected: selectedKeys.has(cardKey(c)), clickable: myTurn && phase === 'playing' }"
-            @click="toggleCard(c)"
+            @mousedown.prevent="startDrag(c)"
+            @mouseenter="dragOver(c)"
           >
             <span class="card-rank">{{ rankLabel(c) }}</span>
             <span class="card-suit">{{ suitSymbol(c) }}</span>
@@ -345,6 +401,26 @@ function bidLabel(b: number | undefined): string {
   font-size: 14px;
 }
 
+.op-pos {
+  padding: 1px 6px;
+  border-radius: var(--radius-pill);
+  font-size: 11px;
+  background: var(--muted-weak);
+  color: var(--muted);
+}
+
+.bottom-cards {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+}
+
+.bottom-label {
+  font-size: 12px;
+  color: var(--muted);
+}
+
 .op-cards {
   font-size: 13px;
   color: var(--muted);
@@ -412,6 +488,7 @@ function bidLabel(b: number | undefined): string {
 .card-row.hand {
   padding: 8px 0;
   min-height: 90px;
+  user-select: none;
 }
 
 .card {

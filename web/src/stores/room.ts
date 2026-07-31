@@ -1741,6 +1741,28 @@ export const useRoomStore = defineStore('room', () => {
         }
         break
       }
+      case 'game-config-propose': {
+        const table = gameTables.get(msg.tableId)
+        const proposal = (msg as any).proposal
+        if (table && proposal) {
+          table.config = { ...(table.config || {}), proposal, agreed: false }
+        }
+        break
+      }
+      case 'game-config-accept': {
+        const table = gameTables.get(msg.tableId)
+        const proposal = (table?.config as any)?.proposal
+        if (table && proposal) {
+          table.config = {
+            redSeat: proposal.redSeat,
+            gameTimeSec: proposal.gameTimeSec,
+            moveTimeSec: proposal.moveTimeSec,
+            agreed: true,
+            proposal: null,
+          }
+        }
+        break
+      }
       case 'game-chat': {
         const chatMsg = msg.chatMsg as GameChatMessage
         if (chatMsg && msg.tableId) {
@@ -2412,6 +2434,17 @@ export const useRoomStore = defineStore('room', () => {
     table.tableNumber = tableNumber
     table.hasPassword = !!password
 
+    // 象棋：初始化开局协商配置（默认桌主执红/先手、局时 10 分、步时 60 秒，待双方确认）
+    if (gameType === 'xiangqi') {
+      table.config = {
+        redSeat: 0,
+        gameTimeSec: 600,
+        moveTimeSec: 60,
+        agreed: false,
+        proposal: null,
+      }
+    }
+
     gameTables.set(table.tableId, table)
     currentTableId.value = table.tableId
 
@@ -2541,6 +2574,12 @@ export const useRoomStore = defineStore('room', () => {
       return
     }
 
+    // 象棋：开局设置需双方协商一致后方可开始
+    if (table.gameType === 'xiangqi' && !(table.config as any)?.agreed) {
+      lastError.value = '请先与对手协商并确认开局设置'
+      return
+    }
+
     table.state = 'playing'
     table.startedAt = Date.now()
 
@@ -2557,6 +2596,33 @@ export const useRoomStore = defineStore('room', () => {
       tableId,
       moveData,
     })
+  }
+
+  /** 象棋开局设置：发出一份提议（覆盖旧提议，需对方确认后 agreed 才为 true） */
+  function proposeXiangqiConfig(
+    tableId: string,
+    config: { redSeat: 0 | 1; gameTimeSec: number; moveTimeSec: number },
+  ): void {
+    const table = gameTables.get(tableId)
+    if (!table) return
+    const proposal = { ...config, by: myId.value }
+    table.config = { ...(table.config || {}), proposal, agreed: false }
+    mesh?.broadcast({ kind: 'game-config-propose', tableId, proposal })
+  }
+
+  /** 象棋开局设置：接受当前待定提议，双方 config 落定为提议值并置 agreed */
+  function acceptXiangqiConfig(tableId: string): void {
+    const table = gameTables.get(tableId)
+    const proposal = (table?.config as any)?.proposal
+    if (!table || !proposal) return
+    table.config = {
+      redSeat: proposal.redSeat,
+      gameTimeSec: proposal.gameTimeSec,
+      moveTimeSec: proposal.moveTimeSec,
+      agreed: true,
+      proposal: null,
+    }
+    mesh?.broadcast({ kind: 'game-config-accept', tableId })
   }
 
   function sendGameChat(tableId: string, text: string): void {
@@ -2929,6 +2995,8 @@ export const useRoomStore = defineStore('room', () => {
     leaveGameTable,
     startGameTable,
     sendGameMove,
+    proposeXiangqiConfig,
+    acceptXiangqiConfig,
     sendGameChat,
     sendGameMousePos,
     sitDownAtTable,
