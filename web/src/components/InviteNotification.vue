@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, ref, onMounted, onUnmounted } from 'vue'
 import { useRoomStore } from '@/stores/room'
 import { getGameMeta } from '@/core/games'
 import type { Invitation } from '@/core/invite-manager'
@@ -7,65 +7,81 @@ import AppIcon from './AppIcon.vue'
 
 const store = useRoomStore()
 
-const latestInvite = computed<Invitation | null>(() => {
-  return store.pendingInvites.length > 0 ? store.pendingInvites[0] : null
+// 用一个每秒推进的时钟触发过期重算，让过期邀请自动从列表消失。
+const now = ref(Date.now())
+let timer: ReturnType<typeof setInterval> | null = null
+onMounted(() => {
+  timer = setInterval(() => { now.value = Date.now() }, 1000)
+})
+onUnmounted(() => {
+  if (timer) clearInterval(timer)
 })
 
-const inviteInfo = computed(() => {
-  if (!latestInvite.value) return null
+// 仅展示未过期的邀请（最多 3 条，避免刷屏）
+const visibleInvites = computed<Invitation[]>(() =>
+  store.pendingInvites.filter((inv) => inv.expiresAt > now.value).slice(0, 3),
+)
 
-  const fromNick = store.displayName(latestInvite.value.fromPeerId)
-  const gameMeta = getGameMeta(latestInvite.value.gameType)
-
+function infoOf(invite: Invitation) {
+  const gameMeta = getGameMeta(invite.gameType)
   return {
-    fromNick,
+    fromNick: store.displayName(invite.fromPeerId),
     gameName: gameMeta?.name || '游戏',
     gameIcon: gameMeta?.icon || '🎮',
-    tableNumber: latestInvite.value.tableNumber,
+    tableNumber: invite.tableNumber,
   }
-})
-
-function accept() {
-  if (!latestInvite.value) return
-  store.acceptInvite(latestInvite.value.inviteId)
 }
 
-function decline() {
-  if (!latestInvite.value) return
-  store.declineInvite(latestInvite.value.inviteId)
+function accept(invite: Invitation) {
+  store.acceptInvite(invite.inviteId)
+}
+
+function decline(invite: Invitation) {
+  store.declineInvite(invite.inviteId)
 }
 </script>
 
 <template>
-  <Transition name="slide-down">
-    <div v-if="latestInvite && inviteInfo" class="invite-notification">
-      <div class="invite-icon">{{ inviteInfo.gameIcon }}</div>
+  <TransitionGroup name="slide-down" tag="div" class="invite-stack">
+    <div
+      v-for="invite in visibleInvites"
+      :key="invite.inviteId"
+      class="invite-notification"
+    >
+      <div class="invite-icon">{{ infoOf(invite).gameIcon }}</div>
       <div class="invite-content">
         <div class="invite-title">游戏邀请</div>
         <div class="invite-message">
-          <strong>{{ inviteInfo.fromNick }}</strong> 邀请你加入
-          <span class="game-name">{{ inviteInfo.gameName }}</span>
-          <span class="table-number">#{{ inviteInfo.tableNumber }}</span>
+          <strong>{{ infoOf(invite).fromNick }}</strong> 邀请你加入
+          <span class="game-name">{{ infoOf(invite).gameName }}</span>
+          <span class="table-number">#{{ infoOf(invite).tableNumber }}</span>
         </div>
       </div>
       <div class="invite-actions">
-        <button class="btn-accept" @click="accept">
+        <button class="btn-accept" @click="accept(invite)">
           <AppIcon name="check" :size="16" />
           加入
         </button>
-        <button class="btn-decline" @click="decline">
+        <button class="btn-decline" @click="decline(invite)">
           <AppIcon name="x" :size="16" />
         </button>
       </div>
     </div>
-  </Transition>
+  </TransitionGroup>
 </template>
 
 <style scoped>
-.invite-notification {
+.invite-stack {
   position: fixed;
   top: 20px;
   right: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  z-index: 1000;
+}
+
+.invite-notification {
   width: min(400px, calc(100vw - 40px));
   background: var(--panel);
   border: 2px solid var(--accent);
@@ -75,13 +91,6 @@ function decline() {
   align-items: center;
   gap: 16px;
   padding: 16px;
-  z-index: 1000;
-  animation: bounce 0.5s;
-}
-
-@keyframes bounce {
-  0%, 100% { transform: translateY(0); }
-  50% { transform: translateY(-10px); }
 }
 
 .slide-down-enter-active,

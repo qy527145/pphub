@@ -43,6 +43,8 @@ export interface DoudizhuState {
   bids: (0 | 1 | 2 | 3)[]  // 0=不叫，1-3=叫地主（分数）
   /** 游戏结果 */
   winner?: 'lord' | 'peasants'
+  /** 单调递增的状态版本号（每次状态转移 +1，供对端判断新旧、包括过牌） */
+  moveCount: number
 }
 
 const RANK_ORDER: CardRank[] = ['3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K', 'A', '2', 'small', 'big']
@@ -96,6 +98,7 @@ export function initDoudizhu(): DoudizhuState {
     lastPlay: null,
     phase: 'bidding',
     bids: [],
+    moveCount: 0,
   }
 }
 
@@ -220,4 +223,113 @@ export function canPlayHand(cards: Card[], lastPlay: PlayedHand | null): boolean
   }
 
   return compareHands({ cards, type: handType, player: '' }, lastPlay)
+}
+
+// ===== 对局推进（纯函数，均返回新状态；由「当前行动玩家」调用后广播全量状态）=====
+
+/**
+ * 叫地主。bidding 阶段从 0 号玩家开始按 0→1→2 顺序叫分（0=不叫，1-3=叫）。
+ * 有人叫 3 分或三家都叫过后立即定地主：最高分者为地主，收 3 张底牌，进入出牌阶段。
+ * 三家都不叫则默认 0 号为地主（简化处理，避免重新发牌导致各端牌不一致）。
+ */
+export function placeBid(state: DoudizhuState, playerIndex: number, bid: 0 | 1 | 2 | 3): DoudizhuState {
+  if (state.phase !== 'bidding' || state.currentPlayer !== playerIndex) return state
+
+  const bids = [...state.bids]
+  bids[playerIndex] = bid // 叫分按玩家索引记录（叫牌顺序即 0→1→2）
+
+  const done = bid === 3 || bids.length === 3
+  if (!done) {
+    return { ...state, bids, currentPlayer: (playerIndex + 1) % 3, moveCount: state.moveCount + 1 }
+  }
+
+  // 定地主：最高分者（并列取先叫者）
+  let lordIndex = 0
+  let best = -1
+  bids.forEach((b, i) => {
+    if ((b ?? 0) > best) {
+      best = b ?? 0
+      lordIndex = i
+    }
+  })
+
+  const hands = state.hands.map((h) => [...h]) as [Card[], Card[], Card[]]
+  hands[lordIndex] = sortHand([...hands[lordIndex], ...state.lordCards])
+
+  return {
+    ...state,
+    bids,
+    hands,
+    lordIndex,
+    phase: 'playing',
+    currentPlayer: lordIndex,
+    lastPlay: null,
+    moveCount: state.moveCount + 1,
+  }
+}
+
+/** 出一手牌。非法（牌型不成立/压不过上家/手牌中无此牌）时原样返回。 */
+export function playCards(state: DoudizhuState, playerIndex: number, cards: Card[]): DoudizhuState {
+  if (state.phase !== 'playing' || state.currentPlayer !== playerIndex) return state
+
+  const type = identifyHandType(cards)
+  if (!type) return state
+
+  // 需要压过上家（除非是自己领出的自由回合）
+  const mustBeat = state.lastPlay !== null && Number(state.lastPlay.player) !== playerIndex
+  if (mustBeat && !canPlayHand(cards, state.lastPlay)) return state
+
+  // 从手牌中移除打出的牌
+  const hand = [...state.hands[playerIndex]]
+  for (const c of cards) {
+    const i = hand.findIndex((h) => h.rank === c.rank && h.suit === c.suit)
+    if (i === -1) return state
+    hand.splice(i, 1)
+  }
+  const hands = state.hands.map((h, i) => (i === playerIndex ? hand : h)) as [Card[], Card[], Card[]]
+  const played: PlayedHand = { cards, type, player: String(playerIndex) }
+
+  // 打光即结束：地主赢则 lord，否则 peasants
+  if (hand.length === 0) {
+    return {
+      ...state,
+      hands,
+      lastPlay: played,
+      phase: 'finished',
+      winner: playerIndex === state.lordIndex ? 'lord' : 'peasants',
+      moveCount: state.moveCount + 1,
+    }
+  }
+
+  return {
+    ...state,
+    hands,
+    lastPlay: played,
+    currentPlayer: (playerIndex + 1) % 3,
+    moveCount: state.moveCount + 1,
+  }
+}
+
+/** 过牌（不出）。首出或自己领出的回合不能过。 */
+export function passTurn(state: DoudizhuState, playerIndex: number): DoudizhuState {
+  if (state.phase !== 'playing' || state.currentPlayer !== playerIndex) return state
+  if (!state.lastPlay) return state
+  const lastPlayer = Number(state.lastPlay.player)
+  if (lastPlayer === playerIndex) return state
+
+  const next = (playerIndex + 1) % 3
+  // 轮回到上次出牌者：其余两家都过了，清空场面让其自由领出。
+  return {
+    ...state,
+    currentPlayer: next,
+    lastPlay: next === lastPlayer ? null : state.lastPlay,
+    moveCount: state.moveCount + 1,
+  }
+}
+
+/** 玩家索引对应的一手牌是否合法且能接上家（供 UI 判断「出牌」按钮是否可用）。 */
+export function isLegalPlay(state: DoudizhuState, playerIndex: number, cards: Card[]): boolean {
+  if (cards.length === 0) return false
+  const mustBeat = state.lastPlay !== null && Number(state.lastPlay.player) !== playerIndex
+  return mustBeat ? canPlayHand(cards, state.lastPlay) : identifyHandType(cards) !== null
 }

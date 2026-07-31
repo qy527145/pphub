@@ -8,6 +8,7 @@ import PeerAvatar from './PeerAvatar.vue'
 import ChompGame from './ChompGame.vue'
 import GomokuGame from './GomokuGame.vue'
 import XiangqiGame from './XiangqiGame.vue'
+import DoudizhuGame from './DoudizhuGame.vue'
 
 const store = useRoomStore()
 
@@ -236,6 +237,7 @@ const showInviteDialog = ref(false)
         <ChompGame v-if="currentTable.gameType === 'chomp'" :table="currentTable" />
         <GomokuGame v-else-if="currentTable.gameType === 'gomoku'" :table="currentTable" />
         <XiangqiGame v-else-if="currentTable.gameType === 'xiangqi'" :table="currentTable" />
+        <DoudizhuGame v-else-if="currentTable.gameType === 'doudizhu'" :table="currentTable" />
         <div v-else class="game-placeholder">
           <div v-if="currentTable.state === 'waiting'" class="placeholder-content">
             <div class="placeholder-icon">⏳</div>

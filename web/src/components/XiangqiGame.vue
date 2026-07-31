@@ -1,6 +1,6 @@
 <script setup lang="ts">
 // 中国象棋游戏组件
-import { computed, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { useRoomStore } from '@/stores/room'
 import type { GameTable } from '@/core/games'
 import {
@@ -20,9 +20,29 @@ import {
 const props = defineProps<{ table: GameTable }>()
 const store = useRoomStore()
 
-const gameState = ref<XiangqiState>(initXiangqi())
+// 初始优先采用 store 中已有的对局状态（中途加入/组件重挂载时不至于回到初盘）。
+const existing = store.gameStates.get(props.table.tableId) as XiangqiState | undefined
+const gameState = ref<XiangqiState>(
+  existing && Array.isArray(existing.board) ? existing : initXiangqi(),
+)
 const selectedPos = ref<Position | null>(null)
 const validMoves = ref<Position[]>([])
+
+// 消费对端走法：game-move 广播后存入 store.gameStates，这里合并进本地棋局。
+// 以 history.length 作为进度判据（对端更靠后才采纳），避免旧状态回灌。
+// 缺了这个 watch，对手的走子永远不会显示、轮次也不会推进，整局会卡死。
+watch(
+  () => store.gameStates.get(props.table.tableId) as XiangqiState | undefined,
+  (remote) => {
+    if (!remote || !Array.isArray(remote.board)) return
+    if ((remote.history?.length ?? 0) <= gameState.value.history.length) return
+    gameState.value = remote
+    // 对端落子后本地的选择态已失效，清掉高亮。
+    selectedPos.value = null
+    validMoves.value = []
+  },
+  { deep: true },
+)
 
 const players = computed(() => {
   return [props.table.players[0] || '', props.table.players[1] || '']
@@ -34,7 +54,11 @@ const myColor = computed((): PieceColor | null => {
 })
 
 const myTurn = computed(() => {
-  return gameState.value.status === 'playing' && gameState.value.turn === myColor.value
+  return (
+    props.table.state === 'playing' &&
+    gameState.value.status === 'playing' &&
+    gameState.value.turn === myColor.value
+  )
 })
 
 const CELL_W = 50
@@ -202,45 +226,53 @@ function getPlayerName(color: PieceColor): string {
         class="valid-move"
       />
 
-      <!-- 棋子 -->
-      <g>
-        <g
-          v-for="c in XIANGQI_COLS"
-          :key="`col${c}`"
-          style="display: contents"
-        >
-          <g
+      <!-- 棋子（纯展示，不接收点击；命中交给下方透明命中层） -->
+      <g class="pieces">
+        <template v-for="c in XIANGQI_COLS" :key="`col${c}`">
+          <template v-for="r in XIANGQI_ROWS" :key="`${r}-${c}`">
+            <circle
+              v-if="getPiece(gameState, { row: r - 1, col: c - 1 })"
+              :cx="PAD + (c - 1) * CELL_W"
+              :cy="PAD + (r - 1) * CELL_H"
+              r="22"
+              class="piece-bg"
+              :class="{
+                red: getPiece(gameState, { row: r - 1, col: c - 1 })?.color === 'red',
+                black: getPiece(gameState, { row: r - 1, col: c - 1 })?.color === 'black',
+                selected: isSelected(r - 1, c - 1),
+              }"
+            />
+            <text
+              v-if="getPiece(gameState, { row: r - 1, col: c - 1 })"
+              :x="PAD + (c - 1) * CELL_W"
+              :y="PAD + (r - 1) * CELL_H + 6"
+              class="piece-text"
+              :class="{
+                red: getPiece(gameState, { row: r - 1, col: c - 1 })?.color === 'red',
+                black: getPiece(gameState, { row: r - 1, col: c - 1 })?.color === 'black',
+              }"
+            >
+              {{ getPieceName(getPiece(gameState, { row: r - 1, col: c - 1 })!) }}
+            </text>
+          </template>
+        </template>
+      </g>
+
+      <!-- 透明命中层：每个交叉点都有一块可点区域，空格落子也能触发 clickBoard。
+           必须盖在棋子与提示之上，且覆盖整格，否则点击空目标格无反应。 -->
+      <g class="hit-layer" :class="{ clickable: myTurn }">
+        <template v-for="c in XIANGQI_COLS" :key="`hit-col${c}`">
+          <rect
             v-for="r in XIANGQI_ROWS"
-            :key="`${r}-${c}`"
-            :class="{ clickable: myTurn }"
+            :key="`hit-${r}-${c}`"
+            :x="PAD + (c - 1) * CELL_W - CELL_W / 2"
+            :y="PAD + (r - 1) * CELL_H - CELL_H / 2"
+            :width="CELL_W"
+            :height="CELL_H"
+            class="hit-cell"
             @click="clickBoard(r - 1, c - 1)"
-          >
-          <circle
-            v-if="getPiece(gameState, { row: r - 1, col: c - 1 })"
-            :cx="PAD + (c - 1) * CELL_W"
-            :cy="PAD + (r - 1) * CELL_H"
-            r="22"
-            class="piece-bg"
-            :class="{
-              red: getPiece(gameState, { row: r - 1, col: c - 1 })?.color === 'red',
-              black: getPiece(gameState, { row: r - 1, col: c - 1 })?.color === 'black',
-              selected: isSelected(r - 1, c - 1),
-            }"
           />
-          <text
-            v-if="getPiece(gameState, { row: r - 1, col: c - 1 })"
-            :x="PAD + (c - 1) * CELL_W"
-            :y="PAD + (r - 1) * CELL_H + 6"
-            class="piece-text"
-            :class="{
-              red: getPiece(gameState, { row: r - 1, col: c - 1 })?.color === 'red',
-              black: getPiece(gameState, { row: r - 1, col: c - 1 })?.color === 'black',
-            }"
-          >
-            {{ getPieceName(getPiece(gameState, { row: r - 1, col: c - 1 })!) }}
-          </text>
-          </g>
-        </g>
+        </template>
       </g>
     </svg>
   </div>
@@ -358,8 +390,19 @@ function getPlayerName(color: PieceColor): string {
 .piece-bg {
   fill: #f9f3e8;
   stroke-width: 2.5;
-  cursor: pointer;
   transition: all 0.2s;
+}
+
+.pieces {
+  pointer-events: none;
+}
+
+.hit-cell {
+  fill: transparent;
+}
+
+.hit-layer.clickable .hit-cell {
+  cursor: pointer;
 }
 
 .piece-bg.red {

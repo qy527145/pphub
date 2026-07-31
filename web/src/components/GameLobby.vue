@@ -23,9 +23,9 @@ const password = ref('')
 // 加入桌子对话框
 const showJoinDialog = ref(false)
 
-// 匹配功能
-const matching = ref(false)
-const matchGameType = ref<GameType | null>(null)
+// 匹配功能：以 store.myMatchingGame 为权威状态，避免本地状态与 store 的超时/取消不同步
+const matchGameType = computed(() => store.myMatchingGame)
+const matching = computed(() => store.myMatchingGame !== null)
 
 // 所有公开的游戏桌
 const publicTables = computed(() => {
@@ -93,8 +93,6 @@ function getPlayerNick(peerId: string): string {
 
 // 开始匹配
 function startMatching(gameType: GameType) {
-  matching.value = true
-  matchGameType.value = gameType
   store.startMatching(gameType)
 }
 
@@ -103,18 +101,7 @@ function cancelMatching() {
   if (matchGameType.value) {
     store.cancelMatching(matchGameType.value)
   }
-  matching.value = false
-  matchGameType.value = null
 }
-
-// 监听匹配成功
-watch(() => store.currentTableId, (newId) => {
-  if (newId && matching.value) {
-    // 匹配成功，停止匹配状态
-    matching.value = false
-    matchGameType.value = null
-  }
-})
 
 // 监听游戏桌变化，实时更新
 watch(() => store.gameTables.size, () => {

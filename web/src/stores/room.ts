@@ -1700,7 +1700,11 @@ export const useRoomStore = defineStore('room', () => {
 
         console.log('[Invite] 收到邀请:', invite.inviteId, 'from', from)
 
-        // 添加到待处理列表
+        // 已经在该桌里则忽略；同一桌的重复邀请只保留最新一条
+        if (invite.tableId === currentTableId.value) break
+        pendingInvites.value = pendingInvites.value.filter(
+          (i) => !(i.fromPeerId === invite.fromPeerId && i.tableId === invite.tableId),
+        )
         pendingInvites.value.push(invite)
 
         // 触发回调（显示通知）
@@ -1764,8 +1768,10 @@ export const useRoomStore = defineStore('room', () => {
 
         console.log('[Matching] 收到匹配请求:', from, gameType)
 
-        // 如果我也在匹配同一个游戏，匹配成功
-        if (myMatchingGame.value === gameType) {
+        // 双方几乎同时匹配时，两端都会互发 match-request。若都各自建桌并互相 match-found，
+        // 会导致两人加入了对方不同的桌子、始终碰不到一起。用 id 字典序做确定性仲裁：
+        // 只有较小 id 的一方担任「桌主」发出 match-found，另一方静待加入，避免分裂。
+        if (myId.value < from) {
           matchWith(from, gameType)
         }
         break
@@ -2652,11 +2658,21 @@ export const useRoomStore = defineStore('room', () => {
   }
 
   function acceptInvite(inviteId: string): void {
-    const invite = inviteManager.acceptInvite(inviteId)
+    // pendingInvites 是接收端的权威来源：邀请由对端创建，本地 inviteManager 里并没有该记录，
+    // 因此不能走 inviteManager.acceptInvite（会返回 null）。
+    const invite = pendingInvites.value.find((i) => i.inviteId === inviteId)
     if (!invite) {
-      lastError.value = '邀请已过期或无效'
+      lastError.value = '邀请已失效'
       return
     }
+    if (Date.now() > invite.expiresAt) {
+      pendingInvites.value = pendingInvites.value.filter((i) => i.inviteId !== inviteId)
+      lastError.value = '邀请已过期'
+      return
+    }
+
+    // 从待处理列表移除（先移除，避免加入过程中的重复触发）
+    pendingInvites.value = pendingInvites.value.filter((i) => i.inviteId !== inviteId)
 
     // 通知邀请者
     mesh?.sendTo(invite.fromPeerId, {
@@ -2664,27 +2680,23 @@ export const useRoomStore = defineStore('room', () => {
       inviteId,
     })
 
-    // 加入游戏桌（使用桌号）
+    // 加入游戏桌（使用桌号，被邀请方可跳过密码）
     joinGameTableByNumber(invite.tableNumber)
-
-    // 从待处理列表移除
-    pendingInvites.value = pendingInvites.value.filter(i => i.inviteId !== inviteId)
   }
 
   function declineInvite(inviteId: string): void {
-    const invite = inviteManager.getInvite(inviteId)
-    if (!invite) return
-
-    inviteManager.declineInvite(inviteId)
-
-    // 通知邀请者
-    mesh?.sendTo(invite.fromPeerId, {
-      kind: 'invite-decline',
-      inviteId,
-    })
+    const invite = pendingInvites.value.find((i) => i.inviteId === inviteId)
 
     // 从待处理列表移除
-    pendingInvites.value = pendingInvites.value.filter(i => i.inviteId !== inviteId)
+    pendingInvites.value = pendingInvites.value.filter((i) => i.inviteId !== inviteId)
+
+    // 通知邀请者
+    if (invite) {
+      mesh?.sendTo(invite.fromPeerId, {
+        kind: 'invite-decline',
+        inviteId,
+      })
+    }
   }
 
   // —— 匹配功能 ——

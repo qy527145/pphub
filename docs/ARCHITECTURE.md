@@ -122,9 +122,11 @@ pphub/
 │   ├── dist/                  # 构建产物：随仓库提交、被嵌入二进制
 │   └── package.json
 └── docs/
-    ├── REQ_PRD.md
-    ├── FEATURE_INVENTORY.md
-    └── ARCHITECTURE.md        # 本文
+    ├── README.md             # 文档导航
+    ├── REQ_PRD.md            # 原始产品需求
+    ├── FEATURE_INVENTORY.md  # 功能可行性评估与关键决策
+    ├── GAME_SYSTEM.md        # 游戏系统设计
+    └── ARCHITECTURE.md       # 本文
 ```
 
 > 运行：`cargo run -- -p 8848`（默认 `-H 0.0.0.0 -p 8848`）。前端改动后需
@@ -424,6 +426,20 @@ control 通道传 `{t:"chat", from, ts, text|html|imgBlobRef}`；图片/文件�
 - **成员退出清未读（后补）**：私聊频道随成员消失，攒着的未读角标没有入口可清、会永远赖在导航上——`peer-removed` 时一并 `unread.delete(peerId)`，消息历史保留。名片编辑弹层回车即保存并关闭（Esc 直接关闭）。
 - **协议/架构**：`messages.ts` 的预留 kind 全部启用（react / voice-note / ping / pong / voice-start / voice-stop / guess-* / gomoku-*），mesh 只做传输与重组、对局与游戏状态全在 store（`GameMessage` 子集事件上抛）；新增 `GomokuPanel.vue`，`utils/` 增 notify / zip / fs / gomoku / words。
 - **验证**：`vue-tsc` + `vite build` + `cargo build` 通过；新增 `web/scripts/e2e-features.mjs` 三端 E2E **23 项全过**：粘贴入待发区（未确认对端收不到）→ 确认发送送达 → 回应加/撤同步 → 200KB 语音分片重组字节一致 → RTT 实测/gossip/视图标注 → 两处游戏入口 → 五子棋全流程（含非法落子拒绝）→ 你画我猜全流程（错猜不计分、标点容忍、比分同步）→ 文件夹 zip 结构校验 → 唯一源掉线停摆保留 + 可取消 → 成员退出清未读且历史保留。原七套件（smoke ×2 + e2e-media/network/relay/http-relay/mixed-context，60+ 断言）无回归。
+
+---
+
+### 拓扑语音串号修复 + 游戏桌大厅/邀请 + 象棋/斗地主落地记录（2026-07-31）
+
+围绕「昨天拓扑优化后的语音串号 / 大厅邀请不可用 / 象棋斗地主玩不了」三件事收口，后端信令零改动。
+
+- **语音串号（拓扑）**：昨天的分层拓扑把 `broadcast/sendTo` 改成经组长中继转发，`handleRelayForward` 同组投递时直接把 `payload` 塞给了目标端，绕过了「按 `finalTo === myId` 分支解包、还原 `originalFrom`」的路径——收方拿到的是**中继者**的身份，于是「A 发语音，B 看到是 C 发的」。本项目房间恒 ≤6 人且连接始终全网维持，中继本无收益，遂把 `broadcast/sendTo` 收敛回**直连投递**（`mesh.ts`：遍历 `peers` 直发 / `peers.get(id)?.sendControl`），`handleRelayForward` 同组分支改走 `sendControl(msg)` 让收方正常解包。发送者身份不再被改写。e2e-network/relay 各 13 项无回归。
+- **游戏桌邀请流程**：`InviteManager` 是发送端的本地态，被邀请端的 `inviteManager` 里**根本没有**这条邀请（邀请由对端 `createInvite` 生成，只随 `invite-send` 进了收端的 `pendingInvites` 响应式数组）。原 `acceptInvite` 却查 `inviteManager.acceptInvite`→恒 `null`→「邀请已过期或无效」。改为**以 `pendingInvites` 为权威来源**：accept 校验存在性/过期后先出列再通知对端并按桌号入桌（被邀方跳过密码，因远端桌注册无 `passwordHash`）；decline 同理。`invite-send` 处理补去重（同 `from+tableId` 只留最新、已在该桌则忽略）。
+- **快速匹配抢桌竞态**：双方几乎同时匹配时会互发 `match-request` 又各自建桌、互发 `match-found`，结果两人加入了**对方不同的**桌子而碰不到一起。用 id 字典序做确定性仲裁——仅较小 id 一方担任桌主发 `match-found`，另一方静待加入。大厅匹配状态改以 `store.myMatchingGame` 为准（`computed`），修掉本地 `matching` ref 与 store 超时/取消不同步导致的遮罩卡死。
+- **邀请通知 UI**：`InviteNotification` 改 `TransitionGroup` 堆叠展示多条邀请（≤3），内置每秒时钟过滤已过期邀请使其自动消失。
+- **象棋走子**：`XiangqiGame.vue` 棋子层设 `pointer-events:none`、另加覆盖整格的**透明命中层**（每交叉点一块 `rect`，偏移 -CELL/2），空目标格点击也能触发 `clickBoard`（原先只有棋子本身可点，落子到空格无反应）；补 `watch(store.gameStates)` 以 `history.length` 为进度判据消费对端走法（缺它对手走子永不显示、整局卡死），`myTurn` 追加 `table.state==='playing'` 约束。
+- **斗地主（从零可玩）**：原本只有 `utils/doudizhu.ts` 的牌型逻辑、无组件（画面全空）。补纯函数 `placeBid/playCards/passTurn/isLegalPlay` 并引入单调 `moveCount`（过牌不改变牌数，牌数无法作对端进度判据，故所有状态转移 +1）；新增 `DoudizhuGame.vue`——桌主开局 `initDoudizhu` 发牌并广播全量状态，各端按 `table.players` 下标定座、以 `moveCount` 判新旧消费广播；只亮自己手牌、其余显背面计数，叫分/出牌/不出按钮受 `isLegalPlay` 约束。`GameTable.vue` 注册 `doudizhu` 分支。
+- **验证**：`npm run build`（vue-tsc + vite）+ `cargo build` 通过；e2e-features 23 / e2e-network 13 / e2e-relay 13 全过，无回归。斗地主/象棋桌内联机流程为手工逻辑校验（现有 e2e 未覆盖游戏桌路径）。
 
 ---
 

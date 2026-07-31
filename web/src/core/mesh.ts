@@ -461,87 +461,23 @@ export class Mesh extends Emitter<MeshEvents> {
     return { ...this.profile, screenDecode: canDecodeScreen() }
   }
 
-  /** 向所有对端广播任意 control 消息（通道未就绪的对端静默跳过）。 */
+  /**
+   * 向所有对端广播任意 control 消息（通道未就绪的对端静默跳过）。
+   *
+   * 一律走全连接直连：房间 ≤6 人（见 ARCHITECTURE.md），且拓扑优化后所有
+   * WebRTC 连接始终保持（closeUnnecessaryConnections 不真正关闭连接），因此
+   * 每个成员都直接可达。曾经的「分层智能广播」只发给必需连接、依赖组长再转发，
+   * 但转发路径其实并不存在，跨组会漏送；点对点转发还会把发送者错记成中继组长
+   * （A 发给 B，B 看到来自组长 C 的串号 bug）。直连既正确又最简单。
+   * 拓扑管理器仅用于网络视图展示与统计，不再参与业务消息路由。
+   */
   broadcast(msg: ControlMessage): void {
-    if (this.topology.getMode() === 'hierarchical') {
-      // 分层模式：智能路由，但保持所有 P2P 连接
-      this.broadcastHierarchical(msg)
-    } else {
-      // 全连接模式：直接广播
-      for (const peer of this.peers.values()) peer.sendControl(msg)
-    }
-  }
-
-  /** 分层模式下的智能广播 */
-  private broadcastHierarchical(msg: ControlMessage): void {
-    const sent = new Set<string>()
-    const required = this.topology.getRequiredConnections()
-
-    // 优先使用拓扑要求的连接
-    for (const peerId of required) {
-      const peer = this.peers.get(peerId)
-      if (peer) {
-        peer.sendControl(msg)
-        sent.add(peerId)
-      }
-    }
-
-    // 注意：不需要向非必需节点发送，因为他们会通过拓扑路由收到消息
-    // 但如果是拓扑通告等特殊消息，可能需要广播到所有人
-    if (msg.kind === 'topo-announce' || msg.kind === 'leader-elect') {
-      // 拓扑消息：发给所有人
-      for (const [peerId, peer] of this.peers) {
-        if (!sent.has(peerId)) {
-          peer.sendControl(msg)
-        }
-      }
-    }
+    for (const peer of this.peers.values()) peer.sendControl(msg)
   }
 
   /** 向指定对端发送一条 control 消息；未就绪返回 false。 */
   sendTo(peerId: string, msg: ControlMessage): boolean {
-    if (this.topology.getMode() === 'hierarchical') {
-      return this.sendToHierarchical(peerId, msg)
-    } else {
-      return this.peers.get(peerId)?.sendControl(msg) ?? false
-    }
-  }
-
-  /** 分层模式下的点对点发送 */
-  private sendToHierarchical(peerId: string, msg: ControlMessage): boolean {
-    // 同组：直接发送
-    if (this.topology.inSameGroup(this.myId, peerId)) {
-      return this.peers.get(peerId)?.sendControl(msg) ?? false
-    }
-
-    // 跨组：通过组长中继
-    const myLeader = this.topology.getMyLeader()
-    const targetLeader = this.topology.getLeader(peerId)
-
-    if (!myLeader || !targetLeader) {
-      // 拓扑尚未就绪，降级为直接发送
-      return this.peers.get(peerId)?.sendControl(msg) ?? false
-    }
-
-    // 我是组长：直接发给对方组长
-    if (this.topology.isLeader() && myLeader === this.myId) {
-      const relayMsg: ControlMessage = {
-        kind: 'relay-forward',
-        originalFrom: this.myId,
-        finalTo: peerId,
-        payload: msg,
-      }
-      return this.peers.get(targetLeader)?.sendControl(relayMsg) ?? false
-    }
-
-    // 我是组员：发给我的组长
-    const relayMsg: ControlMessage = {
-      kind: 'relay-forward',
-      originalFrom: this.myId,
-      finalTo: peerId,
-      payload: msg,
-    }
-    return this.peers.get(myLeader)?.sendControl(relayMsg) ?? false
+    return this.peers.get(peerId)?.sendControl(msg) ?? false
   }
 
   /** 当前各对端连接状态（link-state 广播 + 本端网络视图），附实测 RTT。 */
@@ -1528,8 +1464,10 @@ export class Mesh extends Emitter<MeshEvents> {
     if (this.topology.isLeader()) {
       // 检查目标是否在我的组内
       if (this.topology.inSameGroup(this.myId, finalTo)) {
-        // 目标在我的组内，直接转发
-        this.peers.get(finalTo)?.sendControl(payload)
+        // 目标在我的组内：转发整条 relay-forward（而非裸 payload），
+        // 让目标经上面的 finalTo===myId 分支解包，把发送者正确还原为
+        // originalFrom。若直接投递 payload，目标会把发送者错记成本组长（串号）。
+        this.peers.get(finalTo)?.sendControl(msg)
       } else {
         // 目标在其他组，转发给目标的组长
         const targetLeader = this.topology.getLeader(finalTo)
