@@ -63,6 +63,20 @@ const ICONS: Record<string, string> = {
   pause: '<path d="M9 5.8v12.4"/><path d="M15 5.8v12.4"/>',
   // 游戏：骰子（圆角方 + 五点）
   dice: '<rect x="4" y="4" width="16" height="16" rx="4"/><path d="M8.6 8.6h.01"/><path d="M15.4 8.6h.01"/><path d="M12 12h.01"/><path d="M8.6 15.4h.01"/><path d="M15.4 15.4h.01"/>',
+  // 游戏手柄
+  'gamepad-2':
+    '<path d="M8 8.4h8a5 5 0 0 1 5 5v.4a3.4 3.4 0 0 1-6.1 2.1l-.6-.9H9.7l-.6.9A3.4 3.4 0 0 1 3 13.8v-.4a5 5 0 0 1 5-5z"/><path d="M7.6 11.6v3"/><path d="M6.1 13.1h3"/><path d="M15.4 12.2h.01"/><path d="M17.4 14.2h.01"/>',
+  plus: '<path d="M12 5v14"/><path d="M5 12h14"/>',
+  hash: '<path d="M9.4 4.5 7.6 19.5"/><path d="M16.4 4.5 14.6 19.5"/><path d="M5 9.2h14"/><path d="M4.4 14.8h14"/>',
+  zap: '<path d="M13.2 3 5.4 13.2H11l-1.2 7.8 7.8-10.2H12z"/>',
+  'log-in':
+    '<path d="M14 4.6h3.4a2 2 0 0 1 2 2v10.8a2 2 0 0 1-2 2H14"/><path d="M4.6 12h9.6"/><path d="M10.8 8.4 14.4 12l-3.6 3.6"/>',
+  eye: '<path d="M2.6 12S6 5.6 12 5.6 21.4 12 21.4 12 18 18.4 12 18.4 2.6 12 2.6 12z"/><circle cx="12" cy="12" r="3"/>',
+  globe:
+    '<circle cx="12" cy="12" r="8.4"/><path d="M3.6 12h16.8"/><path d="M12 3.6c2.3 2.3 3.6 5.2 3.6 8.4s-1.3 6.1-3.6 8.4c-2.3-2.3-3.6-5.2-3.6-8.4S9.7 5.9 12 3.6z"/>',
+  lock: '<rect x="5" y="10.4" width="14" height="9.6" rx="2.2"/><path d="M8 10.4V8a4 4 0 0 1 8 0v2.4"/>',
+  mail:
+    '<rect x="3.4" y="5.6" width="17.2" height="12.8" rx="2.4"/><path d="M4.4 7 12 12.4 19.6 7"/>',
 }
 
 defineProps<{ name: string; size?: number }>()

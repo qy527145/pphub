@@ -102,11 +102,13 @@ function getPlayerNick(peerId: string): string {
   return store.displayName(peerId)
 }
 
-// 鼠标位置共享
+// 鼠标位置共享（仅棋类/画图类；手牌类如斗地主关闭，见 GameMeta.shareCursor）
 const gameArea = ref<HTMLElement | null>(null)
 
+const sharesCursor = computed(() => gameMeta.value?.shareCursor ?? false)
+
 function handleMouseMove(ev: MouseEvent) {
-  if (!gameArea.value || !store.currentTableId) return
+  if (!sharesCursor.value || !gameArea.value || !store.currentTableId) return
   const rect = gameArea.value.getBoundingClientRect()
   const x = (ev.clientX - rect.left) / rect.width
   const y = (ev.clientY - rect.top) / rect.height
@@ -114,7 +116,7 @@ function handleMouseMove(ev: MouseEvent) {
 }
 
 const remotePointers = computed(() => {
-  if (!store.currentTableId) return []
+  if (!sharesCursor.value || !store.currentTableId) return []
   return store.gameMousePositions.get(store.currentTableId) || []
 })
 

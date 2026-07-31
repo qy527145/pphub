@@ -1,8 +1,9 @@
 <script setup lang="ts">
-// 游戏大厅 - 显示所有公开的游戏桌，可以创建新桌子
-import { computed, ref, watch } from 'vue'
+// 游戏大厅 - QQ 游戏大厅风格：真实牌桌图形 + 快速匹配 + 待处理邀请
+import { computed, ref } from 'vue'
 import { useRoomStore } from '@/stores/room'
 import { GAME_CATALOG, getGameMeta, type GameType, type GameTable } from '@/core/games'
+import type { Invitation } from '@/core/invite-manager'
 import PeerAvatar from './PeerAvatar.vue'
 import GameTableView from './GameTable.vue'
 import AppIcon from './AppIcon.vue'
@@ -23,14 +24,25 @@ const password = ref('')
 // 加入桌子对话框
 const showJoinDialog = ref(false)
 
-// 匹配功能：以 store.myMatchingGame 为权威状态，避免本地状态与 store 的超时/取消不同步
-const matchGameType = computed(() => store.myMatchingGame)
+// 桌子筛选（全部 / 指定游戏）
+const tableFilter = ref<'all' | GameType>('all')
+
+// 匹配功能：以 store.myMatchingGame 为权威状态，匹配 UI 由全局 MatchmakingOverlay 呈现
 const matching = computed(() => store.myMatchingGame !== null)
 
-// 所有公开的游戏桌
+// 选中游戏的元信息（创建对话框预览用）
+const selectedMeta = computed(() => getGameMeta(selectedGameType.value))
+
+// 待处理邀请（未过期）
+const invites = computed<Invitation[]>(() =>
+  store.pendingInvites.filter((i) => i.expiresAt > store.inviteClock),
+)
+
+// 所有公开的游戏桌（按筛选）
 const publicTables = computed(() => {
   return Array.from(store.gameTables.values())
-    .filter(t => t.visibility === 'public')
+    .filter((t) => t.visibility === 'public')
+    .filter((t) => tableFilter.value === 'all' || t.gameType === tableFilter.value)
     .sort((a, b) => {
       // 等待中的桌子排前面
       if (a.state === 'waiting' && b.state !== 'waiting') return -1
@@ -38,6 +50,16 @@ const publicTables = computed(() => {
       // 按创建时间倒序
       return (b.startedAt || 0) - (a.startedAt || 0)
     })
+})
+
+// 每种游戏的公开桌数量（用于筛选标签徽标）
+const tableCountByGame = computed(() => {
+  const counts: Record<string, number> = {}
+  for (const t of store.gameTables.values()) {
+    if (t.visibility !== 'public') continue
+    counts[t.gameType] = (counts[t.gameType] || 0) + 1
+  }
+  return counts
 })
 
 function openCreateDialog() {
@@ -57,6 +79,12 @@ function createTable() {
   closeCreateDialog()
 }
 
+function createGameFromCatalog(gameType: GameType) {
+  selectedGameType.value = gameType
+  isPublicTable.value = true
+  openCreateDialog()
+}
+
 function joinTable(tableId: string) {
   store.joinGameTable(tableId, false)
 }
@@ -67,9 +95,9 @@ function getTableStateText(table: GameTable): string {
   const meta = getGameMeta(table.gameType)
 
   if (table.state === 'waiting') {
-    return `等待中 (${playerCount}/${meta?.playerCount || '?'})`
+    return `等待中 ${playerCount}/${meta?.playerCount || '?'}`
   } else if (table.state === 'playing') {
-    return `游戏中${spectatorCount > 0 ? ` (${spectatorCount}人观战)` : ''}`
+    return `游戏中${spectatorCount > 0 ? ` · ${spectatorCount}人观战` : ''}`
   } else {
     return '已结束'
   }
@@ -91,22 +119,46 @@ function getPlayerNick(peerId: string): string {
   return store.displayName(peerId)
 }
 
-// 开始匹配
+// —— 牌桌座位布局：绕桌一圈均匀分布，从底部开始 ——
+interface Seat {
+  peerId: string | null
+  isHost: boolean
+}
+
+function seatsOf(table: GameTable): Seat[] {
+  const cap = getGameMeta(table.gameType)?.playerCount ?? table.players.length ?? 0
+  return Array.from({ length: Math.max(cap, 1) }, (_, i) => {
+    const peerId = table.players[i] ?? null
+    return { peerId, isHost: peerId != null && peerId === table.hostId }
+  })
+}
+
+function seatStyle(index: number, total: number) {
+  // 底部为起点顺时针分布；椭圆半径用百分比，座位用 transform 居中
+  const angle = Math.PI / 2 + (index * 2 * Math.PI) / total
+  const x = 50 + 42 * Math.cos(angle)
+  const y = 50 + 40 * Math.sin(angle)
+  return { left: `${x}%`, top: `${y}%` }
+}
+
+// 开始匹配（MOBA 风格遮罩由全局组件呈现）
 function startMatching(gameType: GameType) {
   store.startMatching(gameType)
 }
 
-// 取消匹配
-function cancelMatching() {
-  if (matchGameType.value) {
-    store.cancelMatching(matchGameType.value)
-  }
+// —— 邀请 ——
+function gameIcon(gt: GameType): string {
+  return getGameMeta(gt)?.icon || '🎮'
 }
-
-// 监听游戏桌变化，实时更新
-watch(() => store.gameTables.size, () => {
-  // 桌子数量变化时强制更新
-}, { flush: 'post' })
+function gameName(gt: GameType): string {
+  return getGameMeta(gt)?.name || '游戏'
+}
+function acceptInvite(inv: Invitation) {
+  store.acceptInvite(inv.inviteId)
+}
+function declineInvite(inv: Invitation) {
+  store.declineInvite(inv.inviteId)
+}
 </script>
 
 <template>
@@ -115,24 +167,10 @@ watch(() => store.gameTables.size, () => {
 
   <!-- 否则显示游戏大厅 -->
   <div v-else class="lobby">
-    <!-- 匹配中遮罩 -->
-    <div v-if="matching" class="matching-overlay">
-      <div class="matching-card">
-        <div class="matching-spinner">
-          <div class="spinner"></div>
-        </div>
-        <h3>正在匹配 {{ GAME_CATALOG.find(g => g.id === matchGameType)?.name }}...</h3>
-        <p>寻找其他玩家中，请稍候</p>
-        <button class="btn-cancel-match" @click="cancelMatching">
-          取消匹配
-        </button>
-      </div>
-    </div>
-
     <header class="lobby-header">
       <div class="header-content">
         <h2>🎮 游戏大厅</h2>
-        <p class="subtitle">加入公开桌子，或创建自己的游戏桌</p>
+        <p class="subtitle">加入公开牌桌、快速匹配，或创建自己的游戏桌</p>
       </div>
       <div class="header-actions">
         <button class="btn-join-number" @click="showJoinDialog = true">
@@ -147,133 +185,182 @@ watch(() => store.gameTables.size, () => {
     </header>
 
     <div class="lobby-content">
-      <!-- 游戏目录 -->
-      <section class="games-catalog">
-        <h3 class="section-title">选择游戏</h3>
-        <div class="games-list">
-          <div
-            v-for="game in GAME_CATALOG"
-            :key="game.id"
-            class="game-item"
-          >
-            <div class="game-item-icon">{{ game.icon }}</div>
-            <div class="game-item-info">
-              <h4>{{ game.name }}</h4>
-              <p>{{ game.description }}</p>
-              <div class="game-item-meta">
-                <span class="meta-tag">{{ game.playerCount }}人</span>
-                <span v-if="game.spectatable" class="meta-tag spectatable">可旁观</span>
-              </div>
+      <!-- 待处理邀请 -->
+      <section v-if="invites.length > 0" class="invites-section">
+        <h3 class="section-title">
+          <AppIcon name="mail" :size="18" />
+          游戏邀请
+          <span class="count-pill">{{ invites.length }}</span>
+        </h3>
+        <div class="invites-list">
+          <div v-for="inv in invites" :key="inv.inviteId" class="invite-card">
+            <div class="invite-avatar">
+              <PeerAvatar
+                :avatar="store.members.get(inv.fromPeerId)?.profile?.avatar"
+                :seed="inv.fromPeerId"
+                :size="40"
+              />
+              <span class="invite-game-badge">{{ gameIcon(inv.gameType) }}</span>
             </div>
-            <div class="game-item-actions">
-              <button
-                v-if="game.category !== 'single'"
-                class="btn-match"
-                @click="startMatching(game.id)"
-                :disabled="matching"
-              >
-                <AppIcon name="zap" :size="14" />
-                快速匹配
+            <div class="invite-text">
+              <div class="invite-line">
+                <strong>{{ getPlayerNick(inv.fromPeerId) }}</strong> 邀请你玩
+                <span class="invite-game">{{ gameName(inv.gameType) }}</span>
+              </div>
+              <div class="invite-sub">桌号 #{{ inv.tableNumber }}</div>
+            </div>
+            <div class="invite-actions">
+              <button class="btn-accept" @click="acceptInvite(inv)">
+                <AppIcon name="check" :size="15" /> 加入
               </button>
-              <button
-                class="btn-create-game"
-                @click="() => { selectedGameType = game.id; isPublicTable = true; openCreateDialog(); }"
-              >
-                <AppIcon name="plus" :size="14" />
-                创建桌子
+              <button class="btn-decline" @click="declineInvite(inv)">
+                <AppIcon name="x" :size="15" />
               </button>
             </div>
           </div>
         </div>
       </section>
 
-      <!-- 公开游戏桌列表 -->
-      <section v-if="publicTables.length > 0" class="tables-section">
-        <h3 class="section-title">公开游戏桌</h3>
-        <div class="tables-grid">
-        <div
-          v-for="table in publicTables"
-          :key="table.tableId"
-          class="table-card"
-          :class="getTableStateClass(table)"
-        >
-          <div class="table-header">
-            <div class="table-game">
-              <span class="game-icon">{{ getGameMeta(table.gameType)?.icon }}</span>
-              <div class="game-info">
-                <div class="game-title">
-                  <h3>{{ getGameMeta(table.gameType)?.name }}</h3>
-                  <span v-if="table.tableNumber" class="table-number">#{{ table.tableNumber }}</span>
-                  <span v-if="table.hasPassword" class="password-badge" title="需要密码">🔒</span>
-                </div>
-                <p>{{ getGameMeta(table.gameType)?.description }}</p>
-              </div>
+      <!-- 快速开始：游戏选择 -->
+      <section class="games-catalog">
+        <h3 class="section-title">开始游戏</h3>
+        <div class="games-strip">
+          <div v-for="game in GAME_CATALOG" :key="game.id" class="game-tile">
+            <div class="game-tile-icon">{{ game.icon }}</div>
+            <h4>{{ game.name }}</h4>
+            <p>{{ game.description }}</p>
+            <div class="game-tile-meta">
+              <span class="meta-tag">{{ game.playerCount }}人</span>
+              <span v-if="game.spectatable" class="meta-tag spectatable">可旁观</span>
             </div>
-            <span class="table-state" :class="getTableStateClass(table)">
-              {{ getTableStateText(table) }}
-            </span>
-          </div>
-
-          <div class="table-body">
-            <div class="table-host">
-              <PeerAvatar
-                :avatar="store.members.get(table.hostId)?.profile?.avatar"
-                :seed="table.hostId"
-                :size="24"
-              />
-              <span>{{ getPlayerNick(table.hostId) }}的桌子</span>
-              <span class="host-badge">桌主</span>
-            </div>
-
-            <div class="table-players">
-              <div class="players-label">玩家</div>
-              <div class="players-list">
-                <div
-                  v-for="peerId in table.players"
-                  :key="peerId"
-                  class="player-avatar"
-                  :title="getPlayerNick(peerId)"
-                >
-                  <PeerAvatar
-                    :avatar="store.members.get(peerId)?.profile?.avatar"
-                    :seed="peerId"
-                    :size="32"
-                  />
-                </div>
-                <!-- 空位 -->
-                <div
-                  v-for="i in Math.max(0, (getGameMeta(table.gameType)?.playerCount || 0) - table.players.length)"
-                  :key="`empty-${i}`"
-                  class="player-avatar empty"
-                >
-                  <div class="empty-seat">?</div>
-                </div>
-              </div>
+            <div class="game-tile-actions">
+              <button
+                v-if="game.category !== 'single'"
+                class="btn-match"
+                :disabled="matching"
+                @click="startMatching(game.id)"
+              >
+                <AppIcon name="zap" :size="14" />
+                快速匹配
+              </button>
+              <button class="btn-create-game" @click="createGameFromCatalog(game.id)">
+                <AppIcon name="plus" :size="14" />
+                创建
+              </button>
             </div>
           </div>
+        </div>
+      </section>
 
-          <div class="table-footer">
+      <!-- 公开游戏桌 -->
+      <section class="tables-section">
+        <div class="tables-head">
+          <h3 class="section-title">游戏桌</h3>
+          <div class="filter-tabs">
             <button
-              v-if="canJoinTable(table)"
-              class="btn-join"
-              @click="joinTable(table.tableId)"
+              class="filter-tab"
+              :class="{ active: tableFilter === 'all' }"
+              @click="tableFilter = 'all'"
             >
-              <AppIcon name="log-in" :size="16" />
-              加入游戏桌
+              全部
             </button>
             <button
-              v-else-if="table.state === 'playing' && getGameMeta(table.gameType)?.spectatable"
-              class="btn-spectate"
-              @click="joinTable(table.tableId)"
+              v-for="game in GAME_CATALOG"
+              :key="game.id"
+              class="filter-tab"
+              :class="{ active: tableFilter === game.id }"
+              @click="tableFilter = game.id"
             >
-              <AppIcon name="eye" :size="16" />
-              观战
-            </button>
-            <button v-else class="btn-disabled" disabled>
-              {{ table.state === 'finished' ? '已结束' : '已满' }}
+              {{ game.icon }} {{ game.name }}
+              <span v-if="tableCountByGame[game.id]" class="tab-count">{{ tableCountByGame[game.id] }}</span>
             </button>
           </div>
         </div>
+
+        <!-- 空状态 -->
+        <div v-if="publicTables.length === 0" class="empty-tables">
+          <div class="empty-icon">🪑</div>
+          <p>还没有人开桌，来创建第一桌吧！</p>
+          <button class="btn-create" @click="openCreateDialog">
+            <AppIcon name="plus" :size="16" />
+            创建游戏桌
+          </button>
+        </div>
+
+        <!-- 牌桌网格 -->
+        <div v-else class="tables-grid">
+          <div
+            v-for="table in publicTables"
+            :key="table.tableId"
+            class="poker-card"
+            :class="getTableStateClass(table)"
+          >
+            <!-- 顶栏：游戏名 + 桌号 + 状态 -->
+            <div class="poker-top">
+              <span class="poker-game">{{ getGameMeta(table.gameType)?.icon }} {{ getGameMeta(table.gameType)?.name }}</span>
+              <span class="poker-tags">
+                <span v-if="table.tableNumber" class="poker-number">#{{ table.tableNumber }}</span>
+                <span v-if="table.hasPassword" class="poker-lock" title="需要密码">🔒</span>
+              </span>
+            </div>
+
+            <!-- 牌桌图形 -->
+            <div class="poker-table">
+              <div class="felt">
+                <div class="felt-center">
+                  <span class="felt-icon">{{ getGameMeta(table.gameType)?.icon }}</span>
+                  <span class="felt-state" :class="getTableStateClass(table)">
+                    {{ getTableStateText(table) }}
+                  </span>
+                </div>
+              </div>
+              <!-- 座位 -->
+              <div
+                v-for="(seat, i) in seatsOf(table)"
+                :key="i"
+                class="seat"
+                :class="{ occupied: !!seat.peerId, host: seat.isHost, joinable: !seat.peerId && canJoinTable(table) }"
+                :style="seatStyle(i, seatsOf(table).length)"
+                @click="!seat.peerId && canJoinTable(table) && joinTable(table.tableId)"
+              >
+                <template v-if="seat.peerId">
+                  <div class="seat-ava">
+                    <PeerAvatar
+                      :avatar="store.members.get(seat.peerId)?.profile?.avatar"
+                      :seed="seat.peerId"
+                      :size="40"
+                    />
+                    <span v-if="seat.isHost" class="crown" title="桌主">👑</span>
+                  </div>
+                  <span class="seat-nick">{{ getPlayerNick(seat.peerId) }}</span>
+                </template>
+                <template v-else>
+                  <div class="seat-empty">
+                    <AppIcon v-if="canJoinTable(table)" name="plus" :size="18" />
+                    <span v-else>空</span>
+                  </div>
+                  <span class="seat-nick muted">{{ canJoinTable(table) ? '入座' : '虚位' }}</span>
+                </template>
+              </div>
+            </div>
+
+            <!-- 底部操作 -->
+            <div class="poker-footer">
+              <button v-if="canJoinTable(table)" class="btn-join" @click="joinTable(table.tableId)">
+                <AppIcon name="log-in" :size="16" /> 加入游戏桌
+              </button>
+              <button
+                v-else-if="table.state === 'playing' && getGameMeta(table.gameType)?.spectatable"
+                class="btn-spectate"
+                @click="joinTable(table.tableId)"
+              >
+                <AppIcon name="eye" :size="16" /> 观战
+              </button>
+              <button v-else class="btn-disabled" disabled>
+                {{ table.state === 'finished' ? '已结束' : '已满' }}
+              </button>
+            </div>
+          </div>
         </div>
       </section>
     </div>
@@ -289,24 +376,41 @@ watch(() => store.gameTables.size, () => {
         </header>
 
         <div class="dialog-body">
-          <!-- 桌子设置放在最上面 -->
+          <!-- 下拉选择游戏 -->
+          <div class="form-group">
+            <label>选择游戏</label>
+            <div class="select-wrap">
+              <select v-model="selectedGameType" class="game-select">
+                <option v-for="game in GAME_CATALOG" :key="game.id" :value="game.id">
+                  {{ game.icon }} {{ game.name }}（{{ game.playerCount }}人）
+                </option>
+              </select>
+              <AppIcon name="chevron-down" :size="16" class="select-arrow" />
+            </div>
+            <!-- 选中游戏预览 -->
+            <div v-if="selectedMeta" class="game-preview">
+              <span class="preview-icon">{{ selectedMeta.icon }}</span>
+              <div class="preview-info">
+                <h4>{{ selectedMeta.name }}</h4>
+                <p>{{ selectedMeta.description }}</p>
+                <div class="preview-meta">
+                  <span class="game-meta">{{ selectedMeta.playerCount }}人游戏</span>
+                  <span v-if="selectedMeta.spectatable" class="game-meta spectatable">可旁观</span>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- 桌子设置 -->
           <div class="form-group">
             <label>桌子设置</label>
             <div class="visibility-toggle">
-              <button
-                class="toggle-option"
-                :class="{ active: isPublicTable }"
-                @click="isPublicTable = true"
-              >
+              <button class="toggle-option" :class="{ active: isPublicTable }" @click="isPublicTable = true">
                 <AppIcon name="globe" :size="16" />
                 公开桌子
                 <span class="option-desc">所有人可见和加入</span>
               </button>
-              <button
-                class="toggle-option"
-                :class="{ active: !isPublicTable }"
-                @click="isPublicTable = false"
-              >
+              <button class="toggle-option" :class="{ active: !isPublicTable }" @click="isPublicTable = false">
                 <AppIcon name="lock" :size="16" />
                 私密桌子
                 <span class="option-desc">仅邀请的人可加入</span>
@@ -314,6 +418,7 @@ watch(() => store.gameTables.size, () => {
             </div>
           </div>
 
+          <!-- 密码保护 -->
           <div class="form-group">
             <label>
               <input type="checkbox" v-model="usePassword" class="checkbox" />
@@ -328,29 +433,6 @@ watch(() => store.gameTables.size, () => {
                 class="password-input"
               />
               <p class="hint">设置密码后，只有知道密码的人才能加入</p>
-            </div>
-          </div>
-
-          <div class="form-group">
-            <label>选择游戏</label>
-            <div class="game-select-scroll">
-              <div
-                v-for="game in GAME_CATALOG"
-                :key="game.id"
-                class="game-option"
-                :class="{ selected: selectedGameType === game.id }"
-                @click="selectedGameType = game.id"
-              >
-                <span class="game-option-icon">{{ game.icon }}</span>
-                <div class="game-option-info">
-                  <h4>{{ game.name }}</h4>
-                  <p>{{ game.description }}</p>
-                  <div class="game-option-meta">
-                    <span class="game-meta">{{ game.playerCount }}人游戏</span>
-                    <span v-if="game.spectatable" class="game-meta spectatable">可旁观</span>
-                  </div>
-                </div>
-              </div>
             </div>
           </div>
         </div>
@@ -402,8 +484,7 @@ watch(() => store.gameTables.size, () => {
 }
 
 .btn-join-number,
-.btn-create,
-.btn-create-big {
+.btn-create {
   display: flex;
   align-items: center;
   gap: 8px;
@@ -427,21 +508,14 @@ watch(() => store.gameTables.size, () => {
   border-color: var(--accent);
 }
 
-.btn-create,
-.btn-create-big {
+.btn-create {
   background: var(--accent);
   color: white;
 }
 
-.btn-create:hover,
-.btn-create-big:hover {
+.btn-create:hover {
   background: var(--accent-strong);
   transform: translateY(-1px);
-}
-
-.btn-create-big {
-  padding: 12px 24px;
-  font-size: 15px;
 }
 
 .lobby-content {
@@ -451,65 +525,183 @@ watch(() => store.gameTables.size, () => {
 }
 
 .section-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   margin: 0 0 16px 0;
   font-size: 18px;
   font-weight: 600;
   color: var(--text);
 }
 
-/* 游戏目录 */
-.games-catalog {
-  margin-bottom: 40px;
+.count-pill {
+  background: var(--danger);
+  color: #fff;
+  border-radius: var(--radius-pill);
+  font-size: 12px;
+  font-weight: 600;
+  padding: 2px 9px;
 }
 
-.games-list {
+/* —— 邀请 —— */
+.invites-section {
+  margin-bottom: 36px;
+  padding: 16px;
+  background: var(--accent-weak);
+  border: 1px solid color-mix(in srgb, var(--accent) 40%, transparent);
+  border-radius: var(--radius);
+}
+
+.invites-list {
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 10px;
 }
 
-.game-item {
+.invite-card {
   display: flex;
   align-items: center;
-  gap: 16px;
-  padding: 16px;
+  gap: 14px;
+  padding: 12px 14px;
+  background: var(--panel);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-soft);
+}
+
+.invite-avatar {
+  position: relative;
+  flex-shrink: 0;
+}
+
+.invite-game-badge {
+  position: absolute;
+  right: -4px;
+  bottom: -4px;
+  font-size: 15px;
+  background: var(--panel);
+  border-radius: 50%;
+  line-height: 1;
+  padding: 1px;
+}
+
+.invite-text {
+  flex: 1;
+  min-width: 0;
+}
+
+.invite-line {
+  font-size: 14px;
+  color: var(--text);
+}
+
+.invite-line strong {
+  color: var(--accent-strong);
+}
+
+.invite-game {
+  font-weight: 600;
+}
+
+.invite-sub {
+  margin-top: 2px;
+  font-size: 12px;
+  color: var(--muted);
+  font-family: monospace;
+}
+
+.invite-actions {
+  display: flex;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.btn-accept,
+.btn-decline {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 8px 14px;
+  border: none;
+  border-radius: var(--radius);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.btn-accept {
+  background: var(--accent);
+  color: #fff;
+}
+
+.btn-accept:hover {
+  background: var(--accent-strong);
+}
+
+.btn-decline {
+  background: var(--hover);
+  color: var(--muted);
+  padding: 8px 11px;
+}
+
+.btn-decline:hover {
+  background: var(--muted-weak);
+  color: var(--text);
+}
+
+/* —— 游戏选择条 —— */
+.games-catalog {
+  margin-bottom: 36px;
+}
+
+.games-strip {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: 14px;
+}
+
+.game-tile {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  gap: 6px;
+  padding: 18px 14px;
   background: var(--panel);
   border: 1px solid var(--border);
   border-radius: var(--radius);
   transition: all 0.2s;
 }
 
-.game-item:hover {
+.game-tile:hover {
   border-color: var(--accent);
   box-shadow: var(--shadow-pop);
+  transform: translateY(-2px);
 }
 
-.game-item-icon {
-  font-size: 40px;
-  flex-shrink: 0;
+.game-tile-icon {
+  font-size: 42px;
+  line-height: 1;
 }
 
-.game-item-info {
-  flex: 1;
-  min-width: 0;
-}
-
-.game-item-info h4 {
-  margin: 0 0 4px 0;
-  font-size: 16px;
+.game-tile h4 {
+  margin: 4px 0 0;
+  font-size: 15px;
   color: var(--text);
 }
 
-.game-item-info p {
-  margin: 0 0 8px 0;
-  font-size: 13px;
+.game-tile p {
+  margin: 0;
+  font-size: 12px;
   color: var(--muted);
+  min-height: 32px;
 }
 
-.game-item-meta {
+.game-tile-meta {
   display: flex;
   gap: 6px;
   flex-wrap: wrap;
+  justify-content: center;
 }
 
 .meta-tag {
@@ -526,18 +718,21 @@ watch(() => store.gameTables.size, () => {
   color: var(--success);
 }
 
-.game-item-actions {
+.game-tile-actions {
   display: flex;
   gap: 8px;
-  flex-shrink: 0;
+  margin-top: 8px;
+  width: 100%;
 }
 
 .btn-match,
 .btn-create-game {
+  flex: 1;
   display: flex;
   align-items: center;
-  gap: 6px;
-  padding: 8px 16px;
+  justify-content: center;
+  gap: 5px;
+  padding: 8px 10px;
   border: none;
   border-radius: var(--radius);
   font-size: 13px;
@@ -548,7 +743,7 @@ watch(() => store.gameTables.size, () => {
 
 .btn-match {
   background: var(--success);
-  color: white;
+  color: #fff;
 }
 
 .btn-match:hover:not(:disabled) {
@@ -563,7 +758,7 @@ watch(() => store.gameTables.size, () => {
 
 .btn-create-game {
   background: var(--accent);
-  color: white;
+  color: #fff;
 }
 
 .btn-create-game:hover {
@@ -571,173 +766,129 @@ watch(() => store.gameTables.size, () => {
   transform: translateY(-1px);
 }
 
-/* 匹配遮罩 */
-.matching-overlay {
-  position: fixed;
-  inset: 0;
-  background: rgba(0, 0, 0, 0.7);
-  display: grid;
-  place-items: center;
-  z-index: 1000;
-  animation: fadeIn 0.3s;
-}
-
-.matching-card {
-  background: var(--panel);
-  border-radius: var(--radius);
-  padding: 40px;
-  text-align: center;
-  max-width: 400px;
-  box-shadow: var(--shadow-pop);
-}
-
-.matching-spinner {
-  margin-bottom: 24px;
+/* —— 桌子筛选 —— */
+.tables-head {
   display: flex;
-  justify-content: center;
+  flex-direction: column;
+  gap: 12px;
+  margin-bottom: 18px;
 }
 
-.spinner {
-  width: 60px;
-  height: 60px;
-  border: 4px solid var(--border);
-  border-top-color: var(--accent);
-  border-radius: 50%;
-  animation: spin 1s linear infinite;
+.filter-tabs {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
 }
 
-@keyframes spin {
-  to { transform: rotate(360deg); }
-}
-
-.matching-card h3 {
-  margin: 0 0 8px 0;
-  font-size: 20px;
-  color: var(--text);
-}
-
-.matching-card p {
-  margin: 0 0 24px 0;
-  font-size: 14px;
-  color: var(--muted);
-}
-
-.btn-cancel-match {
-  padding: 10px 24px;
+.filter-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 14px;
   border: 1px solid var(--border);
-  border-radius: var(--radius);
+  border-radius: var(--radius-pill);
   background: var(--panel);
-  color: var(--text);
-  font-size: 14px;
+  color: var(--text-2);
+  font-size: 13px;
   cursor: pointer;
   transition: all 0.2s;
 }
 
-.btn-cancel-match:hover {
-  background: var(--hover);
+.filter-tab:hover {
   border-color: var(--accent);
-}
-
-/* 游戏桌区域 */
-.tables-section {
-  margin-top: 40px;
-}
-
-.empty-state {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  height: 100%;
-  gap: 16px;
-  text-align: center;
-}
-
-.empty-icon {
-  font-size: 64px;
-  opacity: 0.5;
-}
-
-.empty-state h3 {
-  margin: 0;
-  font-size: 20px;
   color: var(--text);
 }
 
-.empty-state p {
-  margin: 0;
-  font-size: 14px;
+.filter-tab.active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+  font-weight: 600;
+}
+
+.tab-count {
+  background: color-mix(in srgb, currentColor 20%, transparent);
+  border-radius: var(--radius-pill);
+  font-size: 11px;
+  padding: 0 6px;
+  line-height: 16px;
+}
+
+/* —— 空状态 —— */
+.empty-tables {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  padding: 60px 20px;
   color: var(--muted);
 }
 
+.empty-icon {
+  font-size: 56px;
+  opacity: 0.6;
+}
+
+.empty-tables p {
+  margin: 0;
+  font-size: 14px;
+}
+
+/* —— 牌桌网格 —— */
 .tables-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(360px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
   gap: 20px;
 }
 
-.table-card {
+.poker-card {
   background: var(--panel);
   border: 2px solid var(--border);
   border-radius: var(--radius);
-  padding: 20px;
+  padding: 14px;
   display: flex;
   flex-direction: column;
-  gap: 16px;
+  gap: 12px;
   transition: all 0.2s;
 }
 
-.table-card:hover {
+.poker-card:hover {
   border-color: var(--accent);
   box-shadow: var(--shadow-pop);
 }
 
-.table-card.waiting {
+.poker-card.waiting {
   border-color: var(--success);
 }
 
-.table-card.playing {
+.poker-card.playing {
   border-color: var(--accent);
 }
 
-.table-header {
+.poker-top {
   display: flex;
-  align-items: flex-start;
+  align-items: center;
   justify-content: space-between;
-  gap: 12px;
+  gap: 10px;
 }
 
-.table-game {
+.poker-game {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.poker-tags {
   display: flex;
-  gap: 12px;
-  flex: 1;
-  min-width: 0;
-}
-
-.game-icon {
-  font-size: 32px;
+  align-items: center;
+  gap: 6px;
   flex-shrink: 0;
 }
 
-.game-info {
-  flex: 1;
-  min-width: 0;
-}
-
-.game-title {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-bottom: 4px;
-}
-
-.game-info h3 {
-  margin: 0;
-  font-size: 16px;
-  color: var(--text);
-}
-
-.table-number {
+.poker-number {
   padding: 2px 8px;
   background: var(--accent-weak);
   color: var(--accent-strong);
@@ -747,116 +898,140 @@ watch(() => store.gameTables.size, () => {
   font-family: monospace;
 }
 
-.password-badge {
-  font-size: 14px;
-}
-
-.game-info p {
-  margin: 0;
-  font-size: 12px;
-  color: var(--muted);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.table-state {
-  padding: 4px 10px;
-  border-radius: var(--radius-pill);
-  font-size: 12px;
-  font-weight: 600;
-  white-space: nowrap;
-}
-
-.table-state.waiting {
-  background: var(--success-weak);
-  color: var(--success);
-}
-
-.table-state.playing {
-  background: var(--accent-weak);
-  color: var(--accent-strong);
-}
-
-.table-state.finished {
-  background: var(--muted-weak);
-  color: var(--muted);
-}
-
-.table-body {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-}
-
-.table-host {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 8px 12px;
-  background: var(--bg);
-  border-radius: var(--radius);
+.poker-lock {
   font-size: 13px;
 }
 
-.table-host span:nth-child(2) {
-  flex: 1;
-  color: var(--text);
-}
-
-.host-badge {
-  padding: 2px 8px;
-  background: var(--accent);
-  color: white;
-  border-radius: var(--radius-pill);
-  font-size: 11px;
-  font-weight: 600;
-}
-
-.table-players {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-
-.players-label {
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--muted);
-  text-transform: uppercase;
-}
-
-.players-list {
-  display: flex;
-  gap: 8px;
-  flex-wrap: wrap;
-}
-
-.player-avatar {
+/* —— 牌桌图形 —— */
+.poker-table {
   position: relative;
-  flex-shrink: 0;
+  width: 100%;
+  aspect-ratio: 5 / 4;
 }
 
-.player-avatar.empty {
+.felt {
+  position: absolute;
+  inset: 16% 10%;
+  border-radius: 50%;
+  background:
+    radial-gradient(circle at 50% 38%, color-mix(in srgb, var(--success) 45%, #0a5c3a) 0%, #0a5c3a 70%, #084a2f 100%);
+  border: 4px solid #6b3f1d;
+  box-shadow: inset 0 0 24px rgba(0, 0, 0, 0.45), var(--shadow-soft);
   display: grid;
   place-items: center;
 }
 
-.empty-seat {
-  width: 32px;
-  height: 32px;
-  border: 2px dashed var(--border);
+.felt-center {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  color: #fff;
+}
+
+.felt-icon {
+  font-size: 30px;
+  opacity: 0.9;
+}
+
+.felt-state {
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 10px;
+  border-radius: var(--radius-pill);
+  background: rgba(0, 0, 0, 0.35);
+  white-space: nowrap;
+}
+
+.felt-state.waiting { color: #8ef5c0; }
+.felt-state.playing { color: #ffe08a; }
+.felt-state.finished { color: #cfcfcf; }
+
+/* —— 座位 —— */
+.seat {
+  position: absolute;
+  transform: translate(-50%, -50%);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 3px;
+  width: 60px;
+}
+
+.seat.joinable {
+  cursor: pointer;
+}
+
+.seat-ava {
+  position: relative;
+  width: 44px;
+  height: 44px;
+  border-radius: 50%;
+  padding: 2px;
+  background: var(--panel);
+  border: 2px solid var(--border-strong);
+  box-shadow: var(--shadow-soft);
+}
+
+.seat.occupied .seat-ava {
+  border-color: var(--accent);
+}
+
+.seat.host .seat-ava {
+  border-color: var(--warn, #f0a500);
+}
+
+.crown {
+  position: absolute;
+  top: -12px;
+  left: 50%;
+  transform: translateX(-50%);
+  font-size: 14px;
+}
+
+.seat-empty {
+  width: 44px;
+  height: 44px;
   border-radius: 50%;
   display: grid;
   place-items: center;
-  font-size: 16px;
+  border: 2px dashed var(--border-strong);
+  background: var(--panel-2);
   color: var(--muted);
-  background: var(--bg);
+  font-size: 12px;
 }
 
-.table-footer {
-  padding-top: 12px;
-  border-top: 1px solid var(--border);
+.seat.joinable .seat-empty {
+  border-color: var(--accent);
+  color: var(--accent-strong);
+  background: var(--accent-weak);
+}
+
+.seat.joinable:hover .seat-empty {
+  background: var(--accent);
+  color: #fff;
+}
+
+.seat-nick {
+  font-size: 11px;
+  color: var(--text);
+  max-width: 60px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  background: var(--panel);
+  padding: 0 4px;
+  border-radius: 4px;
+}
+
+.seat-nick.muted {
+  color: var(--muted);
+  background: transparent;
+}
+
+/* —— 牌桌底部 —— */
+.poker-footer {
+  margin-top: 2px;
 }
 
 .btn-join,
@@ -878,7 +1053,7 @@ watch(() => store.gameTables.size, () => {
 
 .btn-join {
   background: var(--accent);
-  color: white;
+  color: #fff;
 }
 
 .btn-join:hover {
@@ -902,7 +1077,7 @@ watch(() => store.gameTables.size, () => {
   opacity: 0.6;
 }
 
-/* 对话框 */
+/* —— 对话框 —— */
 .dialog-mask {
   position: fixed;
   inset: 0;
@@ -919,7 +1094,7 @@ watch(() => store.gameTables.size, () => {
 }
 
 .dialog {
-  width: min(600px, calc(100vw - 40px));
+  width: min(560px, calc(100vw - 40px));
   max-height: calc(100vh - 80px);
   background: var(--panel);
   border-radius: var(--radius);
@@ -930,14 +1105,8 @@ watch(() => store.gameTables.size, () => {
 }
 
 @keyframes slideUp {
-  from {
-    opacity: 0;
-    transform: translateY(20px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
+  from { opacity: 0; transform: translateY(20px); }
+  to { opacity: 1; transform: translateY(0); }
 }
 
 .dialog-header {
@@ -983,7 +1152,7 @@ watch(() => store.gameTables.size, () => {
   margin-bottom: 0;
 }
 
-.form-group label {
+.form-group > label {
   display: flex;
   align-items: center;
   gap: 8px;
@@ -991,6 +1160,93 @@ watch(() => store.gameTables.size, () => {
   font-size: 14px;
   font-weight: 600;
   color: var(--text);
+}
+
+/* 下拉选择 */
+.select-wrap {
+  position: relative;
+}
+
+.game-select {
+  width: 100%;
+  padding: 12px 40px 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg);
+  color: var(--text);
+  font-size: 15px;
+  font-weight: 600;
+  cursor: pointer;
+  appearance: none;
+  transition: all 0.2s;
+}
+
+.game-select:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-weak);
+}
+
+.select-arrow {
+  position: absolute;
+  right: 14px;
+  top: 50%;
+  transform: translateY(-50%);
+  color: var(--muted);
+  pointer-events: none;
+}
+
+.game-preview {
+  display: flex;
+  gap: 14px;
+  margin-top: 14px;
+  padding: 16px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.preview-icon {
+  font-size: 40px;
+  flex-shrink: 0;
+}
+
+.preview-info {
+  flex: 1;
+  min-width: 0;
+}
+
+.preview-info h4 {
+  margin: 0 0 4px 0;
+  font-size: 15px;
+  color: var(--text);
+}
+
+.preview-info p {
+  margin: 0 0 8px 0;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.preview-meta {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.game-meta {
+  display: inline-block;
+  padding: 2px 8px;
+  background: var(--accent-weak);
+  color: var(--accent-strong);
+  border-radius: var(--radius-pill);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.game-meta.spectatable {
+  background: var(--success-weak);
+  color: var(--success);
 }
 
 .checkbox {
@@ -1026,96 +1282,6 @@ watch(() => store.gameTables.size, () => {
   color: var(--muted);
 }
 
-.game-select-scroll {
-  max-height: 400px;
-  overflow-y: auto;
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-  padding-right: 8px;
-}
-
-.game-select-scroll::-webkit-scrollbar {
-  width: 6px;
-}
-
-.game-select-scroll::-webkit-scrollbar-track {
-  background: var(--bg);
-  border-radius: 3px;
-}
-
-.game-select-scroll::-webkit-scrollbar-thumb {
-  background: var(--border);
-  border-radius: 3px;
-}
-
-.game-select-scroll::-webkit-scrollbar-thumb:hover {
-  background: var(--muted);
-}
-
-.game-option {
-  display: flex;
-  gap: 12px;
-  padding: 16px;
-  border: 2px solid var(--border);
-  border-radius: var(--radius);
-  cursor: pointer;
-  transition: all 0.2s;
-}
-
-.game-option:hover {
-  border-color: var(--accent);
-  background: var(--hover);
-}
-
-.game-option.selected {
-  border-color: var(--accent);
-  background: var(--accent-weak);
-}
-
-.game-option-icon {
-  font-size: 36px;
-  flex-shrink: 0;
-}
-
-.game-option-info {
-  flex: 1;
-  min-width: 0;
-}
-
-.game-option-info h4 {
-  margin: 0 0 4px 0;
-  font-size: 15px;
-  color: var(--text);
-}
-
-.game-option-info p {
-  margin: 0 0 8px 0;
-  font-size: 13px;
-  color: var(--muted);
-}
-
-.game-option-meta {
-  display: flex;
-  gap: 8px;
-  flex-wrap: wrap;
-}
-
-.game-meta {
-  display: inline-block;
-  padding: 2px 8px;
-  background: var(--accent-weak);
-  color: var(--accent-strong);
-  border-radius: var(--radius-pill);
-  font-size: 11px;
-  font-weight: 600;
-}
-
-.game-meta.spectatable {
-  background: var(--success-weak);
-  color: var(--success);
-}
-
 .visibility-toggle {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -1134,6 +1300,7 @@ watch(() => store.gameTables.size, () => {
   cursor: pointer;
   transition: all 0.2s;
   text-align: center;
+  color: var(--text);
 }
 
 .toggle-option:hover {
@@ -1183,7 +1350,7 @@ watch(() => store.gameTables.size, () => {
 
 .btn-confirm {
   background: var(--accent);
-  color: white;
+  color: #fff;
 }
 
 .btn-confirm:hover {

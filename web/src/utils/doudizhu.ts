@@ -27,6 +27,11 @@ export interface PlayedHand {
 }
 
 export interface DoudizhuState {
+  /**
+   * 座位 → 玩家 peerId 的映射（长度 3）。开局时由桌主随机打乱 table.players 得到，
+   * 随全量状态广播，确保各端座位一致。手牌 hands[i] 属于 seats[i]。
+   */
+  seats: string[]
   /** 三个玩家的手牌 */
   hands: [Card[], Card[], Card[]]
   /** 底牌（3张） */
@@ -35,6 +40,8 @@ export interface DoudizhuState {
   lordIndex: number | null
   /** 当前回合玩家索引 */
   currentPlayer: number
+  /** 本局首个叫地主的座位（随机），叫牌按 firstBidder → +1 → +2 顺序进行 */
+  firstBidder: number
   /** 最后出的牌 */
   lastPlay: PlayedHand | null
   /** 游戏阶段 */
@@ -72,9 +79,9 @@ export function createDeck(): Card[] {
   return deck
 }
 
-/** 洗牌 */
-export function shuffleDeck(deck: Card[]): Card[] {
-  const shuffled = [...deck]
+/** 洗牌（Fisher–Yates，返回新数组，可用于任意元素类型） */
+export function shuffle<T>(arr: T[]): T[] {
+  const shuffled = [...arr]
   for (let i = shuffled.length - 1; i > 0; i--) {
     const j = Math.floor(Math.random() * (i + 1))
     ;[shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]]
@@ -82,11 +89,26 @@ export function shuffleDeck(deck: Card[]): Card[] {
   return shuffled
 }
 
-/** 初始化斗地主游戏 */
-export function initDoudizhu(): DoudizhuState {
+/** 洗牌（保留旧名，供牌堆使用） */
+export function shuffleDeck(deck: Card[]): Card[] {
+  return shuffle(deck)
+}
+
+/**
+ * 初始化斗地主游戏。
+ * @param players 桌上玩家 peerId（长度 3），座位会被随机打乱后固定到本局。
+ * @param startMoveCount 起始版本号；「再来一局」时传上一局的 moveCount+1，
+ *   保证新状态的 moveCount 严格大于旧值，各端才会采纳（否则被当作旧状态忽略）。
+ *
+ * 座位随机（seats 打乱）+ 叫地主起手随机（firstBidder），使每局的位置与叫牌顺序都不固定。
+ */
+export function initDoudizhu(players: string[], startMoveCount = 0): DoudizhuState {
   const deck = shuffleDeck(createDeck())
+  const seats = shuffle(players).slice(0, 3)
+  const firstBidder = Math.floor(Math.random() * 3)
 
   return {
+    seats,
     hands: [
       deck.slice(0, 17),
       deck.slice(17, 34),
@@ -94,11 +116,12 @@ export function initDoudizhu(): DoudizhuState {
     ],
     lordCards: deck.slice(51, 54),
     lordIndex: null,
-    currentPlayer: 0,
+    currentPlayer: firstBidder,
+    firstBidder,
     lastPlay: null,
     phase: 'bidding',
     bids: [],
-    moveCount: 0,
+    moveCount: startMoveCount,
   }
 }
 
@@ -228,30 +251,34 @@ export function canPlayHand(cards: Card[], lastPlay: PlayedHand | null): boolean
 // ===== 对局推进（纯函数，均返回新状态；由「当前行动玩家」调用后广播全量状态）=====
 
 /**
- * 叫地主。bidding 阶段从 0 号玩家开始按 0→1→2 顺序叫分（0=不叫，1-3=叫）。
+ * 叫地主。bidding 阶段从 firstBidder 开始按 firstBidder→+1→+2 顺序叫分（0=不叫，1-3=叫）。
  * 有人叫 3 分或三家都叫过后立即定地主：最高分者为地主，收 3 张底牌，进入出牌阶段。
- * 三家都不叫则默认 0 号为地主（简化处理，避免重新发牌导致各端牌不一致）。
+ * 三家都不叫则默认首叫者为地主（简化处理，避免重新发牌导致各端牌不一致）。
  */
 export function placeBid(state: DoudizhuState, playerIndex: number, bid: 0 | 1 | 2 | 3): DoudizhuState {
   if (state.phase !== 'bidding' || state.currentPlayer !== playerIndex) return state
 
   const bids = [...state.bids]
-  bids[playerIndex] = bid // 叫分按玩家索引记录（叫牌顺序即 0→1→2）
+  bids[playerIndex] = bid // 叫分按座位索引记录
 
-  const done = bid === 3 || bids.length === 3
+  // 已叫分的人数（bids 可能因随机起手而稀疏，用 filter 跳过空洞而非 length）
+  const placed = bids.filter((b) => b !== undefined).length
+  const done = bid === 3 || placed === 3
   if (!done) {
     return { ...state, bids, currentPlayer: (playerIndex + 1) % 3, moveCount: state.moveCount + 1 }
   }
 
-  // 定地主：最高分者（并列取先叫者）
-  let lordIndex = 0
+  // 定地主：最高分者；并列时取叫牌顺序中较早的一位（从 firstBidder 起遍历）
+  let lordIndex = state.firstBidder
   let best = -1
-  bids.forEach((b, i) => {
-    if ((b ?? 0) > best) {
-      best = b ?? 0
-      lordIndex = i
+  for (let i = 0; i < 3; i++) {
+    const seat = (state.firstBidder + i) % 3
+    const b = bids[seat] ?? 0
+    if (b > best) {
+      best = b
+      lordIndex = seat
     }
-  })
+  }
 
   const hands = state.hands.map((h) => [...h]) as [Card[], Card[], Card[]]
   hands[lordIndex] = sortHand([...hands[lordIndex], ...state.lordCards])

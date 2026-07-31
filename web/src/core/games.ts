@@ -14,6 +14,11 @@ export interface GameMeta {
   playerCount: number
   /** 是否支持旁观 */
   spectatable: boolean
+  /**
+   * 是否在桌内共享鼠标指针。棋类/画图类指向棋盘有意义；
+   * 手牌类（斗地主）各自手牌保密，共享指针无意义且会暴露操作意图，故关闭。
+   */
+  shareCursor: boolean
   icon: string
 }
 
@@ -122,6 +127,7 @@ export const GAME_CATALOG: GameMeta[] = [
     category: 'double',
     playerCount: 2,
     spectatable: true,
+    shareCursor: true,
     icon: '⚫',
   },
   {
@@ -131,6 +137,7 @@ export const GAME_CATALOG: GameMeta[] = [
     category: 'double',
     playerCount: 2,
     spectatable: true,
+    shareCursor: true,
     icon: '♟️',
   },
   {
@@ -140,6 +147,7 @@ export const GAME_CATALOG: GameMeta[] = [
     category: 'multi',
     playerCount: 3,  // 最少3人，可更多
     spectatable: true,
+    shareCursor: true,
     icon: '🎨',
   },
   {
@@ -149,6 +157,7 @@ export const GAME_CATALOG: GameMeta[] = [
     category: 'multi',
     playerCount: 3,
     spectatable: true,
+    shareCursor: false,
     icon: '🃏',
   },
   {
@@ -158,6 +167,7 @@ export const GAME_CATALOG: GameMeta[] = [
     category: 'single',
     playerCount: 1,
     spectatable: false,
+    shareCursor: false,
     icon: '🍫',
   },
 ]

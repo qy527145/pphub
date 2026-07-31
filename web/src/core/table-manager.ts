@@ -231,6 +231,15 @@ export class TableManager {
   }
 
   /**
+   * 清空所有桌子与桌号（换房间/断连时调用，避免旧房间的桌子残留到新房间）。
+   */
+  reset(): void {
+    this.tables.clear()
+    this.tableNumbers.clear()
+    this.usedNumbers.clear()
+  }
+
+  /**
    * 简单密码哈希（实际项目应使用 bcrypt）
    */
   private hashPassword(password: string): string {

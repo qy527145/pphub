@@ -10,6 +10,7 @@ import ScreenView from '@/components/ScreenView.vue'
 import BoardView from '@/components/BoardView.vue'
 import GameLobby from '@/components/GameLobby.vue'
 import InviteNotification from '@/components/InviteNotification.vue'
+import MatchmakingOverlay from '@/components/MatchmakingOverlay.vue'
 
 const store = useRoomStore()
 
@@ -71,6 +72,17 @@ watch(() => store.activeView, (newView, oldView) => {
 
     <!-- 邀请通知（全局浮动） -->
     <InviteNotification />
+
+    <!-- 快速匹配遮罩（全局，MOBA 风格） -->
+    <MatchmakingOverlay />
+
+    <!-- 轻量成功/信息提示（全局浮动） -->
+    <Transition name="notice-fade">
+      <div v-if="store.notice" class="notice-toast" @click="store.notice = null">
+        <span class="notice-dot"></span>
+        <span>{{ store.notice }}</span>
+      </div>
+    </Transition>
   </div>
 </template>
 
@@ -86,5 +98,44 @@ watch(() => store.activeView, (newView, oldView) => {
   display: flex;
   flex-direction: column;
   overflow: hidden;
+}
+
+.notice-toast {
+  position: fixed;
+  bottom: 24px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  max-width: min(520px, calc(100vw - 40px));
+  padding: 12px 20px;
+  background: var(--panel);
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-pill);
+  box-shadow: var(--shadow-pop);
+  color: var(--text);
+  font-size: 14px;
+  z-index: 2000;
+  cursor: pointer;
+}
+
+.notice-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--accent);
+  flex: none;
+}
+
+.notice-fade-enter-active,
+.notice-fade-leave-active {
+  transition: all 0.3s ease;
+}
+
+.notice-fade-enter-from,
+.notice-fade-leave-to {
+  opacity: 0;
+  transform: translate(-50%, 12px);
 }
 </style>

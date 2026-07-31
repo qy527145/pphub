@@ -247,6 +247,15 @@ export class InviteManager {
   }
 
   /**
+   * 清空所有邀请状态（换房间/断连时调用）。
+   */
+  reset(): void {
+    this.invites.clear()
+    this.pendingInvites.clear()
+    this.inviteCallbacks.clear()
+  }
+
+  /**
    * 获取统计信息
    */
   getStats() {

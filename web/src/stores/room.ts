@@ -285,6 +285,14 @@ export const useRoomStore = defineStore('room', () => {
   const allowIncoming = ref(localStorage.getItem(LS_ALLOW_INCOMING) !== '0')
   const signalingState = ref<SignalingState>('idle')
   const lastError = ref<string | null>(null)
+  /** 轻量成功/信息提示（正向反馈，如「已发送邀请」「XX 已加入」），几秒后自动消失。 */
+  const notice = ref<string | null>(null)
+  let noticeTimer: ReturnType<typeof setTimeout> | null = null
+  function showNotice(text: string): void {
+    notice.value = text
+    if (noticeTimer) clearTimeout(noticeTimer)
+    noticeTimer = setTimeout(() => { notice.value = null }, 4000)
+  }
 
   // —— 会话数据 ——
   const members = reactive(new Map<string, Member>())
@@ -343,6 +351,20 @@ export const useRoomStore = defineStore('room', () => {
   // —— 邀请系统 ——
   /** 待处理的邀请列表 */
   const pendingInvites = ref<Invitation[]>([])
+  /** 每秒推进的时钟：驱动过期重算，并周期性清理已过期邀请。 */
+  const inviteClock = ref(Date.now())
+  if (typeof window !== 'undefined') {
+    setInterval(() => {
+      const t = Date.now()
+      inviteClock.value = t
+      const alive = pendingInvites.value.filter((i) => i.expiresAt > t)
+      if (alive.length !== pendingInvites.value.length) pendingInvites.value = alive
+    }, 1000)
+  }
+  /** 未处理且未过期的邀请数量（供导航角标提示：让用户知道去哪查看邀请）。 */
+  const pendingInviteCount = computed(
+    () => pendingInvites.value.filter((i) => i.expiresAt > inviteClock.value).length,
+  )
 
   /** 文件夹打包中的数量（UI 转圈提示）。 */
   const packing = ref(0)
@@ -554,6 +576,22 @@ export const useRoomStore = defineStore('room', () => {
       for (const key of pointers.keys()) {
         if (key.endsWith(`|${peerId}`)) pointers.delete(key)
       }
+      // 游戏桌：把离线成员从各桌移除；桌主离线则转移，空桌则销毁（避免残留幽灵桌）。
+      for (const [tid, table] of gameTables.entries()) {
+        if (!table.players.includes(peerId) && !table.spectators.includes(peerId)) continue
+        table.players = table.players.filter((p) => p !== peerId)
+        table.spectators = table.spectators.filter((p) => p !== peerId)
+        if (table.hostId === peerId && table.players.length > 0) {
+          table.hostId = table.players[0]
+        }
+        if (table.players.length === 0 && table.spectators.length === 0) {
+          gameTables.delete(tid)
+          tableManager.destroyTable(tid)
+          if (currentTableId.value === tid) currentTableId.value = null
+        }
+      }
+      // 该成员发来的、尚未处理的邀请随其离线失效。
+      pendingInvites.value = pendingInvites.value.filter((i) => i.fromPeerId !== peerId)
     })
     m.on('peer-state', ({ peerId, state }) => {
       const member = members.get(peerId)
@@ -1718,7 +1756,7 @@ export const useRoomStore = defineStore('room', () => {
       case 'invite-accept': {
         const inviteId = (msg as any).inviteId as string
         console.log('[Invite] 邀请被接受:', inviteId, 'by', from)
-        // 可以显示提示：XXX 已加入游戏
+        showNotice(`${displayName(from)} 接受了邀请，已加入游戏桌`)
         break
       }
       case 'invite-decline': {
@@ -1843,6 +1881,15 @@ export const useRoomStore = defineStore('room', () => {
   /** 断开当前会话（不触发自动重新监听）。 */
   function teardown(): void {
     stopTalk()
+    // 换房间/断连前，尽量通知同房其他人自己离开了游戏桌（尽力而为，通道随后关闭）。
+    if (mesh && currentTableId.value) {
+      const t = gameTables.get(currentTableId.value)
+      if (t) {
+        t.players = t.players.filter((p) => p !== myId.value)
+        t.spectators = t.spectators.filter((p) => p !== myId.value)
+        mesh.broadcast({ kind: 'table-leave', tableId: currentTableId.value })
+      }
+    }
     if (mesh) {
       mesh.leave()
       mesh = null
@@ -1883,6 +1930,17 @@ export const useRoomStore = defineStore('room', () => {
     clicks.value = []
     activeBoard.value = 'wb'
     bumpBoard()
+    // 游戏系统状态随会话销毁：换房间不携带旧房间的游戏桌/邀请/匹配（否则桌子会残留）。
+    gameTables.clear()
+    currentTableId.value = null
+    gameChats.clear()
+    gameMousePositions.clear()
+    gameStates.clear()
+    matchingQueues.clear()
+    myMatchingGame.value = null
+    pendingInvites.value = []
+    tableManager.reset()
+    inviteManager.reset()
     myId.value = ''
     room.value = ''
     signalingState.value = 'idle'
@@ -2720,6 +2778,7 @@ export const useRoomStore = defineStore('room', () => {
       invite,
     })
 
+    showNotice(`已邀请 ${displayName(peerId)}，等待对方接受`)
     console.log('[Invite] 已发送邀请:', invite.inviteId, 'to', peerId)
   }
 
@@ -2880,6 +2939,7 @@ export const useRoomStore = defineStore('room', () => {
     allowIncoming,
     signalingState,
     lastError,
+    notice,
     members,
     messages,
     transfers,
@@ -2899,6 +2959,8 @@ export const useRoomStore = defineStore('room', () => {
     gameMousePositions,
     gameStates,
     pendingInvites,
+    pendingInviteCount,
+    inviteClock,
     packing,
     theme,
     activeView,

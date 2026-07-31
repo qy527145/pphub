@@ -443,6 +443,20 @@ control 通道传 `{t:"chat", from, ts, text|html|imgBlobRef}`；图片/文件�
 
 ---
 
+### QQ 风格大厅 + 匹配遮罩 + 斗地主随机化 + 桌子生命周期落地记录（2026-07-31）
+
+在上一条基础上，围绕五点体验诉求收口，后端零改动：
+
+- **斗地主不共享指针**：指针共享原是游戏无关的全局行为，会泄露手牌类游戏的操作意图。`GameMeta` 增字段 `shareCursor`（棋类/画图 `true`、斗地主/单机 `false`），`GameTable.vue` 的 `handleMouseMove` 与 `remotePointers` 依 `gameMeta.shareCursor` 短路。
+- **斗地主随机化 + 再来一局**：座位与叫地主顺序原先固定（`players.indexOf` + 恒从 0 号叫分）。把座位映射搬进 `DoudizhuState.seats`（随广播下发，各端一致），`initDoudizhu` 用 Fisher-Yates `shuffle` 定座 + 随机 `firstBidder`；`placeBid` 计票改数「已定义项」（稀疏 bids 数组下 `bids.length===3` 会误判），并从 `firstBidder` 起循环 tie-break 选地主。终局桌主可「再来一局」——用 `initDoudizhu(players, moveCount+1)` 播种，`moveCount` 递增让各端接受新局覆盖旧终局。
+- **大厅改版（QQ 风格）**：`GameLobby.vue` 重写——公开桌绘成真实牌桌图形（椭圆绒面 + 绕桌均布座位，`seatStyle` 按 `π/2 + i·2π/n` 定位，头像/桌主皇冠/可入座空位），创建对话框游戏选择改**下拉 `<select>` + 选中预览**，顶部加游戏筛选标签（全部 / 各游戏带计数）与空状态。
+- **快速匹配（MOBA/三国杀 风格）**：新增全局 `MatchmakingOverlay.vue`，以 `store.myMatchingGame` 为开关全屏覆盖（含建桌后自动进等待房的场景），呈现雷达搜索动画、已用时钟、座位逐个填充进度；坐满短暂显示「匹配成功」后清匹配态揭开牌桌。`App.vue` 挂载。
+- **邀请/通知重构**：`store.showNotice` 轻量 toast（`App.vue` 底部居中）在发起/被接受时给正反馈；`SideNav` 游戏大厅项挂 `pendingInviteCount` 角标（告诉用户去哪看）；`GameLobby` 顶部常驻**待处理邀请面板**（接受/拒绝内联），与右上角浮动 `InviteNotification` 互补，解决「不知道通知在哪」。
+- **桌子生命周期**：`table-manager`/`invite-manager` 补 `reset()`；`teardown` 换房/断连时广播离桌并清空 `gameTables/currentTableId/pendingInvites` 等 + 两 manager reset；`peer-removed` 移除该 peer 于各桌（桌主离场转移、空桌销毁、清相关邀请），修掉「换房后旧桌常驻」。`AppIcon` 补齐 `plus/hash/zap/log-in/eye/globe/lock/mail/gamepad-2` 等此前渲染为空的图标。
+- **验证**：`npm run build` + `cargo build` 通过；e2e-features 23 项全过无回归（大厅/匹配/斗地主随机化为 UI 与纯逻辑改动，现有 e2e 未覆盖游戏桌联机路径）。
+
+---
+
 ## 十、关键风险与技术债
 
 1. **TURN 带宽成本 vs「零带宽」定位**：约 17%（移动 30–40%）连接必须中继，产生真实流量费。需在文档/UI 诚实说明「零带宽」是 P2P 直连时成立。自建 coturn 控制成本。

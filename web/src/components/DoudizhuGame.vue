@@ -34,8 +34,13 @@ function cardKey(c: Card): string {
   return `${c.suit}-${c.rank}`
 }
 
-// 我的座位号（0/1/2）；不在玩家席则为 -1（旁观）
-const mySeat = computed(() => props.table.players.indexOf(store.myId))
+// 我的座位号（0/1/2）；不在玩家席则为 -1（旁观）。
+// 座位由本局 gameState.seats 决定（开局随机打乱），未开局时回退到 table.players 顺序。
+const mySeat = computed(() => {
+  const gs = gameState.value
+  if (gs) return gs.seats.indexOf(store.myId)
+  return props.table.players.indexOf(store.myId)
+})
 const isHost = computed(() => props.table.hostId === store.myId)
 
 // 消费对端广播的状态：game-move → store.gameStates → 合并进本地。
@@ -52,11 +57,12 @@ watch(
 )
 
 // 桌主在开局时发牌（只有一端洗牌，保证各端一致），并广播初始状态。
+// 座位随机打乱、叫地主起手随机，均在 initDoudizhu 内完成。
 watch(
   () => props.table.state,
   (s) => {
     if (s === 'playing' && isHost.value && !gameState.value) {
-      const initial = initDoudizhu()
+      const initial = initDoudizhu(props.table.players)
       gameState.value = initial
       store.sendGameMove(props.table.tableId, initial)
     }
@@ -81,7 +87,7 @@ const myHand = computed<Card[]>(() => {
 })
 
 // 其他两个座位。相对位置固定：上家(我之前出牌者)在左、下家(我之后)在右，
-// 保证每个玩家看到的相对布局一致（旁观者按 0/1/2 顺序）。
+// 保证每个玩家看到的相对布局一致（旁观者按 0/1/2 顺序）。座位 → peerId 用本局 seats。
 const opponents = computed(() => {
   const gs = gameState.value
   if (!gs) return []
@@ -91,7 +97,7 @@ const opponents = computed(() => {
       : [(mySeat.value + 2) % 3, (mySeat.value + 1) % 3]
   return seats.map((seat, i) => ({
     seat,
-    peerId: props.table.players[seat] || '',
+    peerId: gs.seats[seat] || '',
     count: gs.hands[seat]?.length ?? 0,
     isLord: gs.lordIndex === seat,
     isTurn: gs.currentPlayer === seat && gs.phase !== 'finished',
@@ -178,6 +184,16 @@ function pass(): void {
   commit(next)
 }
 
+// 再来一局：仅桌主可发起（单端发牌保证各端一致）。以「当前 moveCount+1」为新局起始版本，
+// 确保新状态严格更新，各端才会采纳。重新随机座位与叫地主顺序。
+function restart(): void {
+  const gs = gameState.value
+  if (!gs || !isHost.value || gs.phase !== 'finished') return
+  if (props.table.players.length < 3) return
+  const next = initDoudizhu(props.table.players, gs.moveCount + 1)
+  commit(next)
+}
+
 // —— 展示辅助 ——
 const RANK_LABEL: Record<string, string> = {
   small: '小王',
@@ -205,7 +221,7 @@ function isRed(c: Card): boolean {
 }
 
 function seatName(seat: number): string {
-  return store.displayName(props.table.players[seat] || '')
+  return store.displayName(gameState.value?.seats[seat] || '')
 }
 
 const myIsLord = computed(() => gameState.value?.lordIndex === mySeat.value)
@@ -278,7 +294,11 @@ function bidLabel(b: number | undefined): string {
 
       <!-- 中央状态区 -->
       <div class="table-center">
-        <div v-if="gameState.phase === 'finished'" class="result">{{ resultText }}</div>
+        <div v-if="gameState.phase === 'finished'" class="result-area">
+          <div class="result">{{ resultText }}</div>
+          <button v-if="isHost" class="btn-restart" @click="restart">再来一局</button>
+          <p v-else class="restart-hint">等待桌主开始下一局…</p>
+        </div>
         <template v-else>
           <!-- 上一手牌 -->
           <div v-if="gameState.lastPlay" class="last-play">
@@ -460,6 +480,36 @@ function bidLabel(b: number | undefined): string {
   font-size: 28px;
   font-weight: 700;
   color: var(--accent-strong);
+}
+
+.result-area {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+}
+
+.btn-restart {
+  padding: 10px 28px;
+  border: none;
+  border-radius: var(--radius);
+  background: var(--accent);
+  color: white;
+  font-size: 15px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.btn-restart:hover {
+  background: var(--accent-strong);
+  transform: translateY(-1px);
+}
+
+.restart-hint {
+  margin: 0;
+  font-size: 13px;
+  color: var(--muted);
 }
 
 .last-play {
