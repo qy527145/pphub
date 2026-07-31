@@ -457,6 +457,19 @@ control 通道传 `{t:"chat", from, ts, text|html|imgBlobRef}`；图片/文件�
 
 ---
 
+### 大厅快速匹配/筛选/观战 + 邀请送达 & 象棋开局同步修复落地记录（2026-07-31）
+
+针对「邀请对方收不到通知 / 象棋协商卡住无法开始 / 大厅目录过大且与创建按钮重复 / 缺桌子筛选与满员观战」四点收口，后端信令零改动。**并首次以 e2e 覆盖游戏桌联机路径**（此前落地记录中反复标注的空白）。
+
+- **邀请与象棋协商同源的根因（一个 switch 漏 case）**：`mesh.ts` 的 `handleControl()` 用**显式 case 列表**把入站控制消息重新 `emit('game')` 交给 `store.handleGame`，且**无 `default` 分支**——凡未列入的 kind 被静默吞掉。`invite-send / invite-accept / invite-decline` 与 `game-config-propose / game-config-accept` 五个 kind **从未列入**，于是：邀请报文到不了被邀端（`pendingInvites` 永不填充，「只能进大厅看等待桌」正是此症），象棋开局提议/接受也永不同步（`config.agreed` 卡在 false，桌主无从开始）。而 `table-create` **在**列表里，所以桌子能广播可见——「桌见得到、邀请收不到」的表象由此对上。补齐这五个 case 后两条链路一起打通。
+- **被邀方入桌的第二个隐性坑**：`table-manager.registerRemoteTable(id, number)` 只登记 号→id 映射（`tableNumbers/usedNumbers`），**不落 `this.tables` 对象**，故 `getTableByNumber` 对远端桌恒 `null`，`joinGameTableByNumber` 报「桌号不存在」。两处兜底：①`acceptInvite` 改为**直接按 `invite.tableId` 入桌**（邀请自带 tableId，被邀方跳过密码），仅在极少见未同步时回退桌号；②`joinGameTableByNumber` 在 TableManager 查不到时**回退到 `gameTables` 按 `tableNumber` 匹配**。
+- **大厅改版（去重复 + 快速匹配前置）**：`GameLobby.vue` 把原先硕大、与右上角「创建游戏桌」职能重复的 `.games-catalog` 方阵，换成紧凑的**快速匹配条** `.quick-match`——每款游戏一枚 chip（图标/名称/人数/CTA）：单机点「开始」直接建桌，多人点「匹配」走 `store.startMatching`（触发 MOBA 风格 `MatchmakingOverlay`）；匹配中禁用。创建入口只保留右上角一处。
+- **筛选 + 满员观战**：桌列表头新增 `.search-box`（按桌号 `tableNumber.includes` 过滤，数字输入 + 一键清除）、`.status-tabs`（全部 / 等待中 / 游戏中，`all` 排除 `finished`）、及原有游戏类型 `.filter-tabs`。页脚按状态给动作：可入座→「加入」；已满或进行中且允许观战→「进入观战 / 满员 · 观战」（`canSpectateTable` → `store.joinGameTable(id, true)`）；否则禁用。空状态文案区分「有筛选」与「真无桌」。
+- **e2e 首次覆盖游戏桌联机（e2e-features 新增 6 项）**：A 建象棋公开桌→B 全网可见；A 邀请 B→**B 端 `pendingInvites` 出现**（正是回归 mesh 漏 case 的哨兵）；B 接受→A 端玩家数同步为 2；A 提议开局→B 收到 `config.proposal`；B 接受→双方 `config.agreed===true`；桌主开始→双方 `state==='playing'`。用例末尾双方 `leaveGameTable` 清理，不污染后续。
+- **验证**：`npm run build`（vue-tsc + vite）+ `cargo build` 通过；e2e-features **29 项**（23→29）全过、e2e-network 13 / e2e-relay 13 无回归。踩坑清单：①控制消息 switch 必须有 `default`（或补全 case）否则新 kind 静默丢弃——这是本轮两个功能故障的共同根因；②远端桌不进 `tables`，凡「按桌号找桌」的路径都要有 `gameTables` 回退；③被邀入桌一律走 tableId，不依赖桌号解析。
+
+---
+
 ## 十、关键风险与技术债
 
 1. **TURN 带宽成本 vs「零带宽」定位**：约 17%（移动 30–40%）连接必须中继，产生真实流量费。需在文档/UI 诚实说明「零带宽」是 P2P 直连时成立。自建 coturn 控制成本。

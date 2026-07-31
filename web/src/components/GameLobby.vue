@@ -26,6 +26,10 @@ const showJoinDialog = ref(false)
 
 // 桌子筛选（全部 / 指定游戏）
 const tableFilter = ref<'all' | GameType>('all')
+// 状态筛选（全部 / 等待中 / 游戏中）
+const statusFilter = ref<'all' | 'waiting' | 'playing'>('all')
+// 桌号搜索
+const roomQuery = ref('')
 
 // 匹配功能：以 store.myMatchingGame 为权威状态，匹配 UI 由全局 MatchmakingOverlay 呈现
 const matching = computed(() => store.myMatchingGame !== null)
@@ -38,11 +42,17 @@ const invites = computed<Invitation[]>(() =>
   store.pendingInvites.filter((i) => i.expiresAt > store.inviteClock),
 )
 
-// 所有公开的游戏桌（按筛选）
+// 所有公开的游戏桌（按筛选：游戏类型 / 状态 / 桌号搜索）
 const publicTables = computed(() => {
+  const q = roomQuery.value.trim()
   return Array.from(store.gameTables.values())
     .filter((t) => t.visibility === 'public')
     .filter((t) => tableFilter.value === 'all' || t.gameType === tableFilter.value)
+    .filter((t) => {
+      if (statusFilter.value === 'all') return t.state !== 'finished'
+      return t.state === statusFilter.value
+    })
+    .filter((t) => !q || (t.tableNumber || '').includes(q))
     .sort((a, b) => {
       // 等待中的桌子排前面
       if (a.state === 'waiting' && b.state !== 'waiting') return -1
@@ -79,14 +89,23 @@ function createTable() {
   closeCreateDialog()
 }
 
-function createGameFromCatalog(gameType: GameType) {
-  selectedGameType.value = gameType
-  isPublicTable.value = true
-  openCreateDialog()
-}
-
 function joinTable(tableId: string) {
   store.joinGameTable(tableId, false)
+}
+
+function spectateTable(tableId: string) {
+  store.joinGameTable(tableId, true)
+}
+
+// 快速开始：多人游戏走匹配（MOBA 风格遮罩），单机游戏直接开桌进入
+function quickPlay(gameType: GameType) {
+  if (matching.value) return
+  const meta = getGameMeta(gameType)
+  if (meta?.category === 'single') {
+    store.createGameTable(gameType, false)
+  } else {
+    store.startMatching(gameType)
+  }
 }
 
 function getTableStateText(table: GameTable): string {
@@ -115,6 +134,13 @@ function canJoinTable(table: GameTable): boolean {
   return table.players.length < (meta?.playerCount || 999)
 }
 
+// 玩家位已满或已开局的桌子，若支持旁观则可直接进入观战
+function canSpectateTable(table: GameTable): boolean {
+  const meta = getGameMeta(table.gameType)
+  if (!meta?.spectatable || table.state === 'finished') return false
+  return table.state === 'playing' || table.players.length >= (meta.playerCount || 999)
+}
+
 function getPlayerNick(peerId: string): string {
   return store.displayName(peerId)
 }
@@ -139,11 +165,6 @@ function seatStyle(index: number, total: number) {
   const x = 50 + 42 * Math.cos(angle)
   const y = 50 + 40 * Math.sin(angle)
   return { left: `${x}%`, top: `${y}%` }
-}
-
-// 开始匹配（MOBA 风格遮罩由全局组件呈现）
-function startMatching(gameType: GameType) {
-  store.startMatching(gameType)
 }
 
 // —— 邀请 ——
@@ -221,41 +242,56 @@ function declineInvite(inv: Invitation) {
         </div>
       </section>
 
-      <!-- 快速开始：游戏选择 -->
-      <section class="games-catalog">
-        <h3 class="section-title">开始游戏</h3>
-        <div class="games-strip">
-          <div v-for="game in GAME_CATALOG" :key="game.id" class="game-tile">
-            <div class="game-tile-icon">{{ game.icon }}</div>
-            <h4>{{ game.name }}</h4>
-            <p>{{ game.description }}</p>
-            <div class="game-tile-meta">
-              <span class="meta-tag">{{ game.playerCount }}人</span>
-              <span v-if="game.spectatable" class="meta-tag spectatable">可旁观</span>
-            </div>
-            <div class="game-tile-actions">
-              <button
-                v-if="game.category !== 'single'"
-                class="btn-match"
-                :disabled="matching"
-                @click="startMatching(game.id)"
-              >
-                <AppIcon name="zap" :size="14" />
-                快速匹配
-              </button>
-              <button class="btn-create-game" @click="createGameFromCatalog(game.id)">
-                <AppIcon name="plus" :size="14" />
-                创建
-              </button>
-            </div>
-          </div>
+      <!-- 快速匹配：紧凑的游戏选择条，点击即自动组队匹配 -->
+      <section class="quick-match">
+        <h3 class="section-title">
+          <AppIcon name="zap" :size="18" />
+          快速匹配
+          <span class="qm-hint">选择游戏，自动为你组队匹配对手</span>
+        </h3>
+        <div class="qm-games">
+          <button
+            v-for="game in GAME_CATALOG"
+            :key="game.id"
+            class="qm-game"
+            :class="{ single: game.category === 'single' }"
+            :disabled="matching"
+            :title="game.description"
+            @click="quickPlay(game.id)"
+          >
+            <span class="qm-icon">{{ game.icon }}</span>
+            <span class="qm-info">
+              <span class="qm-name">{{ game.name }}</span>
+              <span class="qm-players">{{ game.category === 'single' ? '单机' : `${game.playerCount} 人` }}</span>
+            </span>
+            <span class="qm-cta">
+              <AppIcon :name="game.category === 'single' ? 'play' : 'zap'" :size="13" />
+              {{ game.category === 'single' ? '开始' : '匹配' }}
+            </span>
+          </button>
         </div>
       </section>
 
       <!-- 公开游戏桌 -->
       <section class="tables-section">
         <div class="tables-head">
-          <h3 class="section-title">游戏桌</h3>
+          <div class="tables-title-row">
+            <h3 class="section-title">游戏桌<span v-if="publicTables.length" class="tables-count">{{ publicTables.length }}</span></h3>
+            <div class="table-tools">
+              <div class="search-box">
+                <AppIcon name="hash" :size="15" />
+                <input v-model="roomQuery" type="text" inputmode="numeric" placeholder="搜索桌号" />
+                <button v-if="roomQuery" class="search-clear" @click="roomQuery = ''">
+                  <AppIcon name="x" :size="13" />
+                </button>
+              </div>
+              <div class="status-tabs">
+                <button :class="{ active: statusFilter === 'all' }" @click="statusFilter = 'all'">全部</button>
+                <button :class="{ active: statusFilter === 'waiting' }" @click="statusFilter = 'waiting'">等待中</button>
+                <button :class="{ active: statusFilter === 'playing' }" @click="statusFilter = 'playing'">游戏中</button>
+              </div>
+            </div>
+          </div>
           <div class="filter-tabs">
             <button
               class="filter-tab"
@@ -280,7 +316,7 @@ function declineInvite(inv: Invitation) {
         <!-- 空状态 -->
         <div v-if="publicTables.length === 0" class="empty-tables">
           <div class="empty-icon">🪑</div>
-          <p>还没有人开桌，来创建第一桌吧！</p>
+          <p>{{ roomQuery || statusFilter !== 'all' || tableFilter !== 'all' ? '没有符合条件的游戏桌' : '还没有人开桌，来创建第一桌吧！' }}</p>
           <button class="btn-create" @click="openCreateDialog">
             <AppIcon name="plus" :size="16" />
             创建游戏桌
@@ -350,11 +386,11 @@ function declineInvite(inv: Invitation) {
                 <AppIcon name="log-in" :size="16" /> 加入游戏桌
               </button>
               <button
-                v-else-if="table.state === 'playing' && getGameMeta(table.gameType)?.spectatable"
+                v-else-if="canSpectateTable(table)"
                 class="btn-spectate"
-                @click="joinTable(table.tableId)"
+                @click="spectateTable(table.tableId)"
               >
-                <AppIcon name="eye" :size="16" /> 观战
+                <AppIcon name="eye" :size="16" /> {{ table.state === 'playing' ? '进入观战' : '满员 · 观战' }}
               </button>
               <button v-else class="btn-disabled" disabled>
                 {{ table.state === 'finished' ? '已结束' : '已满' }}
@@ -649,121 +685,85 @@ function declineInvite(inv: Invitation) {
   color: var(--text);
 }
 
-/* —— 游戏选择条 —— */
-.games-catalog {
-  margin-bottom: 36px;
+/* —— 快速匹配条 —— */
+.quick-match {
+  margin-bottom: 32px;
 }
 
-.games-strip {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
-  gap: 14px;
+.qm-hint {
+  font-size: 12px;
+  font-weight: 400;
+  color: var(--muted);
+  margin-left: 4px;
 }
 
-.game-tile {
+.qm-games {
   display: flex;
-  flex-direction: column;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.qm-game {
+  display: flex;
   align-items: center;
-  text-align: center;
-  gap: 6px;
-  padding: 18px 14px;
+  gap: 10px;
+  padding: 10px 14px;
   background: var(--panel);
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  transition: all 0.2s;
-}
-
-.game-tile:hover {
-  border-color: var(--accent);
-  box-shadow: var(--shadow-pop);
-  transform: translateY(-2px);
-}
-
-.game-tile-icon {
-  font-size: 42px;
-  line-height: 1;
-}
-
-.game-tile h4 {
-  margin: 4px 0 0;
-  font-size: 15px;
-  color: var(--text);
-}
-
-.game-tile p {
-  margin: 0;
-  font-size: 12px;
-  color: var(--muted);
-  min-height: 32px;
-}
-
-.game-tile-meta {
-  display: flex;
-  gap: 6px;
-  flex-wrap: wrap;
-  justify-content: center;
-}
-
-.meta-tag {
-  padding: 2px 8px;
-  background: var(--accent-weak);
-  color: var(--accent-strong);
-  border-radius: var(--radius-pill);
-  font-size: 11px;
-  font-weight: 600;
-}
-
-.meta-tag.spectatable {
-  background: var(--success-weak);
-  color: var(--success);
-}
-
-.game-tile-actions {
-  display: flex;
-  gap: 8px;
-  margin-top: 8px;
-  width: 100%;
-}
-
-.btn-match,
-.btn-create-game {
-  flex: 1;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 5px;
-  padding: 8px 10px;
-  border: none;
-  border-radius: var(--radius);
-  font-size: 13px;
-  font-weight: 600;
   cursor: pointer;
   transition: all 0.2s;
 }
 
-.btn-match {
-  background: var(--success);
-  color: #fff;
-}
-
-.btn-match:hover:not(:disabled) {
-  background: var(--success-strong);
+.qm-game:hover:not(:disabled) {
+  border-color: var(--accent);
+  box-shadow: var(--shadow-soft);
   transform: translateY(-1px);
 }
 
-.btn-match:disabled {
+.qm-game:disabled {
   opacity: 0.5;
   cursor: not-allowed;
 }
 
-.btn-create-game {
-  background: var(--accent);
-  color: #fff;
+.qm-icon {
+  font-size: 26px;
+  line-height: 1;
 }
 
-.btn-create-game:hover {
-  background: var(--accent-strong);
-  transform: translateY(-1px);
+.qm-info {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 1px;
+}
+
+.qm-name {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.qm-players {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.qm-cta {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: 6px;
+  padding: 5px 12px;
+  border-radius: var(--radius-pill);
+  background: var(--success);
+  color: #fff;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.qm-game.single .qm-cta {
+  background: var(--accent);
 }
 
 /* —— 桌子筛选 —— */
@@ -772,6 +772,105 @@ function declineInvite(inv: Invitation) {
   flex-direction: column;
   gap: 12px;
   margin-bottom: 18px;
+}
+
+.tables-title-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.tables-title-row .section-title {
+  margin: 0;
+}
+
+.tables-count {
+  margin-left: 8px;
+  padding: 1px 9px;
+  background: var(--accent-weak);
+  color: var(--accent-strong);
+  border-radius: var(--radius-pill);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.table-tools {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.search-box {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-pill);
+  background: var(--panel);
+  color: var(--muted);
+}
+
+.search-box:focus-within {
+  border-color: var(--accent);
+}
+
+.search-box input {
+  width: 96px;
+  border: none;
+  background: none;
+  color: var(--text);
+  font-size: 13px;
+  outline: none;
+}
+
+.search-clear {
+  display: grid;
+  place-items: center;
+  border: none;
+  background: var(--hover);
+  color: var(--muted);
+  border-radius: 50%;
+  width: 18px;
+  height: 18px;
+  cursor: pointer;
+}
+
+.search-clear:hover {
+  color: var(--text);
+}
+
+.status-tabs {
+  display: inline-flex;
+  padding: 3px;
+  gap: 2px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-pill);
+  background: var(--panel);
+}
+
+.status-tabs button {
+  padding: 5px 12px;
+  border: none;
+  background: none;
+  color: var(--text-2);
+  font-size: 13px;
+  border-radius: var(--radius-pill);
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.status-tabs button:hover {
+  color: var(--text);
+}
+
+.status-tabs button.active {
+  background: var(--accent);
+  color: #fff;
+  font-weight: 600;
 }
 
 .filter-tabs {

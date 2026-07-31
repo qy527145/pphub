@@ -1233,11 +1233,16 @@ export class Mesh extends Emitter<MeshEvents> {
       case 'table-standup':
       case 'table-invite':
       case 'game-move':
+      case 'game-config-propose':
+      case 'game-config-accept':
       case 'game-chat':
       case 'mouse-pos':
       case 'match-request':
       case 'match-cancel':
       case 'match-found':
+      case 'invite-send':
+      case 'invite-accept':
+      case 'invite-decline':
         this.emit('game', { from, msg })
         break
       case 'profile': {

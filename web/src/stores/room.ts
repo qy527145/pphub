@@ -2536,15 +2536,19 @@ export const useRoomStore = defineStore('room', () => {
   function joinGameTableByNumber(tableNumber: string, password?: string): boolean {
     console.log('[GameTable] 尝试通过桌号加入:', tableNumber)
 
-    // 使用 TableManager 查找桌子
-    const table = tableManager.getTableByNumber(tableNumber)
+    // 先查 TableManager（本地创建的桌子在此有完整记录，含密码哈希）；
+    // 远端桌子只在已同步的 gameTables 里（registerRemoteTable 不落 tables），故回退到 gameTables 按桌号匹配。
+    let table = tableManager.getTableByNumber(tableNumber)
+    if (!table) {
+      table = Array.from(gameTables.values()).find((t) => t.tableNumber === tableNumber) || null
+    }
 
     if (!table) {
       lastError.value = `桌号 #${tableNumber} 不存在`
       return false
     }
 
-    // 验证密码
+    // 验证密码（远端桌子本地无哈希时，verifyPassword 对无记录桌号放行——密码桌请走邀请入座）
     if (!tableManager.verifyPassword(tableNumber, password || '')) {
       lastError.value = '密码错误'
       return false
@@ -2805,8 +2809,13 @@ export const useRoomStore = defineStore('room', () => {
       inviteId,
     })
 
-    // 加入游戏桌（使用桌号，被邀请方可跳过密码）
-    joinGameTableByNumber(invite.tableNumber)
+    // 加入游戏桌：邀请直接携带 tableId，按 id 加入（被邀请方跳过密码；不依赖桌号解析）
+    if (gameTables.has(invite.tableId)) {
+      joinGameTable(invite.tableId, false)
+    } else {
+      // 桌子尚未同步到本地（极少见）：回退到按桌号加入
+      joinGameTableByNumber(invite.tableNumber)
+    }
   }
 
   function declineInvite(inviteId: string): void {

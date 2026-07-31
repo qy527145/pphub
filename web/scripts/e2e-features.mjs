@@ -290,6 +290,85 @@ async function main() {
     )
     ok('五子棋：认输终局，双方结果互补')
 
+    // —— 4.5 游戏桌 / 邀请送达 / 象棋开局协商（验证 mesh 正确路由 game-config-* 与 invite-*）——
+    // A 创建象棋公开桌 → 广播；B 在大厅看到该桌
+    const xTableId = await a.evaluate(() => {
+      window.__pphub.createGameTable('xiangqi', true)
+      return window.__pphub.currentTableId
+    })
+    await until(
+      b,
+      (id) => window.__pphub.gameTables.has(id),
+      'B 看到 A 创建的象棋桌',
+      20000,
+      xTableId,
+    )
+    ok('游戏桌：创建后广播，全网可见')
+
+    // A 邀请 B：invite-send 必须经 mesh 路由到 B（此前该 kind 未在 mesh switch 中，静默丢弃）
+    await a.evaluate((to) => window.__pphub.inviteToTable(window.__pphub.currentTableId, to), bId)
+    const inv = await until(
+      b,
+      (from) => window.__pphub.pendingInvites.find((i) => i.fromPeerId === from) ?? null,
+      'B 收到游戏邀请',
+      20000,
+      aId,
+    )
+    ok('游戏邀请：invite-send 经 mesh 送达，B 端 pendingInvites 出现通知')
+
+    // B 接受邀请 → 加入该桌；A 端玩家数同步为 2
+    await b.evaluate((id) => window.__pphub.acceptInvite(id), inv.inviteId)
+    await until(
+      a,
+      (id) => window.__pphub.gameTables.get(id)?.players.length === 2,
+      'A 端看到 B 入座（2 玩家）',
+      20000,
+      xTableId,
+    )
+    ok('游戏邀请：B 接受后入座，玩家数同步为 2')
+
+    // 象棋开局协商：A 提议 → game-config-propose 送达 B
+    await a.evaluate(
+      (id) => window.__pphub.proposeXiangqiConfig(id, { redSeat: 0, gameTimeSec: 600, moveTimeSec: 60 }),
+      xTableId,
+    )
+    await until(
+      b,
+      (id) => !!(window.__pphub.gameTables.get(id)?.config?.proposal),
+      'B 收到开局提议',
+      20000,
+      xTableId,
+    )
+    ok('象棋协商：game-config-propose 经 mesh 送达 B')
+
+    // B 接受 → game-config-accept 送达 A，双方 config.agreed 同步为 true
+    await b.evaluate((id) => window.__pphub.acceptXiangqiConfig(id), xTableId)
+    for (const [p, name] of [[a, 'A'], [b, 'B']]) {
+      await until(
+        p,
+        (id) => window.__pphub.gameTables.get(id)?.config?.agreed === true,
+        `${name} 端开局设置 agreed`,
+        20000,
+        xTableId,
+      )
+    }
+    ok('象棋协商：B 接受后双方 config.agreed 同步为 true')
+
+    // 桌主 A 开始 → 双方进入对局（此前因 agreed 无法同步而卡死）
+    await a.evaluate((id) => window.__pphub.startGameTable(id), xTableId)
+    await until(
+      b,
+      (id) => window.__pphub.gameTables.get(id)?.state === 'playing',
+      'B 端象棋进入对局',
+      20000,
+      xTableId,
+    )
+    ok('象棋：协商一致后桌主开始，双方进入对局')
+
+    // 清理：双方离桌，避免影响后续用例
+    await b.evaluate(() => window.__pphub.leaveGameTable())
+    await a.evaluate(() => window.__pphub.leaveGameTable())
+
     // —— 5. 你画我猜（先验证网络动作条入口：直达白板 + 弹出出题面板）——
     await a.evaluate(() => window.__pphub.actionGuess())
     await until(
