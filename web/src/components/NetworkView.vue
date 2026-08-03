@@ -606,7 +606,7 @@ function stateLabel(m: { state: string; transport: string }): string {
         </div>
 
         <div class="method">
-          <div class="mhead"><span class="num">03</span> 房间口令（多节点组网 ≤6）</div>
+          <div class="mhead"><span class="num">03</span> 房间口令（多节点全网状组网）</div>
           <div class="row">
             <input
               v-model="roomName"
