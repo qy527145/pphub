@@ -45,9 +45,18 @@ import {
   canStartGame,
   minPlayersOf,
   maxPlayersOf,
+  generateTableId,
 } from '@/core/games'
-import { tableManager } from '@/core/table-manager'
-import { inviteManager, type Invitation } from '@/core/invite-manager'
+import {
+  electHost,
+  canSit,
+  hashPassword,
+  verifyPassword,
+  genTableNumber,
+  type Invitation,
+  type TableAction,
+  type XiangqiProposal,
+} from '@/core/lobby'
 
 /** idle=未上线 · connecting=正在进房 · online=已在房间（监听中或已连接对端） */
 export type Status = 'idle' | 'connecting' | 'online'
@@ -343,14 +352,14 @@ export const useRoomStore = defineStore('room', () => {
   const gameChats = reactive(new Map<string, GameChatMessage[]>())
   /** 游戏内鼠标位置 */
   const gameMousePositions = reactive(new Map<string, MousePosition[]>())
-  /** 匹配队列：gameType -> 等待匹配的玩家 ID 列表 */
-  const matchingQueues = reactive(new Map<GameType, string[]>())
   /** 当前正在匹配的游戏类型 */
   const myMatchingGame = ref<GameType | null>(null)
   /** 游戏状态：tableId -> 游戏特定状态 */
   const gameStates = reactive(new Map<string, any>())
 
   // —— 邀请系统 ——
+  /** 邀请存活时长：超过即视为过期（发起后无人应答自动消失）。 */
+  const INVITE_TTL_MS = 60 * 1000
   /** 待处理的邀请列表 */
   const pendingInvites = ref<Invitation[]>([])
   /** 每秒推进的时钟：驱动过期重算，并周期性清理已过期邀请。 */
@@ -359,14 +368,50 @@ export const useRoomStore = defineStore('room', () => {
     setInterval(() => {
       const t = Date.now()
       inviteClock.value = t
-      const alive = pendingInvites.value.filter((i) => i.expiresAt > t)
+      const alive = pendingInvites.value.filter((i) => t - i.createdAt < INVITE_TTL_MS)
       if (alive.length !== pendingInvites.value.length) pendingInvites.value = alive
     }, 1000)
   }
   /** 未处理且未过期的邀请数量（供导航角标提示：让用户知道去哪查看邀请）。 */
   const pendingInviteCount = computed(
-    () => pendingInvites.value.filter((i) => i.expiresAt > inviteClock.value).length,
+    () => pendingInvites.value.filter((i) => inviteClock.value - i.createdAt < INVITE_TTL_MS).length,
   )
+
+  // —— 幽灵桌回收（兜底）——
+  // 桌主权威 + table-gone 已能覆盖绝大多数销毁，此处每 10s 兜底清理三类残留：
+  //   1. 无任何在线占用者的桌（错过了 table-gone）；
+  //   2. 结束超过 30s、且我不在其中的桌；
+  //   3. 我托管、未在查看、且仅剩我自己（或空）的桌——多为「双方同时离席时被移交回我」的竞态产物。
+  if (typeof window !== 'undefined') {
+    setInterval(() => {
+      const me = myId.value
+      for (const [tid, table] of gameTables.entries()) {
+        const occupants = [...table.players, ...table.spectators]
+        const anyOnline = occupants.some((p) => p === me || members.has(p))
+        if (!anyOnline) {
+          dropTable(tid)
+          continue
+        }
+        if (
+          table.state === 'finished' &&
+          table.finishedAt &&
+          Date.now() - table.finishedAt > 30_000 &&
+          currentTableId.value !== tid
+        ) {
+          dropTable(tid)
+          continue
+        }
+        if (
+          table.hostId === me &&
+          currentTableId.value !== tid &&
+          occupants.every((p) => p === me)
+        ) {
+          mesh?.broadcast({ kind: 'table-gone', tableId: tid })
+          dropTable(tid)
+        }
+      }
+    }, 10_000)
+  }
 
   /** 文件夹打包中的数量（UI 转圈提示）。 */
   const packing = ref(0)
@@ -578,18 +623,41 @@ export const useRoomStore = defineStore('room', () => {
       for (const key of pointers.keys()) {
         if (key.endsWith(`|${peerId}`)) pointers.delete(key)
       }
-      // 游戏桌：把离线成员从各桌移除；桌主离线则转移，空桌则销毁（避免残留幽灵桌）。
+      // 游戏桌：把离线成员从各桌移除。桌主权威模型下——
+      //   · 桌主掉线：所有节点用 electHost() 确定性改选（无需协商，不会脑裂）；
+      //     当选者接管权威并重新广播 table-sync，其余节点先做乐观本地移除等其同步。
+      //   · 普通成员掉线：仅桌主权威移除并广播；空桌则回收（table-gone）。
       for (const [tid, table] of gameTables.entries()) {
         if (!table.players.includes(peerId) && !table.spectators.includes(peerId)) continue
-        table.players = table.players.filter((p) => p !== peerId)
-        table.spectators = table.spectators.filter((p) => p !== peerId)
-        if (table.hostId === peerId && table.players.length > 0) {
-          table.hostId = table.players[0]
-        }
-        if (table.players.length === 0 && table.spectators.length === 0) {
-          gameTables.delete(tid)
-          tableManager.destroyTable(tid)
-          if (currentTableId.value === tid) currentTableId.value = null
+        const players = table.players.filter((p) => p !== peerId)
+        const spectators = table.spectators.filter((p) => p !== peerId)
+
+        if (table.hostId === peerId) {
+          const newHost = electHost(players, spectators)
+          if (!newHost) {
+            dropTable(tid)
+            continue
+          }
+          table.players = players
+          table.spectators = spectators
+          table.hostId = newHost
+          if (newHost === myId.value) {
+            // 我当选：接管权威、自增 rev、向全网广播接管后的快照。
+            table.rev++
+            mesh?.broadcast({ kind: 'table-sync', table })
+          }
+        } else {
+          table.players = players
+          table.spectators = spectators
+          if (table.hostId === myId.value) {
+            if (players.length === 0 && spectators.length === 0) {
+              mesh?.broadcast({ kind: 'table-gone', tableId: tid })
+              dropTable(tid)
+              continue
+            }
+            table.rev++
+            mesh?.broadcast({ kind: 'table-sync', table })
+          }
         }
       }
       // 该成员发来的、尚未处理的邀请随其离线失效。
@@ -688,15 +756,16 @@ export const useRoomStore = defineStore('room', () => {
         m.sendTo(peerId, { kind: 'draw-state', board: dmBoardId(peerId), items: dm })
       }
 
-      // 同步所有公开的游戏桌给新加入的成员
+      // 桌主权威：只向新成员补发「我作为桌主」的桌子快照（含私有桌，供其在大厅看到并凭桌号/邀请加入）。
+      // 非本端托管的桌子由各自桌主负责同步，避免转发陈旧状态。
       let syncCount = 0
       for (const table of gameTables.values()) {
-        if (table.visibility === 'public') {
-          m.sendTo(peerId, { kind: 'table-create', tableId: table.tableId, table })
+        if (table.hostId === myId.value) {
+          m.sendTo(peerId, { kind: 'table-sync', table })
           syncCount++
         }
       }
-      console.log('[GameTable] 已同步', syncCount, '个公开桌子给', peerId)
+      console.log('[GameTable] 已同步', syncCount, '个本端托管桌子给', peerId)
     })
 
     m.on('screen-start', (peerId) => {
@@ -1560,6 +1629,151 @@ export const useRoomStore = defineStore('room', () => {
     }
   }
 
+  // ============================================================
+  //  游戏桌：桌主权威模型辅助函数
+  //  · 状态只由桌主修改并广播 table-sync（rev 单调递增）；
+  //  · 其余节点按 rev 合并快照，从根源消除座位竞争 / 脑裂；
+  //  · 桌内游戏流量（move/chat/mouse/config）只在桌成员间定向收发。
+  // ============================================================
+
+  /** 从本地彻底移除一张桌子及其附属状态。 */
+  function dropTable(tid: string): void {
+    gameTables.delete(tid)
+    gameStates.delete(tid)
+    gameChats.delete(tid)
+    gameMousePositions.delete(tid)
+    if (currentTableId.value === tid) currentTableId.value = null
+  }
+
+  /** 把一条消息定向发给某桌的全体成员（玩家 + 旁观，去重、排除自己）。 */
+  function sendToTable(table: GameTable, msg: GameMessage): void {
+    if (!mesh) return
+    const seen = new Set<string>()
+    for (const pid of [...table.players, ...table.spectators]) {
+      if (pid === myId.value || seen.has(pid)) continue
+      seen.add(pid)
+      mesh.sendTo(pid, msg)
+    }
+  }
+
+  /**
+   * 桌主根据请求修改权威桌子状态（就地修改 table）。
+   * 返回 { changed, reject }：reject 有值时应向请求方回 table-reject，
+   * changed 为 true 时桌主应 rev++ 并广播新快照。
+   */
+  function applyTableAction(
+    table: GameTable,
+    from: string,
+    action: TableAction,
+    password?: string,
+  ): { changed: boolean; reject?: string } {
+    switch (action) {
+      case 'join': {
+        if (table.players.includes(from)) return { changed: false }
+        if (!verifyPassword(table, password)) return { changed: false, reject: '密码错误' }
+        if (!canSit(table, from)) {
+          return { changed: false, reject: table.state === 'playing' ? '游戏已开始' : '座位已满' }
+        }
+        table.spectators = table.spectators.filter((p) => p !== from)
+        table.players = [...table.players, from]
+        return { changed: true }
+      }
+      case 'spectate': {
+        if (table.spectators.includes(from) && !table.players.includes(from)) return { changed: false }
+        table.players = table.players.filter((p) => p !== from)
+        if (!table.spectators.includes(from)) table.spectators = [...table.spectators, from]
+        return { changed: true }
+      }
+      case 'sit': {
+        if (table.players.includes(from)) return { changed: false }
+        if (!canSit(table, from)) return { changed: false, reject: '座位已满' }
+        table.spectators = table.spectators.filter((p) => p !== from)
+        table.players = [...table.players, from]
+        return { changed: true }
+      }
+      case 'standup': {
+        if (!table.players.includes(from)) return { changed: false }
+        if (table.state !== 'waiting') return { changed: false, reject: '游戏进行中不能起立' }
+        table.players = table.players.filter((p) => p !== from)
+        if (!table.spectators.includes(from)) table.spectators = [...table.spectators, from]
+        return { changed: true }
+      }
+      case 'leave': {
+        if (!table.players.includes(from) && !table.spectators.includes(from)) return { changed: false }
+        table.players = table.players.filter((p) => p !== from)
+        table.spectators = table.spectators.filter((p) => p !== from)
+        return { changed: true }
+      }
+    }
+    return { changed: false }
+  }
+
+  /** 接收桌主的权威快照：按 rev 单调合并，并处理「我被移出 / 开局 / 匹配聚合」等联动。 */
+  function adoptTableSync(t: GameTable): void {
+    const local = gameTables.get(t.tableId)
+    if (local && local.rev >= t.rev) return // 陈旧快照，忽略
+    gameTables.set(t.tableId, t)
+
+    const me = myId.value
+    // 权威快照已不含我（被拒 / 被移出）而我仍停在该桌视图 → 回到大厅（结算态除外）。
+    if (
+      currentTableId.value === t.tableId &&
+      !t.players.includes(me) &&
+      !t.spectators.includes(me) &&
+      t.state !== 'finished'
+    ) {
+      currentTableId.value = null
+    }
+    // 我的当前桌开局 → 清除匹配遮罩，揭开牌桌。
+    if (myMatchingGame.value && t.tableId === currentTableId.value && t.state === 'playing') {
+      myMatchingGame.value = null
+    }
+    coalesceMatching(t)
+    maybeAutoStart(t)
+  }
+
+  /** 桌主：匹配自建桌达到最少开局人数时自动开局。 */
+  function maybeAutoStart(table: GameTable): void {
+    if (table.hostId !== myId.value || !table.autoStart || table.state !== 'waiting') return
+    const meta = getGameMeta(table.gameType)
+    if (meta && table.players.length >= minPlayersOf(meta)) startGameTable(table.tableId)
+  }
+
+  /**
+   * 匹配聚合：我正为某游戏匹配、且独自守着自建的匹配空桌时，若发现同类公开空桌的
+   * tableId 更小，则并过去。「只并入更小 id」保证全网所有匹配者收敛到同一张桌，
+   * 不会来回横跳，避免匹配分散成多张单人桌永远凑不齐人。
+   */
+  function coalesceMatching(t: GameTable): void {
+    if (!mesh || myMatchingGame.value !== t.gameType) return
+    const cur = currentTableId.value ? gameTables.get(currentTableId.value) : null
+    if (
+      !cur ||
+      cur.hostId !== myId.value ||
+      !cur.autoStart ||
+      cur.state !== 'waiting' ||
+      cur.players.length !== 1
+    ) {
+      return
+    }
+    const meta = getGameMeta(t.gameType)
+    if (!meta) return
+    const cap = maxPlayersOf(meta)
+    let best: GameTable | null = null
+    for (const o of gameTables.values()) {
+      if (o.tableId === cur.tableId) continue
+      if (o.gameType !== t.gameType || o.visibility !== 'public') continue
+      if (o.state !== 'waiting' || o.passwordHash) continue
+      if (o.players.length >= cap) continue
+      if (o.tableId >= cur.tableId) continue
+      if (!best || o.tableId < best.tableId) best = o
+    }
+    if (best) {
+      leaveGameTable()
+      joinGameTable(best.tableId, false)
+    }
+  }
+
   /** 游戏消息统一入口（mesh 'game' 事件）。 */
   function handleGame(from: string, msg: GameMessage): void {
     switch (msg.kind) {
@@ -1649,152 +1863,85 @@ export const useRoomStore = defineStore('room', () => {
         }
         break
       }
-      // —— 游戏桌消息处理 ——
-      case 'table-create': {
-        const table = msg.table as GameTable
-        console.log('[GameTable] 收到 table-create:', {
-          from,
-          tableId: table?.tableId,
-          tableNumber: table?.tableNumber,
-          gameType: table?.gameType,
-          visibility: table?.visibility,
-          players: table?.players,
-        })
-        if (table && table.tableId) {
-          gameTables.set(table.tableId, table)
-
-          // 同步到 TableManager（用于桌号查询）
-          if (table.tableNumber && table.tableId !== tableManager.getTableByNumber(table.tableNumber)?.tableId) {
-            // 远端创建的桌子，需要在本地 TableManager 中注册
-            tableManager.registerRemoteTable(table.tableId, table.tableNumber)
-          }
-
-          console.log('[GameTable] 已添加到 gameTables, 当前桌子数:', gameTables.size)
-        }
+      // —— 游戏桌（桌主权威 + 版本化全量同步）——
+      case 'table-sync': {
+        adoptTableSync(msg.table)
         break
       }
-      case 'table-join': {
-        const table = gameTables.get(msg.tableId)
-        if (table && !table.players.includes(from)) {
-          table.players.push(from)
-        }
+      case 'table-gone': {
+        dropTable(msg.tableId)
         break
       }
-      case 'table-spectate': {
+      case 'table-req': {
+        // 仅当我是该桌桌主时才处理请求：据 action 修改权威状态并广播新快照。
         const table = gameTables.get(msg.tableId)
-        if (table && !table.spectators.includes(from)) {
-          table.spectators.push(from)
-        }
-        break
-      }
-      case 'table-leave': {
-        const table = gameTables.get(msg.tableId)
-        if (table) {
-          table.players = table.players.filter(p => p !== from)
-          table.spectators = table.spectators.filter(p => p !== from)
-          // 如果桌主离开，转移给第一个玩家
-          if (table.hostId === from && table.players.length > 0) {
-            table.hostId = table.players[0]
-          }
-          // 如果桌子空了，删除
+        if (!table || table.hostId !== myId.value) break
+        const res = applyTableAction(table, from, msg.action, msg.password)
+        if (res.reject) {
+          mesh?.sendTo(from, { kind: 'table-reject', tableId: table.tableId, reason: res.reject })
+        } else if (res.changed) {
+          table.rev++
           if (table.players.length === 0 && table.spectators.length === 0) {
-            gameTables.delete(msg.tableId)
-            // 同步到 TableManager
-            tableManager.destroyTable(msg.tableId)
+            mesh?.broadcast({ kind: 'table-gone', tableId: table.tableId })
+            dropTable(table.tableId)
+          } else {
+            mesh?.broadcast({ kind: 'table-sync', table })
+            maybeAutoStart(table)
           }
         }
         break
       }
-      case 'table-start': {
-        const table = gameTables.get(msg.tableId)
-        if (table) {
-          table.state = 'playing'
-          table.startedAt = Date.now()
-          // 采用桌主冻结的座位表；旧端未携带时回退到当前玩家顺序。
-          table.roster = (msg as any).roster || [...table.players]
-        }
+      case 'table-reject': {
+        // 桌主驳回我的请求：退出该桌视图（回到大厅）并提示原因。
+        if (currentTableId.value === msg.tableId) currentTableId.value = null
+        lastError.value = msg.reason || '加入游戏桌失败'
         break
       }
-      case 'table-sit': {
-        const table = gameTables.get(msg.tableId)
-        if (table) {
-          table.spectators = table.spectators.filter(p => p !== from)
-          if (!table.players.includes(from)) {
-            table.players.push(from)
-          }
-        }
-        break
-      }
-      case 'table-standup': {
-        const table = gameTables.get(msg.tableId)
-        if (table) {
-          table.players = table.players.filter(p => p !== from)
-          if (!table.spectators.includes(from)) {
-            table.spectators.push(from)
-          }
-        }
-        break
-      }
-      // —— 邀请消息 ——
+      // —— 邀请消息（点对点定向）——
       case 'invite-send': {
-        const invite = (msg as any).invite as Invitation
+        const invite = msg.invite
         if (!invite) break
-
-        console.log('[Invite] 收到邀请:', invite.inviteId, 'from', from)
-
-        // 已经在该桌里则忽略；同一桌的重复邀请只保留最新一条
+        // 已在该桌里则忽略；同一发起人 + 同一桌的重复邀请只保留最新一条。
         if (invite.tableId === currentTableId.value) break
-        pendingInvites.value = pendingInvites.value.filter(
-          (i) => !(i.fromPeerId === invite.fromPeerId && i.tableId === invite.tableId),
-        )
-        pendingInvites.value.push(invite)
-
-        // 触发回调（显示通知）
-        inviteManager.triggerInviteCallback(invite)
-
-        // 系统通知
+        pendingInvites.value = [
+          ...pendingInvites.value.filter(
+            (i) => !(i.fromPeerId === invite.fromPeerId && i.tableId === invite.tableId),
+          ),
+          invite,
+        ]
         const gameName = getGameMeta(invite.gameType)?.name || '游戏'
         notifyBackground('游戏邀请', `${displayName(from)} 邀请你加入 ${gameName}`)
         break
       }
       case 'invite-accept': {
-        const inviteId = (msg as any).inviteId as string
-        console.log('[Invite] 邀请被接受:', inviteId, 'by', from)
         showNotice(`${displayName(from)} 接受了邀请，已加入游戏桌`)
         break
       }
       case 'invite-decline': {
-        const inviteId = (msg as any).inviteId as string
-        console.log('[Invite] 邀请被拒绝:', inviteId, 'by', from)
         lastError.value = `${displayName(from)} 拒绝了邀请`
         break
       }
-      case 'table-invite': {
-        // 兼容旧消息（逐步废弃）
-        notifyBackground('游戏邀请', `${displayName(from)} 邀请你加入 ${msg.gameName}`)
-        lastError.value = `${displayName(from)} 邀请你加入游戏桌`
-        break
-      }
+      // —— 桌内游戏流量（仅桌成员定向收发）——
       case 'game-move': {
-        const moveData = msg.moveData
-        if (moveData && msg.tableId) {
-          // 更新游戏状态
-          gameStates.set(msg.tableId, moveData)
-        }
+        const table = gameTables.get(msg.tableId)
+        // 只接受桌内玩家发来的动作：旁观者 / 桌外节点无权推动游戏状态。
+        if (!table || !table.players.includes(from)) break
+        gameStates.set(msg.tableId, msg.moveData)
         break
       }
       case 'game-config-propose': {
         const table = gameTables.get(msg.tableId)
-        const proposal = (msg as any).proposal
-        if (table && proposal) {
-          table.config = { ...(table.config || {}), proposal, agreed: false }
+        // 仅桌内玩家可协商开局配置（旁观者无权改动）。
+        if (table && table.players.includes(from)) {
+          table.config = { ...(table.config || {}), proposal: msg.proposal, agreed: false }
         }
         break
       }
       case 'game-config-accept': {
         const table = gameTables.get(msg.tableId)
-        const proposal = (table?.config as any)?.proposal
-        if (table && proposal) {
+        if (!table || !table.players.includes(from)) break
+        const proposal = (table.config as any)?.proposal
+        if (proposal) {
           table.config = {
             redSeat: proposal.redSeat,
             gameTimeSec: proposal.gameTimeSec,
@@ -1806,7 +1953,7 @@ export const useRoomStore = defineStore('room', () => {
         break
       }
       case 'game-chat': {
-        const chatMsg = msg.chatMsg as GameChatMessage
+        const chatMsg = msg.chatMsg
         if (chatMsg && msg.tableId) {
           const chats = gameChats.get(msg.tableId) || []
           chats.push(chatMsg)
@@ -1815,83 +1962,13 @@ export const useRoomStore = defineStore('room', () => {
         break
       }
       case 'mouse-pos': {
-        const pos = msg.pos as MousePosition
+        const pos = msg.pos
         if (pos && msg.tableId) {
           const positions = gameMousePositions.get(msg.tableId) || []
           // 只保留每个用户的最新位置（移除旧的）
-          const filtered = positions.filter(p => p.peerId !== pos.peerId)
+          const filtered = positions.filter((p) => p.peerId !== pos.peerId)
           filtered.push(pos)
           gameMousePositions.set(msg.tableId, filtered)
-        }
-        break
-      }
-      // —— 匹配消息 ——
-      case 'match-request': {
-        const gameType = (msg as any).gameType as GameType
-        if (!gameType || myMatchingGame.value !== gameType) break
-
-        console.log('[Matching] 收到匹配请求:', from, gameType)
-
-        // 对称握手：id 较小者担任桌主，直接发 match-found；较大者回一条定向 match-request
-        // 触发对方（桌主）响应。这样无论谁先开始匹配、谁的 id 更大，都能收敛，
-        // 不再出现「先开始匹配的一方错过对端广播」导致的死锁。
-        if (myId.value < from) {
-          matchWith(from, gameType)
-        } else {
-          mesh?.sendTo(from, { kind: 'match-request', gameType })
-        }
-        break
-      }
-      case 'match-cancel': {
-        const gameType = (msg as any).gameType as GameType
-        if (!gameType) break
-
-        console.log('[Matching] 对方取消匹配:', from, gameType)
-
-        // 从队列中移除
-        const queue = matchingQueues.get(gameType)
-        if (queue) {
-          const index = queue.indexOf(from)
-          if (index >= 0) {
-            queue.splice(index, 1)
-            if (queue.length === 0) {
-              matchingQueues.delete(gameType)
-            }
-          }
-        }
-        break
-      }
-      case 'match-found': {
-        const tableId = (msg as any).tableId as string
-        const tableNumber = (msg as any).tableNumber as string
-        const gameType = (msg as any).gameType as GameType
-
-        console.log('[Matching] 匹配成功，加入游戏桌:', tableNumber || tableId, gameType)
-
-        if (myMatchingGame.value === gameType) {
-          myMatchingGame.value = null
-
-          // 放弃自己为匹配临时建的空等待桌，避免残留幽灵桌占着大厅。
-          if (currentTableId.value && currentTableId.value !== tableId) {
-            const mine = gameTables.get(currentTableId.value)
-            if (
-              mine &&
-              mine.hostId === myId.value &&
-              mine.state === 'waiting' &&
-              mine.players.length <= 1 &&
-              mine.spectators.length === 0
-            ) {
-              leaveGameTable()
-            }
-          }
-
-          // 优先使用桌号加入（更可靠）
-          if (tableNumber) {
-            joinGameTableByNumber(tableNumber)
-          } else if (tableId) {
-            // 回退：直接使用 tableId
-            joinGameTable(tableId, false)
-          }
         }
         break
       }
@@ -1901,15 +1978,8 @@ export const useRoomStore = defineStore('room', () => {
   /** 断开当前会话（不触发自动重新监听）。 */
   function teardown(): void {
     stopTalk()
-    // 换房间/断连前，尽量通知同房其他人自己离开了游戏桌（尽力而为，通道随后关闭）。
-    if (mesh && currentTableId.value) {
-      const t = gameTables.get(currentTableId.value)
-      if (t) {
-        t.players = t.players.filter((p) => p !== myId.value)
-        t.spectators = t.spectators.filter((p) => p !== myId.value)
-        mesh.broadcast({ kind: 'table-leave', tableId: currentTableId.value })
-      }
-    }
+    // 换房间/断连前，尽量按权威模型退出当前桌（桌主广播接管/回收，成员发离席请求）。
+    if (mesh && currentTableId.value) leaveGameTable()
     if (mesh) {
       mesh.leave()
       mesh = null
@@ -1956,11 +2026,8 @@ export const useRoomStore = defineStore('room', () => {
     gameChats.clear()
     gameMousePositions.clear()
     gameStates.clear()
-    matchingQueues.clear()
     myMatchingGame.value = null
     pendingInvites.value = []
-    tableManager.reset()
-    inviteManager.reset()
     myId.value = ''
     room.value = ''
     signalingState.value = 'idle'
@@ -2497,177 +2564,132 @@ export const useRoomStore = defineStore('room', () => {
     guessSetupReq.value = true
   }
 
-  // —— 游戏桌管理 ——
+  // —— 游戏桌管理（桌主权威：本端只对「自己托管的桌」做权威变更，其余走 table-req）——
 
-  function createGameTable(gameType: GameType, isPublic: boolean, password?: string): void {
-    // 使用 TableManager 创建桌子并生成桌号
-    const { table, tableNumber } = tableManager.createTable({
+  function createGameTable(
+    gameType: GameType,
+    isPublic: boolean,
+    password?: string,
+    autoStart = false,
+  ): GameTable {
+    const taken = new Set(
+      [...gameTables.values()].map((t) => t.tableNumber).filter((n): n is string => !!n),
+    )
+    const tableNumber = genTableNumber(taken, Math.floor(Math.random() * 1e9))
+
+    const table: GameTable = {
+      tableId: generateTableId(),
+      tableNumber,
       gameType,
       hostId: myId.value,
+      rev: 1,
+      createdAt: Date.now(),
+      state: 'waiting',
       visibility: isPublic ? 'public' : 'private',
-      password,
-    })
-
-    // 添加桌号和密码标记到 table
-    table.tableNumber = tableNumber
-    table.hasPassword = !!password
+      hasPassword: !!password,
+      passwordHash: hashPassword(password),
+      autoStart: autoStart || undefined,
+      players: [myId.value],
+      spectators: [],
+    }
 
     // 象棋：预置默认开局配置（桌主执红/先手、局时 10 分、步时 60 秒）。
     // 默认 agreed=true，快速匹配/创建后即可直接开局；仍可在等待区重新协商更改。
     if (gameType === 'xiangqi') {
-      table.config = {
-        redSeat: 0,
-        gameTimeSec: 600,
-        moveTimeSec: 60,
-        agreed: true,
-        proposal: null,
-      }
+      table.config = { redSeat: 0, gameTimeSec: 600, moveTimeSec: 60, agreed: true, proposal: null }
     }
 
     gameTables.set(table.tableId, table)
     currentTableId.value = table.tableId
-
-    console.log('[GameTable] 创建游戏桌:', {
-      tableId: table.tableId,
-      tableNumber,
-      gameType,
-      visibility: table.visibility,
-      hasPassword: table.hasPassword,
-      players: table.players,
-      mesh: !!mesh,
-      peerCount: connectedPeers.value.length,
-    })
-
-    // 广播创建游戏桌消息
-    if (mesh) {
-      mesh.broadcast({
-        kind: 'table-create',
-        tableId: table.tableId,
-        table,
-      })
-      console.log('[GameTable] 已广播 table-create 消息到', connectedPeers.value.length, '个节点')
-    } else {
-      console.warn('[GameTable] mesh 为 null，无法广播')
-    }
-
-    // 切换到游戏视图
+    mesh?.broadcast({ kind: 'table-sync', table })
     setView('games')
+    return table
   }
 
   function joinGameTableByNumber(tableNumber: string, password?: string): boolean {
-    console.log('[GameTable] 尝试通过桌号加入:', tableNumber)
-
-    // 先查 TableManager（本地创建的桌子在此有完整记录，含密码哈希）；
-    // 远端桌子只在已同步的 gameTables 里（registerRemoteTable 不落 tables），故回退到 gameTables 按桌号匹配。
-    let table = tableManager.getTableByNumber(tableNumber)
-    if (!table) {
-      table = Array.from(gameTables.values()).find((t) => t.tableNumber === tableNumber) || null
-    }
-
+    const table = Array.from(gameTables.values()).find((t) => t.tableNumber === tableNumber)
     if (!table) {
       lastError.value = `桌号 #${tableNumber} 不存在`
       return false
     }
-
-    // 验证密码（远端桌子本地无哈希时，verifyPassword 对无记录桌号放行——密码桌请走邀请入座）
-    if (!tableManager.verifyPassword(tableNumber, password || '')) {
+    // 密码校验放在桌主侧（table-req 携带密码），本地只做一次友好前置校验。
+    if (table.passwordHash && !verifyPassword(table, password)) {
       lastError.value = '密码错误'
       return false
     }
-
-    // 加入桌子
-    joinGameTable(table.tableId, false)
+    joinGameTable(table.tableId, false, password)
     return true
   }
 
   /**
-   * 我能否在这张桌坐下/加入为玩家：
-   * - 等待中：有空位即可；
-   * - 对局中：仅「开局座位表里的原座位者」可回来续战（凭 roster 判定），陌生人只能旁观；
-   * - 已结束：不可。
+   * 我能否在这张桌坐下/加入为玩家（供组件显示「入座」按钮）：
+   * 已在座则否，其余委托纯规则 canSit（含等待有空位 / 对局中原座位续战 / 结束不可）。
    */
   function canTakeSeat(table: GameTable): boolean {
-    if (!table || table.state === 'finished') return false
-    if (table.players.includes(myId.value)) return false
-    const meta = getGameMeta(table.gameType)
-    const cap = meta ? maxPlayersOf(meta) : table.players.length
-    if (table.players.length >= cap) return false
-    if (table.state === 'playing') return !!table.roster?.includes(myId.value)
-    return true
+    if (!table || table.players.includes(myId.value)) return false
+    return canSit(table, myId.value)
   }
 
-  function joinGameTable(tableId: string, asSpectator: boolean): void {
+  /**
+   * 加入某桌。桌主权威模型下：
+   *   · 我就是桌主 → 本就在座，仅切到桌面视图；
+   *   · 否则 → 乐观进入桌面视图并向桌主发 table-req，等其权威 table-sync 落定我的座位；
+   *     被驳回时收到 table-reject 会退回大厅并提示。
+   */
+  function joinGameTable(tableId: string, asSpectator: boolean, password?: string): void {
     const table = gameTables.get(tableId)
     if (!table) return
 
-    // 已在座（如断线重连后重新进入自己的桌）：直接回到桌面即可。
-    if (!asSpectator && !table.players.includes(myId.value)) {
-      // 不满足入座条件（座位已满 / 非本人续战 / 已结束）时自动改为旁观。
-      if (!canTakeSeat(table)) {
-        asSpectator = true
-      }
+    if (table.hostId === myId.value) {
+      currentTableId.value = tableId
+      setView('games')
+      return
     }
 
-    if (asSpectator) {
-      if (!table.spectators.includes(myId.value)) {
-        table.spectators.push(myId.value)
-      }
-    } else {
-      if (!table.players.includes(myId.value)) {
-        table.players.push(myId.value)
-      }
-    }
+    // 非旁观意图但明显无法入座（满员/非续战者）→ 自动降级为旁观。
+    const action: TableAction = !asSpectator && !canSit(table, myId.value) ? 'spectate' : asSpectator ? 'spectate' : 'join'
 
     currentTableId.value = tableId
-
-    // 广播加入消息
-    mesh?.broadcast({
-      kind: asSpectator ? 'table-spectate' : 'table-join',
-      tableId,
-    })
-
     setView('games')
+    mesh?.sendTo(table.hostId, { kind: 'table-req', tableId, action, password })
   }
 
   function leaveGameTable(): void {
-    if (!currentTableId.value) return
-
-    const table = gameTables.get(currentTableId.value)
+    const tid = currentTableId.value
+    if (!tid) return
+    const table = gameTables.get(tid)
+    currentTableId.value = null
+    setView('games')
     if (!table) return
 
-    // 移除自己
-    table.players = table.players.filter((p) => p !== myId.value)
-    table.spectators = table.spectators.filter((p) => p !== myId.value)
-
-    // 广播离开消息
-    mesh?.broadcast({
-      kind: 'table-leave',
-      tableId: currentTableId.value,
-    })
-
-    // 如果是桌主且桌上还有人，转移桌主
-    if (table.hostId === myId.value && table.players.length > 0) {
-      table.hostId = table.players[0]
+    const me = myId.value
+    if (table.hostId === me) {
+      // 桌主离席：确定性移交给剩余成员；无人则回收整桌。
+      const players = table.players.filter((p) => p !== me)
+      const spectators = table.spectators.filter((p) => p !== me)
+      const newHost = electHost(players, spectators)
+      if (!newHost) {
+        mesh?.broadcast({ kind: 'table-gone', tableId: tid })
+        dropTable(tid)
+        return
+      }
+      table.players = players
+      table.spectators = spectators
+      table.hostId = newHost
+      table.rev++
+      mesh?.broadcast({ kind: 'table-sync', table }) // 交出权威，新桌主据此接管
+    } else {
+      // 普通成员离席：乐观本地移除，并请桌主权威更新。
+      table.players = table.players.filter((p) => p !== me)
+      table.spectators = table.spectators.filter((p) => p !== me)
+      mesh?.sendTo(table.hostId, { kind: 'table-req', tableId: tid, action: 'leave' })
     }
-
-    // 如果桌上没人了，删除游戏桌
-    if (table.players.length === 0 && table.spectators.length === 0) {
-      const tableId = currentTableId.value
-      gameTables.delete(tableId)
-
-      // 同步到 TableManager
-      tableManager.destroyTable(tableId)
-    }
-
-    currentTableId.value = null
-    setView('games')  // 改为回到游戏大厅
   }
 
   function startGameTable(tableId: string): void {
     const table = gameTables.get(tableId)
     if (!table || table.hostId !== myId.value || table.state !== 'waiting') return
 
-    // 检查人数是否满足
     const meta = getGameMeta(table.gameType)
     if (!meta || !canStartGame(table.gameType, table.players.length)) {
       lastError.value = meta ? `人数不足，至少需要 ${minPlayersOf(meta)} 人` : '无法开始游戏'
@@ -2681,27 +2703,18 @@ export const useRoomStore = defineStore('room', () => {
     }
 
     // 冻结开局座位表：对局中有人离席也不改变座位→执子映射，且离席者可凭原座位回来续战。
-    const roster = [...table.players]
-    table.roster = roster
+    table.roster = [...table.players]
     table.state = 'playing'
     table.startedAt = Date.now()
-
-    // 广播开始游戏消息（携带座位表，保证各端座位一致）
-    mesh?.broadcast({
-      kind: 'table-start',
-      tableId,
-      roster,
-    })
+    table.rev++
+    mesh?.broadcast({ kind: 'table-sync', table })
   }
 
   function sendGameMove(tableId: string, moveData: unknown): void {
     // 本端也留存最新状态：出招方随后离席/重进时，凭 gameStates 即可恢复棋局。
     gameStates.set(tableId, moveData)
-    mesh?.broadcast({
-      kind: 'game-move',
-      tableId,
-      moveData,
-    })
+    const table = gameTables.get(tableId)
+    if (table) sendToTable(table, { kind: 'game-move', tableId, moveData })
   }
 
   /** 象棋开局设置：发出一份提议（覆盖旧提议，需对方确认后 agreed 才为 true） */
@@ -2711,9 +2724,9 @@ export const useRoomStore = defineStore('room', () => {
   ): void {
     const table = gameTables.get(tableId)
     if (!table) return
-    const proposal = { ...config, by: myId.value }
+    const proposal: XiangqiProposal = { ...config, by: myId.value }
     table.config = { ...(table.config || {}), proposal, agreed: false }
-    mesh?.broadcast({ kind: 'game-config-propose', tableId, proposal })
+    sendToTable(table, { kind: 'game-config-propose', tableId, proposal })
   }
 
   /** 象棋开局设置：接受当前待定提议，双方 config 落定为提议值并置 agreed */
@@ -2728,7 +2741,7 @@ export const useRoomStore = defineStore('room', () => {
       agreed: true,
       proposal: null,
     }
-    mesh?.broadcast({ kind: 'game-config-accept', tableId })
+    sendToTable(table, { kind: 'game-config-accept', tableId })
   }
 
   function sendGameChat(tableId: string, text: string): void {
@@ -2744,252 +2757,168 @@ export const useRoomStore = defineStore('room', () => {
       role,
     }
 
-    // 添加到本地聊天记录
     const chats = gameChats.get(tableId) || []
     chats.push(msg)
     gameChats.set(tableId, chats)
-
-    // 广播聊天消息
-    mesh?.broadcast({
-      kind: 'game-chat',
-      tableId,
-      chatMsg: msg,
-    })
+    sendToTable(table, { kind: 'game-chat', tableId, chatMsg: msg })
   }
 
   function sendGameMousePos(tableId: string, x: number, y: number): void {
-    const pos: MousePosition = {
-      peerId: myId.value,
-      x,
-      y,
-      ts: Date.now(),
-    }
+    const table = gameTables.get(tableId)
+    if (!table) return
+    const pos: MousePosition = { peerId: myId.value, x, y, ts: Date.now() }
+    sendToTable(table, { kind: 'mouse-pos', tableId, pos })
+  }
 
-    mesh?.broadcast({
-      kind: 'mouse-pos',
-      tableId,
-      pos,
-    })
+  /** 座位类请求：我托管则本地权威处理并广播，否则发 table-req 给桌主。 */
+  function requestTableAction(table: GameTable, action: TableAction, password?: string): void {
+    if (table.hostId === myId.value) {
+      const res = applyTableAction(table, myId.value, action, password)
+      if (res.reject) {
+        lastError.value = res.reject
+        return
+      }
+      if (res.changed) {
+        table.rev++
+        if (table.players.length === 0 && table.spectators.length === 0) {
+          mesh?.broadcast({ kind: 'table-gone', tableId: table.tableId })
+          dropTable(table.tableId)
+        } else {
+          mesh?.broadcast({ kind: 'table-sync', table })
+          maybeAutoStart(table)
+        }
+      }
+    } else {
+      mesh?.sendTo(table.hostId, { kind: 'table-req', tableId: table.tableId, action, password })
+    }
   }
 
   function sitDownAtTable(tableId: string): void {
     const table = gameTables.get(tableId)
-    if (!table || table.state === 'finished') return
-
-    // 对局进行中只允许「原座位的人」回来续战（凭开局冻结的 roster 判定），
-    // 避免陌生人占走空位后因不在座位表里而无法执子。等待中则任何有空位者可坐。
-    const meta = getGameMeta(table.gameType)
-    const cap = meta ? maxPlayersOf(meta) : table.players.length
-    if (table.players.includes(myId.value)) return
-    if (table.state === 'playing') {
-      if (!table.roster?.includes(myId.value)) return
-    } else if (table.players.length >= cap) {
-      return
-    }
-
-    // 从旁观者移到玩家
-    table.spectators = table.spectators.filter((p) => p !== myId.value)
-    if (!table.players.includes(myId.value)) {
-      table.players.push(myId.value)
-    }
-
-    // 广播坐下消息
-    mesh?.broadcast({
-      kind: 'table-sit',
-      tableId,
-    })
+    if (table) requestTableAction(table, 'sit')
   }
 
   function standUpFromTable(tableId: string): void {
     const table = gameTables.get(tableId)
-    if (!table || table.state !== 'waiting') return
-
-    // 从玩家移到旁观者
-    table.players = table.players.filter((p) => p !== myId.value)
-    if (!table.spectators.includes(myId.value)) {
-      table.spectators.push(myId.value)
-    }
-
-    // 广播站起消息
-    mesh?.broadcast({
-      kind: 'table-standup',
-      tableId,
-    })
+    if (table) requestTableAction(table, 'standup')
   }
 
   function inviteToTable(tableId: string, peerId: string): void {
     const table = gameTables.get(tableId)
-    if (!table || !table.tableNumber) return
+    if (!table) return
 
-    // 使用 InviteManager 创建邀请
-    const invite = inviteManager.createInvite(
-      myId.value,
-      peerId,
+    const invite: Invitation = {
+      inviteId: `inv_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+      fromPeerId: myId.value,
+      toPeerId: peerId,
       tableId,
-      table.tableNumber,
-      table.gameType,
-      `${myProfile.value.nick || '我'} 邀请你加入游戏`,
-    )
+      tableNumber: table.tableNumber,
+      gameType: table.gameType,
+      message: `${myProfile.value.nick || '我'} 邀请你加入游戏`,
+      createdAt: Date.now(),
+    }
 
-    // 发送邀请消息给指定玩家
-    mesh?.sendTo(peerId, {
-      kind: 'invite-send',
-      invite,
-    })
-
+    mesh?.sendTo(peerId, { kind: 'invite-send', invite })
     showNotice(`已邀请 ${displayName(peerId)}，等待对方接受`)
-    console.log('[Invite] 已发送邀请:', invite.inviteId, 'to', peerId)
   }
 
   function acceptInvite(inviteId: string): void {
-    // pendingInvites 是接收端的权威来源：邀请由对端创建，本地 inviteManager 里并没有该记录，
-    // 因此不能走 inviteManager.acceptInvite（会返回 null）。
     const invite = pendingInvites.value.find((i) => i.inviteId === inviteId)
     if (!invite) {
       lastError.value = '邀请已失效'
       return
     }
-    if (Date.now() > invite.expiresAt) {
+    if (Date.now() - invite.createdAt >= INVITE_TTL_MS) {
       pendingInvites.value = pendingInvites.value.filter((i) => i.inviteId !== inviteId)
       lastError.value = '邀请已过期'
       return
     }
 
-    // 从待处理列表移除（先移除，避免加入过程中的重复触发）
     pendingInvites.value = pendingInvites.value.filter((i) => i.inviteId !== inviteId)
+    mesh?.sendTo(invite.fromPeerId, { kind: 'invite-accept', inviteId })
 
-    // 通知邀请者
-    mesh?.sendTo(invite.fromPeerId, {
-      kind: 'invite-accept',
-      inviteId,
-    })
-
-    // 加入游戏桌：邀请直接携带 tableId，按 id 加入（被邀请方跳过密码；不依赖桌号解析）
+    // 邀请携带 tableId，直接按 id 加入（公开/被邀桌免密码）。
     if (gameTables.has(invite.tableId)) {
       joinGameTable(invite.tableId, false)
-    } else {
-      // 桌子尚未同步到本地（极少见）：回退到按桌号加入
+    } else if (invite.tableNumber) {
       joinGameTableByNumber(invite.tableNumber)
     }
   }
 
   function declineInvite(inviteId: string): void {
     const invite = pendingInvites.value.find((i) => i.inviteId === inviteId)
-
-    // 从待处理列表移除
     pendingInvites.value = pendingInvites.value.filter((i) => i.inviteId !== inviteId)
-
-    // 通知邀请者
-    if (invite) {
-      mesh?.sendTo(invite.fromPeerId, {
-        kind: 'invite-decline',
-        inviteId,
-      })
-    }
+    if (invite) mesh?.sendTo(invite.fromPeerId, { kind: 'invite-decline', inviteId })
   }
 
-  // —— 匹配功能 ——
+  // —— 快速匹配（完全走桌系统：加入现有等待桌，或建一张自动开局的公开桌等人）——
+
+  /** 找一张可加入的公开等待桌：优先人多的（更快开局），同数则 tableId 小的（全网收敛同一张）。 */
+  function findJoinableWaitingTable(gameType: GameType): GameTable | null {
+    const meta = getGameMeta(gameType)
+    if (!meta) return null
+    const cap = maxPlayersOf(meta)
+    let best: GameTable | null = null
+    for (const t of gameTables.values()) {
+      if (t.gameType !== gameType || t.visibility !== 'public') continue
+      if (t.state !== 'waiting' || t.passwordHash) continue
+      if (t.players.includes(myId.value)) continue
+      if (t.players.length >= cap) continue
+      if (
+        !best ||
+        t.players.length > best.players.length ||
+        (t.players.length === best.players.length && t.tableId < best.tableId)
+      ) {
+        best = t
+      }
+    }
+    return best
+  }
 
   function startMatching(gameType: GameType): void {
     if (!mesh || myMatchingGame.value) return
-
-    myMatchingGame.value = gameType
-    console.log('[Matching] 开始快速匹配:', gameType)
-
-    // 1. 先查找等待中的公开桌
-    const waitingTables = tableManager.getWaitingTables(gameType)
     const meta = getGameMeta(gameType)
-
     if (!meta) {
       lastError.value = `未知游戏类型: ${gameType}`
+      return
+    }
+
+    myMatchingGame.value = gameType
+
+    // 单人游戏无需匹配：直接开一张桌开玩。
+    if (minPlayersOf(meta) <= 1) {
+      const t = createGameTable(gameType, false)
+      startGameTable(t.tableId)
       myMatchingGame.value = null
       return
     }
 
-    // 找到有空位的桌子
-    for (const table of waitingTables) {
-      if (table.players.length < maxPlayersOf(meta)) {
-        console.log('[Matching] 找到等待桌:', table.tableId, table.tableNumber)
-        joinGameTable(table.tableId, false)
-        myMatchingGame.value = null
-        return
-      }
+    const cand = findJoinableWaitingTable(gameType)
+    if (cand) {
+      // 加入现有等待桌；桌主达最少人数会自动开局，届时 table-sync(playing) 清匹配态。
+      joinGameTable(cand.tableId, false)
+    } else {
+      // 没有可并入的桌 → 建一张自动开局的公开桌，等人凑齐（或被他人聚合并入）。
+      createGameTable(gameType, true, undefined, true)
     }
 
-    // 2. 没有合适的桌子，创建新桌并等待
-    console.log('[Matching] 创建新桌等待匹配')
-    createGameTable(gameType, true) // 创建公开桌
-
-    // 广播匹配请求
-    mesh.broadcast({
-      kind: 'match-request',
-      gameType,
-    })
-
-    // 设置60秒超时
+    // 60 秒超时：仍在等待则放弃匹配（自建的空桌会被 cancelMatching 逻辑清理）。
     setTimeout(() => {
       if (myMatchingGame.value === gameType) {
-        console.log('[Matching] 匹配超时')
         lastError.value = '匹配超时，建议邀请好友加入'
-        myMatchingGame.value = null
+        cancelMatching(gameType)
       }
     }, 60 * 1000)
   }
 
   function cancelMatching(gameType: GameType): void {
-    if (!mesh || myMatchingGame.value !== gameType) return
-
-    console.log('[Matching] 取消匹配:', gameType)
-
-    // 广播取消匹配
-    mesh.broadcast({
-      kind: 'match-cancel',
-      gameType,
-    })
-
+    if (myMatchingGame.value !== gameType) return
     myMatchingGame.value = null
 
-    // 如果已经创建了桌子，离开桌子
+    // 退出匹配期间进入/自建的等待桌（离席逻辑会处理桌主移交或空桌回收）。
     if (currentTableId.value) {
       const table = gameTables.get(currentTableId.value)
-      if (table && table.gameType === gameType && table.state === 'waiting' && table.players.length === 1) {
-        leaveGameTable()
-      }
-    }
-  }
-
-  function matchWith(partnerId: string, gameType: GameType): void {
-    console.log('[Matching] 匹配成功，邀请玩家:', partnerId, gameType)
-
-    myMatchingGame.value = null
-
-    // 如果当前已在等待桌中，邀请对方加入
-    if (currentTableId.value) {
-      const table = gameTables.get(currentTableId.value)
-      if (table && table.gameType === gameType && table.state === 'waiting') {
-        // 通知对方加入
-        mesh?.sendTo(partnerId, {
-          kind: 'match-found',
-          tableId: currentTableId.value,
-          tableNumber: table.tableNumber,
-          gameType,
-        })
-        return
-      }
-    }
-
-    // 否则创建新桌
-    createGameTable(gameType, true)
-
-    // 通知对方加入
-    if (currentTableId.value) {
-      const table = gameTables.get(currentTableId.value)
-      mesh?.sendTo(partnerId, {
-        kind: 'match-found',
-        tableId: currentTableId.value,
-        tableNumber: table?.tableNumber,
-        gameType,
-      })
+      if (table && table.state === 'waiting') leaveGameTable()
     }
   }
 

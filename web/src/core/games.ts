@@ -45,14 +45,34 @@ export interface GameTable {
   /** 4-6位数字桌号（用户友好的加入方式） */
   tableNumber?: string
   gameType: GameType
-  /** 桌主（创建者） */
+  /**
+   * 桌主（当前权威节点）。桌子的所有状态变更只由桌主执行并广播，
+   * 桌主掉线时由 electHost() 确定性改选（最小 peerId 优先玩家、次旁观）。
+   */
   hostId: string
+  /**
+   * 权威版本号。只有桌主自增；接收端按 rev 单调合并 table-sync，
+   * 旧 rev 不覆盖新值，从根本上消除座位竞争 / 脑裂。
+   */
+  rev: number
+  /** 创建时间戳（用于匹配聚合的确定性排序与 GC）。 */
+  createdAt: number
   /** 桌子状态 */
   state: TableState
   /** 公开/私有 */
   visibility: TableVisibility
-  /** 是否有密码保护 */
+  /** 是否有密码保护（= !!passwordHash，UI 展示用）。 */
   hasPassword?: boolean
+  /**
+   * 密码哈希（随桌同步）。诚实客户端据此校验 join 请求；
+   * 威胁模型为「防误入」而非对抗恶意端（P2P 无服务器权威）。
+   */
+  passwordHash?: string
+  /**
+   * 是否为快速匹配自动创建的桌子：桌主在达到最少开局人数时自动开局，
+   * 且允许同类空桌互相聚合到最小 tableId，避免匹配分散成多个单人桌。
+   */
+  autoStart?: boolean
   /** 玩家列表（peerId[]，按座位顺序） */
   players: string[]
   /**
@@ -73,36 +93,6 @@ export interface GameTable {
   gameState?: unknown
 }
 
-/** 游戏桌消息类型 */
-export type GameTableMessageType =
-  | 'table-create'     // 创建游戏桌
-  | 'table-join'       // 加入游戏桌（作为玩家）
-  | 'table-spectate'   // 加入游戏桌（作为旁观者）
-  | 'table-leave'      // 离开游戏桌
-  | 'table-start'      // 开始游戏
-  | 'table-state'      // 同步游戏桌状态
-  | 'game-move'        // 游戏动作（落子、出牌等）
-  | 'game-chat'        // 游戏内聊天
-  | 'game-timeout'     // 超时
-  | 'game-undo'        // 悔棋请求
-  | 'game-undo-resp'   // 悔棋响应
-  | 'mouse-pos'        // 鼠标位置共享
-
-export interface GameTableMessage {
-  type: GameTableMessageType
-  tableId: string
-  from: string
-  data: unknown
-  ts: number
-}
-
-/** 游戏动作（通用接口，具体游戏继承扩展） */
-export interface GameMove {
-  player: string
-  moveIndex: number
-  ts: number
-}
-
 /** 游戏内聊天消息 */
 export interface GameChatMessage {
   from: string
@@ -117,18 +107,6 @@ export interface MousePosition {
   x: number  // 0-1 归一化坐标
   y: number  // 0-1 归一化坐标
   ts: number
-}
-
-/** 悔棋请求 */
-export interface UndoRequest {
-  from: string
-  moveIndex: number  // 要撤销到哪一步
-}
-
-/** 悔棋响应 */
-export interface UndoResponse {
-  from: string
-  accepted: boolean
 }
 
 // ===== 游戏目录 =====

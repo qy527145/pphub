@@ -3,7 +3,7 @@
 import { computed, ref } from 'vue'
 import { useRoomStore } from '@/stores/room'
 import { GAME_CATALOG, getGameMeta, minPlayersOf, maxPlayersOf, type GameType, type GameTable, type GameMeta } from '@/core/games'
-import type { Invitation } from '@/core/invite-manager'
+import type { Invitation } from '@/core/lobby'
 import PeerAvatar from './PeerAvatar.vue'
 import GameTableView from './GameTable.vue'
 import AppIcon from './AppIcon.vue'
@@ -24,6 +24,10 @@ const password = ref('')
 // 加入桌子对话框
 const showJoinDialog = ref(false)
 
+// 密码加入：点击带锁的公开桌时先弹出密码输入。
+const pendingJoinTable = ref<GameTable | null>(null)
+const joinPassword = ref('')
+
 // 桌子筛选（全部 / 指定游戏）
 const tableFilter = ref<'all' | GameType>('all')
 // 状态筛选（全部 / 等待中 / 游戏中）
@@ -37,9 +41,10 @@ const matching = computed(() => store.myMatchingGame !== null)
 // 选中游戏的元信息（创建对话框预览用）
 const selectedMeta = computed(() => getGameMeta(selectedGameType.value))
 
-// 待处理邀请（未过期）
+// 待处理邀请（未过期）。TTL 与 store 一致（60s，按 createdAt 计）。
+const INVITE_TTL_MS = 60 * 1000
 const invites = computed<Invitation[]>(() =>
-  store.pendingInvites.filter((i) => i.expiresAt > store.inviteClock),
+  store.pendingInvites.filter((i) => store.inviteClock - i.createdAt < INVITE_TTL_MS),
 )
 
 // 所有公开的游戏桌（按筛选：游戏类型 / 状态 / 桌号搜索）
@@ -90,7 +95,27 @@ function createTable() {
 }
 
 function joinTable(tableId: string) {
+  const table = store.gameTables.get(tableId)
+  // 带密码的公开桌（非本人托管、尚未在座）：先弹密码框，再带密码入座。
+  if (table?.hasPassword && table.hostId !== store.myId && !table.players.includes(store.myId)) {
+    pendingJoinTable.value = table
+    joinPassword.value = ''
+    return
+  }
   store.joinGameTable(tableId, false)
+}
+
+function confirmJoinWithPassword() {
+  const table = pendingJoinTable.value
+  if (!table) return
+  store.joinGameTable(table.tableId, false, joinPassword.value.trim() || undefined)
+  pendingJoinTable.value = null
+  joinPassword.value = ''
+}
+
+function cancelJoinWithPassword() {
+  pendingJoinTable.value = null
+  joinPassword.value = ''
 }
 
 function spectateTable(tableId: string) {
@@ -166,6 +191,17 @@ function seatsOf(table: GameTable): Seat[] {
     const peerId = table.players[i] ?? null
     return { peerId, isHost: peerId != null && peerId === table.hostId }
   })
+}
+
+// 座位布局按桌记忆一次：模板里每张桌会多处引用（座位圈 + seatStyle 计数），
+// 避免每次访问都重建数组。随 publicTables（含 players/hostId）变化重算。
+const seatsByTable = computed(() => {
+  const m = new Map<string, Seat[]>()
+  for (const t of publicTables.value) m.set(t.tableId, seatsOf(t))
+  return m
+})
+function seatsFor(table: GameTable): Seat[] {
+  return seatsByTable.value.get(table.tableId) ?? seatsOf(table)
 }
 
 function seatStyle(index: number, total: number) {
@@ -361,11 +397,11 @@ function declineInvite(inv: Invitation) {
               </div>
               <!-- 座位 -->
               <div
-                v-for="(seat, i) in seatsOf(table)"
+                v-for="(seat, i) in seatsFor(table)"
                 :key="i"
                 class="seat"
                 :class="{ occupied: !!seat.peerId, host: seat.isHost, joinable: !seat.peerId && canJoinTable(table) }"
-                :style="seatStyle(i, seatsOf(table).length)"
+                :style="seatStyle(i, seatsFor(table).length)"
                 @click="!seat.peerId && canJoinTable(table) && joinTable(table.tableId)"
               >
                 <template v-if="seat.peerId">
@@ -491,6 +527,39 @@ function declineInvite(inv: Invitation) {
 
     <!-- 加入游戏桌对话框 -->
     <TableJoinDialog v-if="showJoinDialog" @close="showJoinDialog = false" />
+
+    <!-- 密码加入对话框（点击带锁的公开桌时弹出） -->
+    <div v-if="pendingJoinTable" class="dialog-mask" @click.self="cancelJoinWithPassword">
+      <div class="dialog">
+        <header class="dialog-header">
+          <h3>🔒 需要密码</h3>
+          <button class="btn-close" @click="cancelJoinWithPassword">
+            <AppIcon name="x" :size="16" />
+          </button>
+        </header>
+        <div class="dialog-body">
+          <p class="hint">
+            加入
+            <strong>{{ getGameMeta(pendingJoinTable.gameType)?.name }}</strong>
+            桌 #{{ pendingJoinTable.tableNumber }} 需要密码
+          </p>
+          <div class="password-input-group">
+            <input
+              v-model="joinPassword"
+              type="password"
+              placeholder="输入桌子密码"
+              maxlength="16"
+              class="password-input"
+              @keyup.enter="confirmJoinWithPassword"
+            />
+          </div>
+        </div>
+        <footer class="dialog-footer">
+          <button class="btn-cancel" @click="cancelJoinWithPassword">取消</button>
+          <button class="btn-confirm" @click="confirmJoinWithPassword">加入</button>
+        </footer>
+      </div>
+    </div>
   </div>
 </template>
 

@@ -500,6 +500,24 @@ control 通道传 `{t:"chat", from, ts, text|html|imgBlobRef}`；图片/文件�
 
 ---
 
+### 游戏大厅重构：桌主权威 + 版本化全量同步（路线甲）落地记录（2026-08-03）
+
+把游戏桌从「各端本地拼装、靠零散消息互相打补丁」的**多写者最终一致**模型，整体重构为**单写者权威 + 版本化全量同步**。**取代**此前所有「桌子由各端 `table-manager`/`invite-manager` 分头维护」的描述与 2026-07-31 三条记录里逐点打补丁的座位/邀请/匹配逻辑。破坏性改动，不兼容旧协议。
+
+- **根因：无权威 + 增量互补的组合必然漂移**。旧模型每端各持一份桌子拼图，用 `table-create/table-join/...` 增量消息互相打补丁——座位竞态（两人同时入座同一空位都成功→超员）、桌主脑裂（桌主掉线各端自行推举，选出不同的主）、密码不随桌同步、幽灵桌（换房/双离场后残留）、多人（>2）匹配抢桌互相错过，全是「没有单一权威 + 增量而非全量」这一个结构性问题的不同表现。之前每条记录都在补丁单个症状，这次从模型上根除。
+- **桌主权威 + 单调 `rev` 全量同步**：只有桌主变更状态并广播 `table-sync{table}`（全量），`rev` 单调递增；收方按 rev 合并、**旧 rev 直接忽略**——座位竞态与脑裂在结构上不可能发生（唯一写者、全序版本）。`adoptTableSync()` 收敛：rev 门控 + 处理「我被移出」「进入 playing 清匹配态」+ coalesce + autoStart。
+- **确定性选主**（`lobby.ts::electHost`：候选中最小 peerId，玩家优先于旁观者）：所有端对同一成员集合得到同一结果，桌主掉线无需协商即可无脑裂改选。`peer-removed` 时被选中者 bump rev + 广播 table-sync，其余端做乐观本地移除。
+- **请求—应答入座**（`table-req{action}` + `TableAction='join'|'spectate'|'sit'|'standup'|'leave'`）：非桌主一律**请求**桌主，桌主 `applyTableAction()` 校验（含 `canSit` 座位判定、`verifyPassword` 密码闸）后应用并重播 table-sync，或回 `table-reject{reason}`。写权集中到桌主一处。
+- **匹配走桌系统，不再独立协议**：`startMatching` 加入已有的可加入公开等待桌，或建一张 `autoStart` 公开桌；桌主在 `players≥min` 时 `maybeAutoStart`；`coalesceMatching` 让落单的匹配者向**最小 tableId** 归拢收敛——彻底消除旧「双方各自建桌互发 match-found 而错过」的抢桌竞态。删除 `match-maker.ts` 独立匹配协议。
+- **桌内定向流量** `sendToTable()`：game-move/game-chat/mouse-pos/game-config-* 只发给**桌成员**（去重、排除自己），不再全网广播——斗地主等不共享指针的游戏也不会把桌内流量泄漏到大厅。
+- **密码随桌同步**（`hashPassword` FNV-1a 非明文散列存进 `table.passwordHash`，`verifyPassword` 在桌主侧把闸）：威胁模型是「防误入公开桌」而非对抗恶意端，故轻量不可逆散列即可，避免明文随桌广播。
+- **幽灵桌 GC**（`setInterval(…,10_000)`）：无在线占用者的桌、无人观看的终局桌（>30s）、以及「我自持但没在看且我是唯一/无占用者」的桌——后者正是双方几乎同时离开等待桌导致的自持残桌，约 10s 内广播 `table-gone` + 本地 `dropTable` 收尾。修掉「换房后旧桌常驻」。
+- **强类型协议**：`messages.ts` 桌/邀请段收敛为 `table-sync/table-gone/table-req/table-reject/game-move/game-chat/game-config-propose/game-config-accept/mouse-pos/invite-send/invite-accept/invite-decline`，全部带 `tableId` 寻址；`games.ts` 删除死类型（GameTableMessage/GameMove/Undo* 等），`GameTable` 增 `rev/createdAt/passwordHash?/autoStart?`。邀请以 `createdAt + INVITE_TTL_MS(60s)` 判过期（不再存 `expiresAt`）。
+- **新增/删除**：新增 `core/lobby.ts`（纯工具层，无状态无副作用：electHost/hashPassword/verifyPassword/canSit/genTableNumber + 类型）；删除 `core/match-maker.ts`、`core/table-manager.ts`、`core/invite-manager.ts`（三个有状态管理器连同其增量协议一并移除）；`stores/room.ts` 重写桌/邀请/匹配全部编排（dropTable/sendToTable/applyTableAction/adoptTableSync/maybeAutoStart/coalesceMatching 等）；`GameLobby.vue` 加密码加入对话框与 `seatsFor()` memo（替换每帧重算的 `seatsOf`）；`InviteNotification.vue` 改 createdAt TTL。保持游戏组件契约（props.table.* / store.gameStates / sendGameMove / propose+acceptXiangqiConfig / displayName）与 store 公有 API 不变，控制爆炸半径。
+- **验证**：`npm --prefix web run build`（vue-tsc + vite）+ `cargo build` 通过；**六套 e2e 全过共 76 项**——e2e-features 29（含游戏桌联机路径：建桌广播 → invite-send 送达 pendingInvites → 接受入座玩家数=2 → 象棋 config propose/accept 同步 → 桌主开始双方 playing）、e2e-network 13 / e2e-relay 13 / e2e-http-relay 6 / e2e-media 8 / e2e-mixed-context 7，无回归。斗地主/象棋桌内多人对局的深链路仍为手工逻辑校验（e2e 覆盖到「建桌→邀请→入座→协商→开局」骨架，未覆盖逐手对弈全程）。
+
+---
+
 ## 十、关键风险与技术债
 
 1. **TURN 带宽成本 vs「零带宽」定位**：约 17%（移动 30–40%）连接必须中继，产生真实流量费。需在文档/UI 诚实说明「零带宽」是 P2P 直连时成立。自建 coturn 控制成本。

@@ -1,6 +1,9 @@
 // P2P control 通道上的应用层消息（与信令协议无关，端到端直传）。
 // 保持可扩展的判别式联合：新增能力各自加 kind。
 
+import type { GameTable, GameChatMessage, MousePosition } from './games'
+import type { Invitation, XiangqiProposal, TableAction } from './lobby'
+
 /** 一次「强制发送」传输的元信息（control 通道先行，数据走独立 file-<id> 通道）。 */
 export interface FileOffer {
   id: string
@@ -262,25 +265,22 @@ export type ControlMessage =
   /** 落子：n 为手数（从 1 起），用于丢包/乱序防御（control 有序，通常一致）。 */
   | { kind: 'gomoku-move'; gameId: string; n: number; x: number; y: number }
   | { kind: 'gomoku-resign'; gameId: string }
-  // —— 游戏桌系统（支持多种游戏、旁观模式等）——
-  | { kind: 'table-create'; tableId: string; table: unknown }
-  | { kind: 'table-join'; tableId: string }
-  | { kind: 'table-spectate'; tableId: string }
-  | { kind: 'table-leave'; tableId: string }
-  | { kind: 'table-start'; tableId: string; roster?: string[] }
-  | { kind: 'table-sit'; tableId: string }
-  | { kind: 'table-standup'; tableId: string }
-  | { kind: 'table-invite'; tableId: string; gameName: string }
+  // —— 游戏桌系统（桌主权威 + 版本化全量同步）——
+  /** 桌主广播的权威全量桌子快照；接收端按 rev 单调合并（旧 rev 不覆盖新值）。 */
+  | { kind: 'table-sync'; table: GameTable }
+  /** 桌主宣告某桌销毁（空桌 / 结束回收），接收端据此从大厅移除。 */
+  | { kind: 'table-gone'; tableId: string }
+  /** 非桌主向桌主发起座位请求；password 仅 join 用（诚实客户端自校验）。 */
+  | { kind: 'table-req'; tableId: string; action: TableAction; password?: string }
+  /** 桌主驳回请求（满员 / 密码错 / 非续战者 / 已结束），附原因。 */
+  | { kind: 'table-reject'; tableId: string; reason: string }
+  /** 游戏动作：moveData 为各游戏自定义状态（桌内定向下发给玩家 + 旁观）。 */
   | { kind: 'game-move'; tableId: string; moveData: unknown }
-  | { kind: 'game-chat'; tableId: string; chatMsg: unknown }
-  | { kind: 'game-config-propose'; tableId: string; proposal: unknown }
+  | { kind: 'game-chat'; tableId: string; chatMsg: GameChatMessage }
+  | { kind: 'game-config-propose'; tableId: string; proposal: XiangqiProposal }
   | { kind: 'game-config-accept'; tableId: string }
-  | { kind: 'mouse-pos'; tableId: string; pos: unknown }
-  // —— 匹配系统 ——
-  | { kind: 'match-request'; gameType: string }
-  | { kind: 'match-cancel'; gameType: string }
-  | { kind: 'match-found'; tableId: string; tableNumber?: string; gameType: string }
-  // —— 邀请系统 ——
-  | { kind: 'invite-send'; invite: unknown }
+  | { kind: 'mouse-pos'; tableId: string; pos: MousePosition }
+  // —— 邀请系统（点对点定向下发）——
+  | { kind: 'invite-send'; invite: Invitation }
   | { kind: 'invite-accept'; inviteId: string }
   | { kind: 'invite-decline'; inviteId: string }

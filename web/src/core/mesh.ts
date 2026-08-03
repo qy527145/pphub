@@ -111,14 +111,13 @@ export type DrawMessage = Extract<
   { kind: `draw-${string}` } | { kind: `ptr-${string}` }
 >
 
-/** ControlMessage 中的游戏子集（你画我猜 / 五子棋 / 游戏桌 / 匹配 / 邀请）。 */
+/** ControlMessage 中的游戏子集（你画我猜 / 五子棋 / 游戏桌 / 邀请）。 */
 export type GameMessage = Extract<
   ControlMessage,
   | { kind: `guess-${string}` }
   | { kind: `gomoku-${string}` }
   | { kind: `table-${string}` }
   | { kind: `game-${string}` }
-  | { kind: `match-${string}` }
   | { kind: `invite-${string}` }
   | { kind: 'mouse-pos' }
 >
@@ -1292,22 +1291,15 @@ export class Mesh extends Emitter<MeshEvents> {
       case 'gomoku-decline':
       case 'gomoku-move':
       case 'gomoku-resign':
-      case 'table-create':
-      case 'table-join':
-      case 'table-spectate':
-      case 'table-leave':
-      case 'table-start':
-      case 'table-sit':
-      case 'table-standup':
-      case 'table-invite':
+      case 'table-sync':
+      case 'table-gone':
+      case 'table-req':
+      case 'table-reject':
       case 'game-move':
       case 'game-config-propose':
       case 'game-config-accept':
       case 'game-chat':
       case 'mouse-pos':
-      case 'match-request':
-      case 'match-cancel':
-      case 'match-found':
       case 'invite-send':
       case 'invite-accept':
       case 'invite-decline':

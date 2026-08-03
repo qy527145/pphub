@@ -2,7 +2,7 @@
 import { computed, ref, onMounted, onUnmounted } from 'vue'
 import { useRoomStore } from '@/stores/room'
 import { getGameMeta } from '@/core/games'
-import type { Invitation } from '@/core/invite-manager'
+import type { Invitation } from '@/core/lobby'
 import AppIcon from './AppIcon.vue'
 
 const store = useRoomStore()
@@ -17,9 +17,10 @@ onUnmounted(() => {
   if (timer) clearInterval(timer)
 })
 
-// 仅展示未过期的邀请（最多 3 条，避免刷屏）
+// 仅展示未过期的邀请（最多 3 条，避免刷屏）。TTL 与 store 一致（60s）。
+const INVITE_TTL_MS = 60 * 1000
 const visibleInvites = computed<Invitation[]>(() =>
-  store.pendingInvites.filter((inv) => inv.expiresAt > now.value).slice(0, 3),
+  store.pendingInvites.filter((inv) => now.value - inv.createdAt < INVITE_TTL_MS).slice(0, 3),
 )
 
 function infoOf(invite: Invitation) {
