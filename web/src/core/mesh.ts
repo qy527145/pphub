@@ -10,6 +10,7 @@ import {
   receiveFile,
   sendFile,
 } from './filetransfer'
+import { FanoutHub, isFanoutFrame } from './fanout'
 import type {
   ControlMessage,
   FileOffer,
@@ -26,6 +27,7 @@ import {
   canDecodeScreen,
   canEncodeScreen,
 } from './screencodec'
+import { VoiceDecoder, VoiceEncoder, canDecodeVoice } from './voicecodec'
 import type { Sas } from './security'
 import type { Signaling, SignalingState } from './signaling'
 import {
@@ -38,7 +40,6 @@ import {
   packChunk,
   unpackChunk,
 } from './swarm'
-import { TopologyManager, type TopologyMode, type NetworkGroup } from './topology'
 
 type MeshEvents = {
   self: string
@@ -54,10 +55,6 @@ type MeshEvents = {
   'peer-links': { peerId: string; links: { peerId: string; state: string; rtt?: number }[] }
   /** 某对端的 control 通道就绪（可向其补发状态同步，如白板全量）。 */
   'peer-channel-open': string
-  /** 拓扑模式变化 */
-  'topology-mode': TopologyMode
-  /** 网络分组更新 */
-  'topology-groups': NetworkGroup[]
   chat: { from: string; msgId: string; text: string; ts: number; scope: 'all' | 'dm' }
   /** 对端对某条消息的表情回应。 */
   react: { from: string; msgId: string; emoji: string; op: 'add' | 'remove'; scope: 'all' | 'dm' }
@@ -162,6 +159,23 @@ export class JoinRejected extends Error {
   }
 }
 
+/**
+ * 组网层级：仅由房间人数决定的媒体分发策略。
+ *   'mesh'   —— 全网状：屏幕/语音走 WebRTC 原生轨或每对中继自编码（小房间画质最好、带音频）；
+ *   'fanout' —— 服务器扇出：屏幕/语音单次上行、群密钥加密后由服务器复制给全房间（大房间省上行）。
+ */
+export type MeshTier = 'mesh' | 'fanout'
+
+/**
+ * 进入 fanout 的人数阈值（含自己）。低于等于此值用全网状原生轨，超过即切服务器扇出。
+ *
+ * 取 8：媒体网状上行是 O(N)（发送端要给每个观众各传一份），约 4~6 个观众就会压满家用上行；
+ * 留到 8 是给「原生轨画质 + 音频」多一点空间，越过则必须靠扇出把上行降回 O(1)。
+ * 数据（控制/文件/白板/游戏）仍全程 P2P 网状——小消息，几十人也扛得住。
+ * 与 ARCHITECTURE.md「自适应组网」一节保持一致；改此值需同步文档。
+ */
+export const FANOUT_THRESHOLD = 8
+
 /** 会终结 join 流程的服务端错误码；其余错误与 join 无关，继续等待。 */
 const JOIN_ERRORS = new Set(['code-taken', 'room-full', 'duplicate-peer', 'already-joined'])
 
@@ -180,8 +194,14 @@ export class Mesh extends Emitter<MeshEvents> {
   private readonly remoteScreenDecode = new Map<string, boolean>()
   private iceServers: RTCIceServer[] = []
 
-  // 拓扑管理器（网络优化）
-  private readonly topology: TopologyManager
+  /**
+   * 当前组网层级，仅由房间人数决定（客户端本地计算，全房间口径天然一致）：
+   *   'mesh'   —— 小房间：数据与媒体都走全网状 P2P（媒体用 WebRTC 原生轨 / 每对中继自编码）；
+   *   'fanout' —— 大房间：数据仍全网状，但屏幕/语音改由服务器扇出，发送端单次上行
+   *               （群密钥加密，服务器只转发密文，见 fanout.ts 与 ARCHITECTURE.md「自适应组网」）。
+   * 成员数（含自己）超过 FANOUT_THRESHOLD 即进入 fanout。
+   */
+  private tier: MeshTier = 'mesh'
 
   // 强制发送（推）登记表（按传输 id 索引；id 全局随机，跨 peer 不冲突）。
   private readonly pendingOffers = new Map<string, { peerId: string; offer: FileOffer }>()
@@ -201,12 +221,20 @@ export class Mesh extends Emitter<MeshEvents> {
   private screenStream: MediaStream | null = null
   private screenScope: { scope: SendScope; to?: string } = { scope: 'all' }
   private readonly screenSenders = new Map<string, RTCRtpSender[]>()
+  /**
+   * 本次屏幕共享走哪条分发路径（由 applyScreenShare 依 tier 决定）：
+   *   'mesh'   —— 逐对端原生轨（track）或每对中继自编码（codec）；
+   *   'fanout' —— 单次编码 → 群密钥加密 → 服务器扇出（仅 scope=all 的大房间）。
+   */
+  private screenPath: MeshTier = 'mesh'
 
   // 实时对讲：本端麦克风流 + 各对端 senders；remoteVoiceStreams 记录对端通告的
   // 语音流 id，用于把到达的媒体流与屏幕共享区分开。
   private voiceStream: MediaStream | null = null
   private readonly voiceSenders = new Map<string, RTCRtpSender[]>()
   private readonly remoteVoiceStreams = new Map<string, string>()
+  /** 本次开麦走哪条路径（同 screenPath）。 */
+  private voicePath: MeshTier = 'mesh'
   /** 语音消息分片重组缓冲：`${from}|${msgId}` → 已到分片。 */
   private readonly voiceParts = new Map<string, string[]>()
 
@@ -223,25 +251,28 @@ export class Mesh extends Emitter<MeshEvents> {
   /** 已就「本机无法解码」报过警的对端，避免每个包刷一条错误。 */
   private readonly decodeWarned = new Set<string>()
 
-  constructor(signaling: Signaling, topologyMode: TopologyMode = 'hierarchical') {
+  // 扇出路径（路线乙）：语音自编码器 + 各发送端的语音解码器。
+  private voiceEncoder: VoiceEncoder | null = null
+  private voiceEncoderStarting: Promise<boolean> | null = null
+  private readonly voiceDecoders = new Map<string, VoiceDecoder>()
+  private readonly voiceDecodeWarned = new Set<string>()
+  /**
+   * 媒体扇出枢纽：把本端屏幕/语音单次编码、群密钥加密后经服务器扇出，并解密
+   * 各发送端扇出来的媒体。仅在 fanout 层级使用（见 FanoutHub / ARCHITECTURE.md）。
+   */
+  private readonly fanoutHub: FanoutHub
+
+  constructor(signaling: Signaling) {
     super()
     this.signaling = signaling
-    this.topology = new TopologyManager()
+    this.fanoutHub = new FanoutHub({
+      sendFrame: (frame) => this.signaling.sendRelay(frame),
+      onScreen: (from, packet) => this.handleScreenPacket(from, packet),
+      onVoice: (from, packet) => this.handleVoicePacket(from, packet),
+    })
     this.wireSignaling()
-    this.wireTopology()
     // RTT 探测 + 邻接表（含 RTT）周期广播；leave 时清除。
     this.pingTimer = setInterval(() => this.pingAll(), 5000)
-
-    // 从 localStorage 读取拓扑模式配置，默认使用分层模式
-    const savedMode = localStorage.getItem('pphub:topology:mode') as TopologyMode | null
-    if (savedMode === 'hierarchical' || savedMode === 'full-mesh') {
-      topologyMode = savedMode
-    } else if (!savedMode) {
-      // 首次使用，默认分层模式
-      topologyMode = 'hierarchical'
-      localStorage.setItem('pphub:topology:mode', 'hierarchical')
-    }
-    this.topology.setMode(topologyMode)
   }
 
   /** 向所有通道就绪的对端发一轮 ping；久未应答的记录顺带过期。 */
@@ -261,14 +292,6 @@ export class Mesh extends Emitter<MeshEvents> {
       this.lastLinksBroadcast = now
       this.broadcastLinks()
     }
-
-    // 如果我是组长，定期广播拓扑信息
-    if (this.topology.isLeader()) {
-      const announce = this.topology.generateAnnounce()
-      if (announce) {
-        this.broadcast(announce)
-      }
-    }
   }
 
   private lastLinksBroadcast = 0
@@ -277,8 +300,6 @@ export class Mesh extends Emitter<MeshEvents> {
     this.signaling.on('joined', ({ peerId, peers }) => {
       this.myId = peerId
       this.emit('self', peerId)
-      // 初始化拓扑管理器
-      this.topology.initialize(peerId, this.topology.getMode())
       for (const p of peers) {
         this.nicks.set(p.peerId, p.nick ?? undefined)
         this.addPeer(p.peerId)
@@ -301,51 +322,17 @@ export class Mesh extends Emitter<MeshEvents> {
     this.signaling.on('error', (e) => this.emit('error', e))
     this.signaling.on('state', (s) => this.emit('signaling-state', s))
 
-    // WS 中继帧：帧头里的 peerId 已被服务器改写为来源，据此路由到对应 Peer。
+    // WS 中继帧：外层版本 2 为服务器扇出的媒体（交给 FanoutHub 解密分发），
+    // 版本 1 为 1:1 中继（帧头 peerId 已被服务器改写为来源，路由到对应 Peer）。
     this.signaling.on('relay', (frame) => {
+      if (isFanoutFrame(frame)) {
+        this.fanoutHub.handleFrame(frame)
+        return
+      }
       const from = relayFrameSource(frame)
       if (!from) return
       const peer = this.peers.get(from) ?? this.addPeer(from)
       peer.handleRelayFrame(frame)
-    })
-  }
-
-  /** 连接拓扑管理器的事件 */
-  private wireTopology(): void {
-    this.topology.on('mode-change', (mode) => {
-      this.emit('topology-mode', mode)
-      // 保存到 localStorage
-      localStorage.setItem('pphub:topology:mode', mode)
-    })
-
-    this.topology.on('groups-update', (groups) => {
-      this.emit('topology-groups', groups)
-    })
-
-    this.topology.on('leader-change', ({ groupId, newLeader }) => {
-      console.log(`[mesh] Group ${groupId} leader changed to ${newLeader}`)
-      // 如果新组长是本节点，需要建立与其他组长的连接
-      if (newLeader === this.myId) {
-        const leaders = this.topology.getLeaders()
-        for (const leader of leaders) {
-          if (leader !== this.myId && !this.peers.has(leader)) {
-            this.addPeer(leader)
-          }
-        }
-      }
-    })
-
-    this.topology.on('connect-peer', (peerId) => {
-      console.log(`[mesh] Topology requires connection to ${peerId}`)
-      if (!this.peers.has(peerId)) {
-        this.addPeer(peerId)
-      }
-    })
-
-    this.topology.on('disconnect-peer', (peerId) => {
-      console.log(`[mesh] Topology allows disconnection from ${peerId}`)
-      // 注意：不立即断开，避免频繁震荡
-      // 可以在下次拓扑评估时再决定是否真正断开
     })
   }
 
@@ -367,17 +354,6 @@ export class Mesh extends Emitter<MeshEvents> {
 
     const ack = this.waitJoined()
     this.signaling.send({ t: 'join', room, peerId: this.myId, nick: profile.nick, listen })
-
-    // 延迟进行拓扑优化（如果是分层或树状模式）
-    ack.then(() => {
-      if (this.topology.getMode() !== 'full-mesh') {
-        // 等待 10 秒让所有连接建立并收集 RTT 数据
-        setTimeout(() => {
-          console.log('[mesh] Starting topology optimization...')
-          this.optimizeTopology()
-        }, 10000)
-      }
-    })
 
     return ack
   }
@@ -464,12 +440,9 @@ export class Mesh extends Emitter<MeshEvents> {
   /**
    * 向所有对端广播任意 control 消息（通道未就绪的对端静默跳过）。
    *
-   * 一律走全连接直连：房间 ≤6 人（见 ARCHITECTURE.md），且拓扑优化后所有
-   * WebRTC 连接始终保持（closeUnnecessaryConnections 不真正关闭连接），因此
-   * 每个成员都直接可达。曾经的「分层智能广播」只发给必需连接、依赖组长再转发，
-   * 但转发路径其实并不存在，跨组会漏送；点对点转发还会把发送者错记成中继组长
-   * （A 发给 B，B 看到来自组长 C 的串号 bug）。直连既正确又最简单。
-   * 拓扑管理器仅用于网络视图展示与统计，不再参与业务消息路由。
+   * 数据一律走全网状直连：每个成员都与其余成员保持 P2P 连接（WebRTC 或降级中继），
+   * 因此直接可达、无需任何转发。控制/聊天/文件/白板/游戏都是小消息，几十人也扛得住。
+   * 大房间只有**媒体**（屏幕/语音）改走服务器扇出以省上行（见 fanout.ts），数据不变。
    */
   broadcast(msg: ControlMessage): void {
     for (const peer of this.peers.values()) peer.sendControl(msg)
@@ -542,21 +515,47 @@ export class Mesh extends Emitter<MeshEvents> {
   /**
    * 开始屏幕共享。scope=all 发给所有对端；direct 只发给指定对端。
    * 后续新加入的对端仅在 scope=all 时自动补挂。
+   * 实际分发路径（网状 / 扇出）由 applyScreenShare 依当前层级决定。
    */
   startScreenShare(stream: MediaStream, scope: SendScope = 'all', to?: string): void {
     this.stopScreenShare()
     this.screenStream = stream
     this.screenScope = { scope, to }
+    this.applyScreenShare()
+  }
+
+  /**
+   * 依当前层级把屏幕挂到分发路径：
+   *   - 大房间 + 面向全体（fanout & scope=all）：单次编码 → 群密钥加密 → 服务器扇出；
+   *   - 其余（小房间，或 direct 单播）：逐对端原生轨 / 每对中继自编码。
+   * 幂等，可在 start 与层级迁移时重复调用。
+   */
+  private applyScreenShare(): void {
+    const stream = this.screenStream
+    if (!stream) return
+    if (this.tier === 'fanout' && this.screenScope.scope === 'all') {
+      this.screenPath = 'fanout'
+      // 群密钥经每对 P2P control 通道发出（绝不过服务器明文），供观众解密扇出帧。
+      this.broadcast({ kind: 'media-key', key: this.fanoutHub.keyBase64 })
+      this.broadcast({ kind: 'screen-start', scope: 'all', via: 'fanout' })
+      void this.ensureScreenEncoder().then((ok) => {
+        if (ok) this.screenEncoder?.requestKeyFrame()
+      })
+      return
+    }
+    this.screenPath = 'mesh'
     const targets =
-      scope === 'direct' && to
-        ? [this.peers.get(to)].filter((p): p is Peer => !!p)
+      this.screenScope.scope === 'direct' && this.screenScope.to
+        ? [this.peers.get(this.screenScope.to)].filter((p): p is Peer => !!p)
         : [...this.peers.values()]
     for (const peer of targets) this.attachScreen(peer)
   }
 
-  /** 停止屏幕共享：撤各对端的媒体轨、关编码器、停本地轨道。 */
-  stopScreenShare(): void {
-    if (!this.screenStream) return
+  /**
+   * 拆除当前屏幕分发路径（撤各对端媒体轨、关编码器、清中继观众），
+   * 但**不**停止源流、**不**广播 screen-stop——供层级迁移时原地换路。
+   */
+  private detachScreenPaths(): void {
     for (const [peerId, senders] of this.screenSenders) {
       const peer = this.peers.get(peerId)
       if (peer) for (const s of senders) peer.removeTrack(s)
@@ -566,8 +565,15 @@ export class Mesh extends Emitter<MeshEvents> {
     this.screenEncoder?.close()
     this.screenEncoder = null
     this.encoderStarting = null
+  }
+
+  /** 停止屏幕共享：撤各对端的媒体轨、关编码器、停本地轨道。 */
+  stopScreenShare(): void {
+    if (!this.screenStream) return
+    this.detachScreenPaths()
     for (const track of this.screenStream.getTracks()) track.stop()
     this.screenStream = null
+    this.screenPath = 'mesh'
     this.broadcast({ kind: 'screen-stop' })
   }
 
@@ -578,39 +584,129 @@ export class Mesh extends Emitter<MeshEvents> {
   // —— 实时对讲（麦克风轨）——
 
   /**
-   * 开麦：把麦克风轨挂到所有 WebRTC 直连/TURN 的对端（复用媒体轨重协商链路）。
-   * 走 WS 中继的对端收不到（媒体轨过不了应用层中继，且未做音频自编码），
-   * 返回收不到的对端列表供 UI 说明。
+   * 开麦。分发路径依当前层级：
+   *   - 小房间（mesh）：把麦克风轨挂到所有 WebRTC 直连/TURN 的对端；走 WS 中继的
+   *     对端收不到（媒体轨过不了应用层中继），以 blocked 返回供 UI 说明。
+   *   - 大房间（fanout）：麦克风单次 Opus 自编码、群密钥加密后经服务器扇出，
+   *     全房间可达（除浏览器不支持 WebCodecs 解码者），blocked 为空。
    */
   startVoice(stream: MediaStream): { blocked: string[] } {
     this.stopVoice()
     this.voiceStream = stream
-    const blocked: string[] = []
-    for (const peer of this.peers.values()) {
-      if (peer.transport === 'webrtc') {
-        this.attachVoice(peer)
-      } else {
-        blocked.push(peer.remoteId)
-      }
+    this.applyVoice()
+    if (this.voicePath === 'fanout') return { blocked: [] }
+    // 网状：走 WS 中继的对端收不到原生音频轨。
+    return {
+      blocked: [...this.peers.values()]
+        .filter((p) => p.transport !== 'webrtc')
+        .map((p) => p.remoteId),
     }
-    return { blocked }
   }
 
-  /** 关麦：撤各对端的音频轨并停止本地采集。 */
-  stopVoice(): void {
-    if (!this.voiceStream) return
+  /**
+   * 依当前层级把麦克风挂到分发路径：
+   *   - fanout：单次 Opus 编码 → 群密钥加密 → 服务器扇出；
+   *   - mesh：把音频轨挂到所有 WebRTC 直连/TURN 的对端。
+   * 幂等，可在 start 与层级迁移时重复调用。
+   */
+  private applyVoice(): void {
+    const stream = this.voiceStream
+    if (!stream) return
+    if (this.tier === 'fanout') {
+      this.voicePath = 'fanout'
+      this.broadcast({ kind: 'media-key', key: this.fanoutHub.keyBase64 })
+      this.broadcast({ kind: 'voice-start', via: 'fanout' })
+      void this.ensureVoiceEncoder()
+      return
+    }
+    this.voicePath = 'mesh'
+    for (const peer of this.peers.values()) {
+      if (peer.transport === 'webrtc') this.attachVoice(peer)
+    }
+  }
+
+  /**
+   * 拆除当前语音分发路径（撤音频轨 / 关扇出编码器），但**不**停源流、
+   * **不**广播 voice-stop——供层级迁移时原地换路。
+   */
+  private detachVoicePaths(): void {
     for (const [peerId, senders] of this.voiceSenders) {
       const peer = this.peers.get(peerId)
       if (peer) for (const s of senders) peer.removeTrack(s)
     }
     this.voiceSenders.clear()
+    this.voiceEncoder?.close()
+    this.voiceEncoder = null
+    this.voiceEncoderStarting = null
+  }
+
+  /** 关麦：撤各对端的音频轨 / 关扇出编码器，并停止本地采集。 */
+  stopVoice(): void {
+    if (!this.voiceStream) return
+    this.detachVoicePaths()
     for (const track of this.voiceStream.getTracks()) track.stop()
     this.voiceStream = null
+    this.voicePath = 'mesh'
     this.broadcast({ kind: 'voice-stop' })
   }
 
   get voiceActive(): boolean {
     return this.voiceStream !== null
+  }
+
+  /** 惰性创建扇出语音编码器；并发调用共用同一个启动 promise。 */
+  private ensureVoiceEncoder(): Promise<boolean> {
+    if (this.voiceEncoderStarting) return this.voiceEncoderStarting
+    const track = this.voiceStream?.getAudioTracks()[0]
+    if (!track) return Promise.resolve(false)
+
+    const encoder = new VoiceEncoder(track, {
+      send: (packet) => this.fanoutHub.sendVoice(packet),
+      buffered: () => this.signaling.bufferedAmount,
+    })
+    this.voiceEncoderStarting = encoder.start().then((ok) => {
+      if (!ok || !this.voiceStream) {
+        encoder.close()
+        if (!ok) {
+          this.emit('error', {
+            code: 'voice-codec-unsupported',
+            msg: '本机没有可用的 Opus 编码器，无法在大房间扇出语音',
+          })
+        }
+        return false
+      }
+      this.voiceEncoder = encoder
+      return true
+    })
+    return this.voiceEncoderStarting
+  }
+
+  /** 扇出语音包到达：交给该发送端的解码器，解出后当作一条语音流上报。 */
+  private handleVoicePacket(from: string, packet: ArrayBuffer): void {
+    let decoder = this.voiceDecoders.get(from)
+    if (!decoder) {
+      if (!canDecodeVoice()) {
+        if (!this.voiceDecodeWarned.has(from)) {
+          this.voiceDecodeWarned.add(from)
+          const who = this.nicks.get(from) ?? from
+          this.emit('error', {
+            code: 'voice-codec-unsupported',
+            msg: `${who} 正经扇出对讲，但当前浏览器不支持 WebCodecs 解码，无法收听`,
+          })
+        }
+        return
+      }
+      decoder = new VoiceDecoder()
+      decoder.onReady = (stream) => this.emit('voice-stream', { peerId: from, stream })
+      this.voiceDecoders.set(from, decoder)
+    }
+    decoder.push(packet)
+  }
+
+  private dropVoiceDecoder(peerId: string): void {
+    this.voiceDecoders.get(peerId)?.close()
+    this.voiceDecoders.delete(peerId)
+    this.voiceDecodeWarned.delete(peerId)
   }
 
   /** 幂等：把麦克风轨挂到某对端并通告流 id（对端据此识别为语音流）。 */
@@ -686,7 +782,7 @@ export class Mesh extends Emitter<MeshEvents> {
     if (!track) return Promise.resolve(false)
 
     const encoder = new ScreenEncoder(track, {
-      send: (packet) => this.fanoutScreen(packet),
+      send: (packet) => this.emitScreenPacket(packet),
       // 中继最终压在信令 WebSocket 的发送缓冲上，编码器据此丢帧。
       buffered: () => this.signaling.bufferedAmount,
     })
@@ -708,8 +804,17 @@ export class Mesh extends Emitter<MeshEvents> {
     return this.encoderStarting
   }
 
-  /** 编码一次，分发给所有中继观众（中继内部会立即复制载荷，可复用同一份）。 */
-  private fanoutScreen(packet: ArrayBuffer): void {
+  /** 编码器出的一个屏幕包，按当前路径分发：扇出（群密钥加密上行一次）或每对中继。 */
+  private emitScreenPacket(packet: ArrayBuffer): void {
+    if (this.screenPath === 'fanout') {
+      this.fanoutHub.sendScreen(packet)
+    } else {
+      this.distributeCodecScreen(packet)
+    }
+  }
+
+  /** 网状路径：把编码包分发给所有走中继的观众（sendScreen 内部会即时复制载荷）。 */
+  private distributeCodecScreen(packet: ArrayBuffer): void {
     for (const peerId of this.codecViewers) {
       this.peers.get(peerId)?.sendScreen(packet)
     }
@@ -911,111 +1016,38 @@ export class Mesh extends Emitter<MeshEvents> {
     }
   }
 
-  /** 设置拓扑模式 */
-  setTopologyMode(mode: TopologyMode): void {
-    this.topology.setMode(mode)
+  /** 当前组网层级（UI / 诊断用）。 */
+  get networkTier(): MeshTier {
+    return this.tier
   }
 
-  /** 获取当前拓扑模式 */
-  getTopologyMode(): TopologyMode {
-    return this.topology.getMode()
+  /**
+   * 依据房间人数（含自己）重算组网层级：跨过 FANOUT_THRESHOLD 即切换。
+   * addPeer / removePeer / joined 之后调用；若切换时正在共享媒体，
+   * onTierChanged 会把屏幕/语音迁到新路径。
+   */
+  private reevaluateTier(): void {
+    const total = this.peers.size + 1
+    const next: MeshTier = total > FANOUT_THRESHOLD ? 'fanout' : 'mesh'
+    if (next === this.tier) return
+    this.tier = next
+    this.onTierChanged()
   }
 
-  /** 获取拓扑统计信息 */
-  getTopologyStats() {
-    return this.topology.getStats()
-  }
-
-  /** 优化拓扑连接：关闭不需要的连接 */
-  private optimizeTopology(): void {
-    const mode = this.topology.getMode()
-    console.log(`[mesh] Optimizing topology (mode: ${mode})`)
-
-    if (mode === 'full-mesh') {
-      // 全连接模式：保持所有连接
-      console.log('[mesh] Full-mesh mode: keeping all connections')
-      return
+  /**
+   * 组网层级切换后的媒体迁移：屏幕/语音正在共享时，拆掉旧路径、按新层级重挂
+   * （detach* 不停源流、不发 stop，apply* 会广播新的 screen-start/voice-start via）。
+   * 跨阈值切换较罕见，接受一次短暂闪断（见 ARCHITECTURE.md「自适应组网」）。
+   */
+  private onTierChanged(): void {
+    if (this.screenStream) {
+      this.detachScreenPaths()
+      this.applyScreenShare()
     }
-
-    // 获取拓扑要求的连接
-    const required = this.topology.getRequiredConnections()
-    const current = new Set(this.peers.keys())
-
-    console.log(`[mesh] Required connections: ${required.size}`)
-    console.log(`[mesh] Current connections: ${current.size}`)
-
-    // 重要：广播拓扑信息到所有节点，确保一致性
-    console.log('[mesh] Broadcasting topology information...')
-    this.broadcastTopologyInfo()
-
-    // 延迟关闭连接，等待拓扑信息同步
-    setTimeout(() => {
-      this.closeUnnecessaryConnections()
-    }, 2000)
-  }
-
-  /** 广播拓扑信息（分组结果） */
-  private broadcastTopologyInfo(): void {
-    const groups = this.topology.getGroupsList()
-
-    // 构造拓扑信息消息
-    for (const group of groups) {
-      const topoMsg: ControlMessage = {
-        kind: 'topo-announce',
-        groupId: group.id,
-        leader: group.leader,
-        members: Array.from(group.members),
-        version: Date.now(), // 使用时间戳作为版本号
-      }
-
-      // 广播到所有节点
-      this.broadcast(topoMsg)
+    if (this.voiceStream) {
+      this.detachVoicePaths()
+      this.applyVoice()
     }
-  }
-
-  /** 关闭不需要的连接（在同步后执行） */
-  private closeUnnecessaryConnections(): void {
-    const required = this.topology.getRequiredConnections()
-    const current = new Set(this.peers.keys())
-
-    console.log('[mesh] Topology optimization: marking inactive connections...')
-    console.log('[mesh] Required connections:', required.size)
-    console.log('[mesh] Current connections:', current.size)
-
-    // 重要：不关闭连接，只标记为"不活跃"
-    // 这样保持 P2P 通道，避免降级到服务器中继
-    let markedCount = 0
-    let activeCount = 0
-
-    for (const peerId of current) {
-      if (required.has(peerId)) {
-        // 必需的连接：标记为活跃
-        activeCount++
-      } else {
-        // 不需要的连接：不关闭，但标记为备用
-        // 这些连接仍然可用于冗余路由
-        markedCount++
-        console.log(
-          `[mesh] Marking as backup: ${peerId.slice(0, 8)} ` +
-          `(keeping WebRTC, not using for primary routing)`
-        )
-      }
-    }
-
-    console.log(
-      `[mesh] Topology ready: ` +
-      `${activeCount} active, ` +
-      `${markedCount} backup, ` +
-      `total ${this.peers.size} WebRTC connections maintained`
-    )
-
-    // 广播更新后的邻接表
-    this.broadcastLinks()
-  }
-
-  /** 手动触发拓扑优化（用于测试或手动控制） */
-  triggerTopologyOptimization(): void {
-    this.optimizeTopology()
   }
 
   getNick(peerId: string): string | undefined {
@@ -1029,7 +1061,6 @@ export class Mesh extends Emitter<MeshEvents> {
     }
     this.pendingPings.clear()
     this.rtts.clear()
-    this.topology.dispose()
     if (this.voiceStream) {
       for (const track of this.voiceStream.getTracks()) track.stop()
       this.voiceStream = null
@@ -1037,6 +1068,12 @@ export class Mesh extends Emitter<MeshEvents> {
     this.voiceSenders.clear()
     this.remoteVoiceStreams.clear()
     this.voiceParts.clear()
+    this.voiceEncoder?.close()
+    this.voiceEncoder = null
+    this.voiceEncoderStarting = null
+    for (const d of this.voiceDecoders.values()) d.close()
+    this.voiceDecoders.clear()
+    this.voiceDecodeWarned.clear()
     if (this.screenStream) {
       for (const track of this.screenStream.getTracks()) track.stop()
       this.screenStream = null
@@ -1063,6 +1100,7 @@ export class Mesh extends Emitter<MeshEvents> {
     this.peers.clear()
     this.nicks.clear()
     this.remoteScreenDecode.clear()
+    this.fanoutHub.reset()
     this.signaling.send({ t: 'leave' })
     this.signaling.close()
   }
@@ -1070,9 +1108,6 @@ export class Mesh extends Emitter<MeshEvents> {
   private addPeer(remoteId: string): Peer {
     const existing = this.peers.get(remoteId)
     if (existing) return existing
-
-    // 在分层模式下，暂时延迟建立连接，等待拓扑计算完成
-    // 注意：这里仍然创建 Peer，但可以在后续优化中实现按需连接
 
     const initiator = this.myId < remoteId
     const peer = new Peer({
@@ -1098,7 +1133,13 @@ export class Mesh extends Emitter<MeshEvents> {
     peer.on('transport', (transport) => {
       this.emit('peer-transport', { peerId: remoteId, transport })
       // 共享进行中的对端刚降级为中继：原生媒体轨已作废，改挂自编码路径。
-      if (transport === 'relay' && this.screenStream && this.sharedWith(remoteId)) {
+      // 扇出路径不依赖 per-peer transport（画面走服务器），无需处理。
+      if (
+        transport === 'relay' &&
+        this.screenStream &&
+        this.screenPath !== 'fanout' &&
+        this.sharedWith(remoteId)
+      ) {
         this.screenSenders.delete(remoteId)
         this.attachScreen(peer)
       }
@@ -1108,9 +1149,13 @@ export class Mesh extends Emitter<MeshEvents> {
       if (!stream) return
       // 对讲的语音流 id 由 voice-start 先行通告；其余媒体流一律视为屏幕共享。
       if (this.remoteVoiceStreams.get(remoteId) === stream.id || (track.kind === 'audio' && stream.getVideoTracks().length === 0)) {
+        // 原生音频轨到达：若此前在收该对端的扇出语音，丢弃陈旧解码器（新流取而代之）。
+        this.dropVoiceDecoder(remoteId)
         this.emit('voice-stream', { peerId: remoteId, stream })
         return
       }
+      // 原生视频轨到达：丢弃此前的中继/扇出屏幕解码器（新流取而代之）。
+      this.dropScreenDecoder(remoteId)
       this.emit('screen-stream', { peerId: remoteId, stream })
     })
     peer.on('channelopen', () => {
@@ -1121,10 +1166,26 @@ export class Mesh extends Emitter<MeshEvents> {
         .filter((e) => e.local && e.meta.scope === 'all')
         .map((e) => e.meta)
       if (visible.length > 0) peer.sendControl({ kind: 'share-list', files: visible })
-      // attachScreen 幂等：这里既补发 screen-start，也让中继观众拿到关键帧
-      // （中继的 channelopen 正好在密钥协商完成时触发）。
-      if (this.screenStream && this.sharedWith(remoteId)) this.attachScreen(peer)
-      if (this.voiceStream) this.attachVoice(peer)
+      // 屏幕：网状逐对端补挂（attachScreen 幂等，兼补发 screen-start 与关键帧）；
+      // 扇出则发群密钥 + screen-start(via:fanout)，并请求一个关键帧供新观众起画。
+      if (this.screenStream && this.sharedWith(remoteId)) {
+        if (this.screenPath === 'fanout') {
+          peer.sendControl({ kind: 'media-key', key: this.fanoutHub.keyBase64 })
+          peer.sendControl({ kind: 'screen-start', scope: 'all', via: 'fanout' })
+          this.screenEncoder?.requestKeyFrame()
+        } else {
+          this.attachScreen(peer)
+        }
+      }
+      // 语音：同理。扇出下发密钥 + voice-start(via:fanout)，配置包由编码器周期性重发。
+      if (this.voiceStream) {
+        if (this.voicePath === 'fanout') {
+          peer.sendControl({ kind: 'media-key', key: this.fanoutHub.keyBase64 })
+          peer.sendControl({ kind: 'voice-start', via: 'fanout' })
+        } else {
+          this.attachVoice(peer)
+        }
+      }
       // 会话内续传：通道（重新）就绪时向它询问所有进行中下载的持块情况，
       // 停摆的下载据此拿回源并自动继续。
       for (const fileId of this.downloads.keys()) {
@@ -1134,8 +1195,10 @@ export class Mesh extends Emitter<MeshEvents> {
     })
 
     this.peers.set(remoteId, peer)
-    // 本端正在向全网共享屏幕：给新对端补挂画面。
-    if (this.screenStream && this.screenScope.scope === 'all') this.attachScreen(peer)
+    // 本端正在向全网共享屏幕：给新对端补挂画面（扇出路径由 channelopen 分发密钥）。
+    if (this.screenStream && this.screenScope.scope === 'all' && this.screenPath !== 'fanout') {
+      this.attachScreen(peer)
+    }
     this.emit('peer-added', { peerId: remoteId, nick: this.nicks.get(remoteId) })
     // 构造期就可能已降级（如强制中继开关），此时 'transport' 事件早于上面的
     // 订阅发出，补一次同步；之后的变化由事件驱动。必须在 peer-added 之后，
@@ -1143,6 +1206,8 @@ export class Mesh extends Emitter<MeshEvents> {
     if (peer.transport !== 'webrtc') {
       this.emit('peer-transport', { peerId: remoteId, transport: peer.transport })
     }
+    // 人数变化后重算组网层级（跨过阈值则把媒体迁到扇出路径）。
+    this.reevaluateTier()
     return peer
   }
 
@@ -1195,23 +1260,26 @@ export class Mesh extends Emitter<MeshEvents> {
           const rtt = Math.max(0, Math.round(performance.now() - p.sentAt))
           this.rtts.set(from, rtt)
           this.emit('peer-rtt', { peerId: from, rtt })
-
-          // 更新拓扑管理器的质量数据
-          const peer = this.peers.get(from)
-          this.topology.updateQuality(from, {
-            rtt,
-            state: peer?.connectionState ?? 'new',
-            iceType: this.getIceType(peer),
-          })
         }
         break
       }
       case 'voice-start':
-        this.remoteVoiceStreams.set(from, msg.streamId)
+        // streamId 仅在原生轨路径（via:'track'）出现，用于把到达的媒体流认作语音；
+        // 扇出路径（via:'fanout'）没有 WebRTC 轨，语音由 handleVoicePacket 解出。
+        if (msg.streamId) this.remoteVoiceStreams.set(from, msg.streamId)
+        // 对方经扇出对讲而本机解不了码：明确告知（否则只是静默收不到声）。
+        if (msg.via === 'fanout' && !canDecodeVoice() && !this.voiceDecodeWarned.has(from)) {
+          this.voiceDecodeWarned.add(from)
+          this.emit('error', {
+            code: 'voice-codec-unsupported',
+            msg: `${this.nicks.get(from) ?? from} 正经扇出对讲，但当前浏览器不支持 WebCodecs 解码，无法收听`,
+          })
+        }
         this.emit('voice-start', from)
         break
       case 'voice-stop':
         this.remoteVoiceStreams.delete(from)
+        this.dropVoiceDecoder(from)
         this.emit('voice-stop', from)
         break
       case 'guess-start':
@@ -1268,9 +1336,9 @@ export class Mesh extends Emitter<MeshEvents> {
         this.emit('peer-links', { peerId: from, links: msg.links })
         break
       case 'screen-start':
-        // 对方经中继共享（WebCodecs 自编码），而本机解不了：明确告知，
+        // 对方经中继/扇出共享（WebCodecs 自编码），而本机解不了：明确告知，
         // 否则只会看到一个永远黑屏的画面条目。提示只发一次，但拒绝要每次都拒。
-        if (msg.via === 'codec' && !canDecodeScreen()) {
+        if ((msg.via === 'codec' || msg.via === 'fanout') && !canDecodeScreen()) {
           if (!this.decodeWarned.has(from)) {
             this.decodeWarned.add(from)
             this.emit('error', {
@@ -1386,120 +1454,16 @@ export class Mesh extends Emitter<MeshEvents> {
           if (dl.ownsReq(msg.reqId)) dl.onNak(from, msg.reqId)
         })
         break
-      // —— 拓扑管理消息 ——
-      case 'topo-announce':
-        // 收到拓扑通告：同步远端的分组信息
-        console.log(`[mesh] Received topology from ${from.slice(0, 8)}:`, msg)
-        this.handleTopologyAnnounce(from, msg)
-        break
-      case 'leader-elect':
-        this.topology.handleLeaderElect(from, msg)
-        break
-      case 'leader-ack':
-        // 组长确认消息（预留，当前选举逻辑较简单）
-        break
-      case 'relay-forward':
-        // 收到中继消息：如果是发给我的，解包；如果我是组长且需要转发，继续转发
-        this.handleRelayForward(from, msg)
+      case 'media-key':
+        // 发送端的媒体群密钥（路线乙）：登记后即可解密其扇出帧。
+        this.fanoutHub.setRemoteKey(from, msg.key)
         break
     }
-  }
-
-  /** 处理拓扑通告消息 */
-  private handleTopologyAnnounce(
-    from: string,
-    msg: Extract<ControlMessage, { kind: 'topo-announce' }>
-  ): void {
-    // 传递给拓扑管理器
-    this.topology.handleTopologyAnnounce(from, msg)
-
-    // 同步拓扑信息：根据收到的分组信息更新本地视图
-    // 注意：为了保持一致性，使用字典序最小的节点作为"协调者"
-    const allPeers = [this.myId, ...Array.from(this.peers.keys())].sort()
-    const coordinator = allPeers[0]
-
-    if (from === coordinator) {
-      // 收到协调者的拓扑信息，以此为准
-      console.log(`[mesh] Syncing topology from coordinator ${coordinator.slice(0, 8)}`)
-      // TODO: 应用协调者的拓扑决策
-    }
-  }
-
-  /** 处理中继转发消息 */
-  private handleRelayForward(from: string, msg: Extract<ControlMessage, { kind: 'relay-forward' }>): void {
-    const { originalFrom, finalTo, payload } = msg
-
-    // 如果是发给我的，直接处理
-    if (finalTo === this.myId) {
-      this.handleControl(originalFrom, payload)
-      return
-    }
-
-    // 如果是广播消息 (finalTo === '*')
-    if (finalTo === '*') {
-      // 1. 本节点处理一次
-      this.handleControl(originalFrom, payload)
-
-      // 2. 如果我是组长，转发给我的组员（除了来源）
-      if (this.topology.isLeader()) {
-        const myGroupId = this.topology.getGroupId(this.myId)
-        if (myGroupId) {
-          const myGroup = this.topology.getGroupsList().find((g) => g.id === myGroupId)
-          if (myGroup) {
-            for (const member of myGroup.members) {
-              if (member !== this.myId && member !== from && member !== originalFrom) {
-                this.peers.get(member)?.sendControl(msg)
-              }
-            }
-          }
-        }
-
-        // 3. 转发给其他组的组长（除了来源）
-        const leaders = this.topology.getLeaders()
-        for (const leader of leaders) {
-          if (leader !== this.myId && leader !== from && leader !== originalFrom) {
-            this.peers.get(leader)?.sendControl(msg)
-          }
-        }
-      }
-      return
-    }
-
-    // 如果是点对点消息，且我是组长，需要转发
-    if (this.topology.isLeader()) {
-      // 检查目标是否在我的组内
-      if (this.topology.inSameGroup(this.myId, finalTo)) {
-        // 目标在我的组内：转发整条 relay-forward（而非裸 payload），
-        // 让目标经上面的 finalTo===myId 分支解包，把发送者正确还原为
-        // originalFrom。若直接投递 payload，目标会把发送者错记成本组长（串号）。
-        this.peers.get(finalTo)?.sendControl(msg)
-      } else {
-        // 目标在其他组，转发给目标的组长
-        const targetLeader = this.topology.getLeader(finalTo)
-        if (targetLeader && targetLeader !== this.myId) {
-          this.peers.get(targetLeader)?.sendControl(msg)
-        }
-      }
-    }
-  }
-
-  /** 获取 peer 的 ICE 类型（用于拓扑质量评估） */
-  private getIceType(peer: Peer | undefined): 'host' | 'srflx' | 'relay' | 'unknown' {
-    if (!peer) return 'unknown'
-    // 简化版：根据 transport 推断
-    // WebRTC relay 通常通过 TURN
-    // 实际实现可以从 ICE 候选中获取更精确的类型
-    if (peer.transport === 'relay') return 'relay'
-    // 默认假设是直连或 srflx
-    return 'host'
   }
 
   private removePeer(remoteId: string): void {
     const peer = this.peers.get(remoteId)
     if (!peer) return
-
-    // 从拓扑管理器移除
-    this.topology.removePeer(remoteId)
 
     peer.close()
     this.peers.delete(remoteId)
@@ -1510,6 +1474,8 @@ export class Mesh extends Emitter<MeshEvents> {
     this.dropScreenDecoder(remoteId)
     this.voiceSenders.delete(remoteId)
     this.remoteVoiceStreams.delete(remoteId)
+    this.dropVoiceDecoder(remoteId)
+    this.fanoutHub.removeRemoteKey(remoteId)
     this.rtts.delete(remoteId)
     for (const key of [...this.voiceParts.keys()]) {
       if (key.startsWith(`${remoteId}|`)) this.voiceParts.delete(key)
@@ -1533,6 +1499,8 @@ export class Mesh extends Emitter<MeshEvents> {
     }
     this.broadcastLinks()
     this.emit('peer-removed', remoteId)
+    // 人数变化后重算组网层级（跌回阈值内则把媒体迁回网状路径）。
+    this.reevaluateTier()
   }
 
   /** 收到远端的 share-offer / share-list：登记为可下载条目。 */

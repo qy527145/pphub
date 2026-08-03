@@ -8,7 +8,7 @@
 
 1. **纯浏览器**，不做原生伴侣程序 → 无远程桌面控制、无 SSH 终端、无局域网自动发现。
 2. **信令栈用 Rust**（axum + tokio），单一后端二进制。
-3. **纯 P2P Mesh，房间 ≤6 人**，不引入 SFU。
+3. **数据恒全网状 P2P**（控制/聊天/文件/白板/游戏，无论房间多大）；**媒体（屏幕/语音）按房间人数自适应**——小房间逐对端直发，大房间由服务器**扇出**（分发端到端加密密文，非 SFU 转码，服务器看不到明文）。默认房间上限 32 人。
 4. **首期功能**：文件/文件夹快传 + 文本聊天、屏幕共享 + 互动白板、一起看片房、局域网离线快传；配套地基：信令握手、SAS 指纹校验、TURN 兜底。
 
 ---
@@ -43,7 +43,7 @@
                      文件 · 聊天 · 白板 · 看片同步 · 屏幕流
 ```
 
-**四类流量**：① 应用静态资源（HTTPS，一次性）；② 信令（WSS，小且短）；③ NAT 穿透探测（STUN 无带宽成本 / TURN 有）；④ 全部业务数据走 P2P，端到端加密。**只有 TURN 兜底时**业务数据才过服务器（且服务器仍看不到明文）。
+**四类流量**：① 应用静态资源（HTTPS，一次性）；② 信令（WSS，小且短）；③ NAT 穿透探测（STUN 无带宽成本 / TURN 有）；④ 全部业务数据走 P2P，端到端加密。业务数据过服务器有两种情形——**TURN 兜底**（穿透失败）与**大房间媒体扇出**（发送端只上行一份加密密文，服务器复制给各观众）；两种情形下服务器都**看不到明文**。
 
 ---
 
@@ -167,7 +167,7 @@ type ServerMsg =
 
 - **加入协议**：新成员 `join` → 服务器回 `joined`（含现有成员），并向现有成员广播 `peer-join`。由**新成员发起** offer（谁后到谁发 offer，避免双向 glare）。
 - **Trickle ICE**：`signal` 消息同时承载 SDP 和逐条 ICE candidate，边收集边转发，不阻塞。
-- **房间上限**：服务端强制 ≤6 人（Mesh 约束），满员拒绝并回 `error`。
+- **房间上限**：服务端强制默认 32 人（`PPHUB_MAX_PEERS` 可调），满员拒绝并回 `error`。上限主要受全网状数据通道数约束（每端 N−1 条）；媒体在大房间走服务器扇出，不再是瓶颈。
 
 ### TURN 凭证签发
 coturn 的 `use-auth-secret` 模式：`username = "<expiry>:<peerId>"`，`credential = base64(HMAC-SHA1(secret, username))`，TTL 建议 1–2h。密钥只在服务端，前端每次连接前拉取。
@@ -182,7 +182,7 @@ coturn 的 `use-auth-secret` 模式：`username = "<expiry>:<peerId>"`，`creden
 ├─────────────────────────────────────────────┤
 │  channels.ts   多路 DataChannel / 分块 / 背压  │  传输层
 ├─────────────────────────────────────────────┤
-│  mesh.ts       Mesh 拓扑 / 成员生命周期        │
+│  mesh.ts       全网状成员生命周期 / 自适应组网  │
 │  peer.ts       单连接 (Perfect Negotiation)   │  连接层
 │  security.ts   SAS 指纹校验                    │
 ├─────────────────────────────────────────────┤
@@ -198,10 +198,13 @@ coturn 的 `use-auth-secret` 模式：`username = "<expiry>:<peerId>"`，`creden
 - `onicecandidate` → trickle 发送；`oniceconnectionstatechange === "failed"` → `restartIce()`（并先确保信令通道已重连）；`disconnected` 设宽限计时器，可能自愈。
 - 用 `RTCPeerConnection.generateCertificate()` 生成并持久化到 IndexedDB，做稳定身份指纹（配合 SAS）。
 
-### 5.2 连接层 — Mesh 管理
-- 房间内 N 人 → 每端维护 N-1 条 `RTCPeerConnection`（全网状）。
+### 5.2 连接层 — 全网状成员管理与自适应组网
+- 房间内 N 人 → 每端维护 N-1 条 `RTCPeerConnection`（**数据恒全网状**）。
 - 由信令的 `peer-join`/`peer-left` 驱动增删连接。
-- **硬上限 6**；数据通道 Mesh 本可到 50–100 端，但音视频受编码器限制，统一按 6 封顶。
+- **默认上限 32**（`PPHUB_MAX_PEERS` 可调）；数据通道全网状可到几十端，媒体不再受「每端各编一份」的上行约束——见下。
+- **自适应组网（客户端自行判定，无需服务端协议改动）**：`tier = 成员数(含己) > FANOUT_THRESHOLD(=8) ? 'fanout' : 'mesh'`。各端成员视图一致，算出的层级一致。
+  - **数据**（control/chat/file/whiteboard/game）：**任何规模都全网状 P2P 直发**，不走扇出。
+  - **媒体**（屏幕/语音）：小房间逐对端发（原生媒体轨或每对中继自编码）；大房间切到**服务器扇出**——发送端只编码一次、用群密钥加密一次、上行一次，服务器复制密文给 N−1 观众（见 6.7）。跨阈值切换时原地换路，接受一次短暂闪断。
 
 ### 5.3 传输层 — DataChannel 抽象
 **多通道划分**（同一 PC 上，共享一个 SCTP 拥塞窗口，但分通道避免应用层队头阻塞）：
@@ -223,7 +226,7 @@ coturn 的 `use-auth-secret` 模式：`username = "<expiry>:<peerId>"`，`creden
   - 双方从 `getStats()` / SDP 取本端与对端 DTLS 指纹（SHA-256）。
   - 归一化拼接后哈希 → 生成**短认证串（SAS）**：4 个 emoji 或 6 位数字。
   - UI 引导两端**带外比对**（当面/语音/已有可信渠道）一致即确认，防 MITM。
-- 纯 P2P（无 SFU）下这是可达的真端到端加密。
+- 纯 P2P 直连下这是可达的真端到端加密；大房间媒体扇出时，服务器只转发用**发送端群密钥**加密的密文（密钥经每对 P2P control 通道分发，绝不过服务器），端到端加密同样不破（见 6.7）。
 
 ### 5.5 能力探测与降级
 `capabilities.ts` 启动时探测并写入 store，各功能据此启用/降级：
@@ -265,6 +268,7 @@ control 通道传 `{t:"chat", from, ts, text|html|imgBlobRef}`；图片/文件�
 - 编码控制：`sender.setParameters()` 调 `maxBitrate`；`degradationPreference = "maintain-resolution"`（运维/看字场景）。
 - 编解码：`setCodecPreferences` 按对端能力协商，AV1/VP9 覆盖 Chromium/FF、H.264 兜底。
 - **限制**：桌面限定，移动端浏览器无此 API；需 HTTPS。
+- **三条分发路径**（按对端连接与房间规模）：① WebRTC 直连/TURN → 原生媒体轨（画质/延迟最好、带音频）；② 已降级为 WS 中继 → `screencodec.ts` 自编码经加密中继（仅视频）；③ 大房间（fanout 层级）→ 自编码经服务器扇出（见 6.7）。后两条都需安全上下文（WebCodecs）。
 
 ### 6.4 互动白板（Yjs CRDT）
 - 白板文档 = **Yjs Y.Doc**，图元存 `Y.Array`/`Y.Map`；变更通过 control 通道以 Yjs update 二进制同步（自写一个薄 WebRTC provider，或直接手动 `Y.applyUpdate`）。
@@ -289,6 +293,15 @@ control 通道传 `{t:"chat", from, ts, text|html|imgBlobRef}`；图片/文件�
 - **vanilla ICE**：不配 STUN/TURN，等 `icegatheringstate === "complete"`（`onicecandidate` 收到 null）再导出完整 SDP；离线只有 host candidate，收集快。
 - **二维码优化**：SDP 压缩到 55–100 字节（从 DTLS 指纹派生 ICE 凭证、二进制打包候选）。
 - **已知坑**：mDNS `.local` 混淆候选依赖组播可达，AP 隔离/跨 VLAN 会静默失败——UI 需给「连接失败请确认同一 Wi-Fi 且未开访客隔离」提示。
+
+### 6.7 大房间媒体扇出（服务器分发端到端加密密文）
+房间 > `FANOUT_THRESHOLD`(=8) 时，屏幕/语音从「每对端各发一份」切到「上行一份、服务器复制给所有观众」，消除发送端 O(N) 的上行与编码开销。**不是 SFU**——服务器不解码、不转码，只按房间复制不透明密文。
+- **自编码**：屏幕用 `screencodec.ts`（WebCodecs `VideoEncoder`）、语音用 `voicecodec.ts`（WebCodecs `AudioEncoder`，Opus 32kbps 单声道），发送端把媒体自行编成 `EncodedChunk`（就在 JS 手里，绕开浏览器内部 SRTP 栈，故可经服务器转发）。**需安全上下文**——WebCodecs 与 `crypto.subtle` 一样在明文 http 下不存在（如实告知用户，见 6.3 限制）。
+- **群密钥（SFrame sender-key 模型，不轮换）**：发送端开播时随机生成 32 字节群密钥，经**每对已加密的 control 通道**用 `media-key` 消息发给各观众（**绝不过服务器明文**）。屏幕与语音复用同一把发送端密钥，帧内 1 字节 `kind` 区分且被 AEAD 鉴权。房间成员皆为授权观众，无需轮换。
+- **线格式（外层版本字节=2，区别于 1:1 中继的版本 1）**：发送端→服务器 `[2][inner]`；服务器→观众 `[2][srcIdLen][srcId][inner]`（服务器**在密文外**盖来源 peerId，修历史「语音串号」之踩坑）；`inner = [nonce:12][cipher]`，`cipher = seal(群密钥, nonce, [kind:1] ++ packet)`。
+- **服务端**（`src/room.rs::fanout` + `src/ws.rs`）：`relay_binary` 按首字节分流——`1` 走 1:1 中继（`send().await` 背压），`2` 走 `fanout`（`try_send`，满即丢帧，绝不让一个慢观众卡住实时媒体）。服务器只复制密文、看不到明文。
+- **客户端枢纽**（`core/fanout.ts` 的 `FanoutHub`）：一端既是发送端（`sendScreen/sendVoice`）也是观众（`handleFrame` 解密后分发给屏幕/语音解码器）。`mesh.ts` 依 `tier` 在「逐对端」与「扇出」间切换路径，跨阈值时原地换路。
+- **能力缺口如实告知**：发送端无 WebCodecs 编码器 → 提示无法在大房间扇出该媒体；观众浏览器无 WebCodecs 解码 → 提示收不到（明文 http 常见）。扇出语音无 WebRTC 的回声消除链路。
 
 ---
 
@@ -467,6 +480,23 @@ control 通道传 `{t:"chat", from, ts, text|html|imgBlobRef}`；图片/文件�
 - **筛选 + 满员观战**：桌列表头新增 `.search-box`（按桌号 `tableNumber.includes` 过滤，数字输入 + 一键清除）、`.status-tabs`（全部 / 等待中 / 游戏中，`all` 排除 `finished`）、及原有游戏类型 `.filter-tabs`。页脚按状态给动作：可入座→「加入」；已满或进行中且允许观战→「进入观战 / 满员 · 观战」（`canSpectateTable` → `store.joinGameTable(id, true)`）；否则禁用。空状态文案区分「有筛选」与「真无桌」。
 - **e2e 首次覆盖游戏桌联机（e2e-features 新增 6 项）**：A 建象棋公开桌→B 全网可见；A 邀请 B→**B 端 `pendingInvites` 出现**（正是回归 mesh 漏 case 的哨兵）；B 接受→A 端玩家数同步为 2；A 提议开局→B 收到 `config.proposal`；B 接受→双方 `config.agreed===true`；桌主开始→双方 `state==='playing'`。用例末尾双方 `leaveGameTable` 清理，不污染后续。
 - **验证**：`npm run build`（vue-tsc + vite）+ `cargo build` 通过；e2e-features **29 项**（23→29）全过、e2e-network 13 / e2e-relay 13 无回归。踩坑清单：①控制消息 switch 必须有 `default`（或补全 case）否则新 kind 静默丢弃——这是本轮两个功能故障的共同根因；②远端桌不进 `tables`，凡「按桌号找桌」的路径都要有 `gameTables` 回退；③被邀入桌一律走 tableId，不依赖桌号解析。
+
+---
+
+### 自适应组网 + 大房间媒体扇出（路线乙）落地记录（2026-08-03）
+
+把媒体分发从「≤6 人纯网状、大房间无解」推进到**按房间人数自适应**：数据恒全网状 P2P，媒体在大房间由服务器扇出端到端加密密文，屏幕/语音得以发给几十人。**取代**此前 §六/§5.2 中「硬上限 6」「中继路径未做音频自编码、收不到语音」等描述，以及 2026-07-31「拓扑语音串号修复」里「本项目房间恒 ≤6 人、中继无收益」的前提。
+
+- **为何不是 SFU**：真 SFU 要解 SRTP、按订阅转发 RTP，需 https 且不友好于 nginx 的 http/ws 反代，也与「服务器看不到明文」相悖。路线乙让发送端用 WebCodecs 自编码、群密钥自加密后**只上行一份密文**，服务器（`Rooms::fanout`）**只按房间复制密文**——单二进制、可过 nginx http/ws、端到端加密不破。代价：无 SFU 的按需码率/丢包自适应，且需安全上下文（WebCodecs）。
+- **层级客户端自决，服务端零协议改动**：`tier = 成员数(含己) > FANOUT_THRESHOLD(8) ? 'fanout' : 'mesh'`。各端成员视图一致 → 判定一致，无需协商。服务端只新增一个**与层级无关**的扇出原语（外层版本字节=2），任何时候都能用。
+- **只有媒体切扇出，数据永远全网状**：control/chat/file/whiteboard/game 的 P2P 直发在任何规模都不变——扇出只服务屏幕/语音这种 O(N) 上行的重流量。
+- **群密钥（SFrame sender-key，不轮换）**：发送端随机 32 字节密钥，经每对 P2P control 通道以 `media-key` 分发（**绝不过服务器明文**）；屏幕/语音复用同一把，帧内 `kind` 字节被 AEAD 鉴权区分。`crypto.ts` 补 `randomBytes`（`getRandomValues`，明文 http 也可用）。
+- **来源在密文外盖章，根治历史「语音串号」**：服务器转发时在 `inner` 外层前缀 `srcId`（`[2][srcIdLen][srcId][inner]`），观众按此认发送端；密文内不含身份，故转发者无从篡改——正是 7-31 分层中继踩过的坑，这次从线格式上排除。
+- **背压策略分道**：1:1 中继（版本 1）用 `send().await` 保可靠；扇出（版本 2）用 `try_send`，队列满即丢帧——实时媒体宁可掉帧也不让一个慢观众把整条扇出卡死。
+- **中途换路**：跨阈值时 `detach*Paths()`（不停源、不发 stop）+ `apply*()`（按新路径重挂并广播新的 `screen-start/voice-start` via），接受一次短暂闪断（阈值抖动罕见）。原生媒体轨到达时丢弃对应的中继/扇出解码器（新流取而代之）。
+- **新增/改动**：`core/fanout.ts`（`FanoutHub`：群密钥、`sendScreen/sendVoice`、`handleFrame`、`isFanoutFrame`）、`core/voicecodec.ts`（`VoiceEncoder/VoiceDecoder`，Opus，镜像 screencodec）、`core/crypto.ts`（`randomBytes`）；`core/mesh.ts`（`MeshTier`、`FANOUT_THRESHOLD`、`reevaluateTier/onTierChanged`、screen/voice 的 apply/detach/emit 分路、`media-key` 分发与登记）；`core/messages.ts`（`screen-start.via` 增 `'fanout'`、`voice-start.via`、`media-key`）；`src/room.rs`（`fanout()` + `max_peers()`）、`src/ws.rs`（`relay_binary` 按首字节 1/2 分流）、`src/config.rs`（`max_peers` 默认 32）。
+- **删除的过时代码/文档**：mesh/messages 里的分层拓扑（分组/组长/`relay-forward`）约 ~1500 行连同其死代码文件一并移除；文档内「≤6 人 Mesh 上限」「中继路径未做音频自编码」等描述随本次更新到自适应模型。
+- **验证**：`npm --prefix web run build`（vue-tsc + vite）通过；`cargo build` 通过；e2e 见下（媒体扇出的多端联机走无头 Chromium 的既有 e2e 框架尽力覆盖）。
 
 ---
 

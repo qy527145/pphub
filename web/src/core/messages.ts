@@ -195,15 +195,30 @@ export type ControlMessage =
   // —— 屏幕共享 ——
   /**
    * 本端开始/停止屏幕共享，此消息驱动对端 UI 状态。
-   * via 标明画面走哪条路：track=WebRTC 原生媒体轨（随重协商到达）；
-   * codec=已降级为中继，画面由 WebCodecs 自编码后经中继通道到达（无音频）。
+   * via 标明画面走哪条路：
+   *   track  = WebRTC 原生媒体轨（随重协商到达，画质最好、带音频）；
+   *   codec  = 该对端已降级为中继，画面由 WebCodecs 自编码后经**每对**中继通道到达（无音频）；
+   *   fanout = 大房间自适应组网，画面 WebCodecs 自编码后用群密钥加密、经服务器**扇出**到全房间
+   *            （发送端单次上行，见 fanout.ts / ARCHITECTURE.md 路线乙）。
    */
-  | { kind: 'screen-start'; scope: SendScope; via?: 'track' | 'codec' }
+  | { kind: 'screen-start'; scope: SendScope; via?: 'track' | 'codec' | 'fanout' }
   | { kind: 'screen-stop' }
-  // —— 实时对讲（麦克风轨，仅 WebRTC 直连/TURN 路径）——
-  /** 本端开麦。streamId 用于对端把到达的媒体流识别为语音（区别于屏幕共享）。 */
-  | { kind: 'voice-start'; streamId: string }
+  // —— 实时对讲（麦克风）——
+  /**
+   * 本端开麦。via 标明语音走哪条路：
+   *   track  = WebRTC 原生音频轨；streamId 供对端把到达的媒体流识别为语音（区别于屏幕共享）；
+   *   fanout = 大房间自适应组网，麦克风用 Opus 自编码、群密钥加密后经服务器扇出（见 voicecodec.ts）。
+   * 缺省视为 track（兼容旧版）。
+   */
+  | { kind: 'voice-start'; streamId?: string; via?: 'track' | 'fanout' }
   | { kind: 'voice-stop' }
+  // —— 媒体群密钥（路线乙）——
+  /**
+   * 发送端把本人的媒体群密钥（32 字节，base64）经**每对加密的 control 通道**发给某位观众。
+   * 服务器扇出的是用此密钥加密的密文，因此密钥绝不能过服务器明文——只走点对点 control。
+   * 屏幕与语音复用同一把发送端密钥（帧内 kind 区分）。
+   */
+  | { kind: 'media-key'; key: string }
   // —— 绘制（白板 / 屏幕批注共用）——
   | { kind: 'draw-begin'; board: BoardId; id: string; color: string; size: number; mode: 'pen' | 'eraser'; x: number; y: number }
   /** 追加一批采样点（扁平化 x,y 序列，发送端按 ~25fps 批量）。 */
@@ -269,12 +284,3 @@ export type ControlMessage =
   | { kind: 'invite-send'; invite: unknown }
   | { kind: 'invite-accept'; inviteId: string }
   | { kind: 'invite-decline'; inviteId: string }
-  // —— 分层拓扑（网络优化）——
-  /** 拓扑通告：组长定期广播本组信息 */
-  | { kind: 'topo-announce'; groupId: string; leader: string; members: string[]; version: number }
-  /** 组长选举：发起新一轮选举 */
-  | { kind: 'leader-elect'; groupId: string; candidate: string; term: number }
-  /** 确认新组长 */
-  | { kind: 'leader-ack'; groupId: string; leader: string; term: number }
-  /** 消息中继：跨组消息通过组长转发 */
-  | { kind: 'relay-forward'; originalFrom: string; finalTo: string; payload: ControlMessage }

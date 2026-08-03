@@ -67,6 +67,11 @@ impl Rooms {
         }
     }
 
+    /// 房间成员上限（房满提示文案用）。
+    pub fn max_peers(&self) -> usize {
+        self.max_peers
+    }
+
     /// 加入房间。成功时返回房间内**已有**成员列表（不含自己），
     /// 并向已有成员广播 `peer-join`。
     ///
@@ -133,6 +138,32 @@ impl Rooms {
                 }
                 .into(),
             );
+        }
+    }
+
+    /// 服务器扇出（路线乙）：把一份已加密的媒体载荷复制给房间内除发送者外的每个成员。
+    ///
+    /// 与 `relay`（1:1）和 `sender_of`（1:1 背压 await）不同，扇出面向大房间的
+    /// 实时媒体（屏幕/语音），一律 `try_send`——**队列满就丢帧、绝不阻塞**：
+    /// 一个慢观众不该拖住发送端，媒体丢一帧靠后续帧（含关键帧）即可追上。
+    /// 出站帧头 `[0]=2, [1]=from 长度 n, [2..2+n]=来源 peerId, [2+n..]=密文载荷`。
+    /// 载荷用发送端的媒体群密钥加密，服务器只复制字节，永远看不到明文。
+    pub fn fanout(&self, room: &str, from: &str, payload: &[u8]) {
+        let rooms = self.inner.lock().unwrap();
+        let Some(room) = rooms.get(room) else {
+            return;
+        };
+        // 帧头对所有观众相同：拼一次，逐个克隆投递。
+        let mut frame = Vec::with_capacity(2 + from.len() + payload.len());
+        frame.push(2);
+        frame.push(from.len() as u8);
+        frame.extend_from_slice(from.as_bytes());
+        frame.extend_from_slice(payload);
+        for (id, slot) in room.peers.iter() {
+            if id == from {
+                continue;
+            }
+            let _ = slot.tx.try_send(Out::Bin(frame.clone()));
         }
     }
 

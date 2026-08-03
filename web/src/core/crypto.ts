@@ -48,6 +48,17 @@ export function generateKeyPair(): KeyPair {
 }
 
 /**
+ * n 个密码学随机字节。用 `crypto.getRandomValues`——它在明文 http 下也可用
+ * （不同于被锁在安全上下文里的 `crypto.subtle`），因此局域网明文部署也能
+ * 生成媒体群密钥等对称密钥材料。
+ */
+export function randomBytes(n: number): Uint8Array {
+  const out = new Uint8Array(n)
+  crypto.getRandomValues(out)
+  return out
+}
+
+/**
  * X25519 协商 + HKDF-SHA256 派生双向密钥。
  *
  * 方向靠两个公钥的字典序确定：较小者记为 A。两端算出的 (send, recv) 恰好

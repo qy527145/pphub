@@ -13,9 +13,10 @@ use crate::turn::build_ice_servers;
 
 /// 每个客户端的发送队列容量。
 ///
-/// 该队列同时承载信令（极小）与 WS 中继载荷（文件分块，单帧上限 64KiB）。
-/// 32 帧 ≈ 2MiB 在途上限：足够吸收抖动，又不至于让内存随房间人数膨胀。
-/// 队列满时中继投递会 await，从而对发送端形成背压（见 `Rooms::sender_of`）。
+/// 该队列承载信令（极小）、WS 1:1 中继（文件分块）与大房间的服务器扇出媒体
+/// （屏幕/语音）。32 帧在途：足够吸收抖动，又不至于让内存随房间人数膨胀。
+/// 1:1 中继投递 await 会形成背压（见 `Rooms::sender_of`）；扇出媒体则 `try_send`
+/// 丢帧不阻塞（见 `Rooms::fanout`），短队列反而利于实时性——丢掉的是陈旧帧。
 const CLIENT_QUEUE: usize = 32;
 
 /// 单个中继帧的载荷上限（防止恶意客户端用巨帧打爆内存）。
@@ -112,7 +113,13 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     }
                     Err(JoinError::Full) => {
                         let _ = tx
-                            .send(ServerMsg::error("room-full", "房间已满（上限 6 人）").into())
+                            .send(
+                                ServerMsg::error(
+                                    "room-full",
+                                    &format!("房间已满（上限 {} 人）", state.rooms.max_peers()),
+                                )
+                                .into(),
+                            )
                             .await;
                     }
                     Err(JoinError::Duplicate) => {
@@ -166,43 +173,66 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     writer.abort();
 }
 
-/// 转发一帧 WS 中继数据。
+/// 转发一帧 WS 中继数据。外层首字节为版本，据此分流：
 ///
-/// 线格式（收发同构，仅路由字段含义不同）：
-///   [0]        版本，当前 1
+/// 版本 1 —— **1:1 中继**（P2P 打不通时的 fallback 传输）：
+///   [0]        版本 1
 ///   [1]        peerId 字节长度 n（1..=32）
 ///   [2..2+n]   入站 = 目标 peerId；出站（改写后）= 来源 peerId
 ///   [2+n..]    端到端加密的载荷，服务器不解析
+///   用 `send().await` 而非 `try_send`：接收方队列满时在此挂起，
+///   反压传导到发送方的 WS 读循环（本函数在读循环内被 await），因为中继
+///   承载文件分块等不可丢的数据。
 ///
-/// 用 `send().await` 而非 `try_send`：接收方队列满时在此挂起，
-/// 反压传导到发送方的 WS 读循环（本函数在读循环内被 await）。
+/// 版本 2 —— **服务器扇出**（路线乙，大房间媒体）：
+///   [0]        版本 2
+///   [1..]      发送端已用媒体群密钥加密的载荷（内层含 nonce/kind/包体）
+///   服务器在载荷前戳上来源 peerId，`try_send` 复制给房间其余成员（丢帧不阻塞，
+///   见 `Rooms::fanout`）。服务器看不到明文，只做扇出。
 async fn relay_binary(state: &AppState, me: &Option<(String, String)>, buf: &[u8]) {
     let Some((room, from)) = me else { return };
-    if buf.len() < RELAY_HDR || buf[0] != 1 {
+    if buf.is_empty() || from.len() > PEER_ID_MAX {
         return;
     }
-    let id_len = buf[1] as usize;
-    if id_len == 0
-        || id_len > PEER_ID_MAX
-        || buf.len() < RELAY_HDR + id_len
-        || buf.len() > RELAY_HDR + id_len + MAX_RELAY_FRAME
-        || from.len() > PEER_ID_MAX
-    {
-        return;
-    }
-    let Ok(to) = std::str::from_utf8(&buf[RELAY_HDR..RELAY_HDR + id_len]) else {
-        return;
-    };
-    let Some(dst) = state.rooms.sender_of(room, to) else {
-        return;
-    };
 
-    // 复用帧结构：把「目标」字段改写为「来源」，载荷跟随。
-    let payload = &buf[RELAY_HDR + id_len..];
-    let mut out = Vec::with_capacity(RELAY_HDR + from.len() + payload.len());
-    out.push(1);
-    out.push(from.len() as u8);
-    out.extend_from_slice(from.as_bytes());
-    out.extend_from_slice(payload);
-    let _ = dst.send(crate::room::Out::Bin(out)).await;
+    match buf[0] {
+        // —— 版本 1：1:1 中继（背压 await）——
+        1 => {
+            if buf.len() < RELAY_HDR {
+                return;
+            }
+            let id_len = buf[1] as usize;
+            if id_len == 0
+                || id_len > PEER_ID_MAX
+                || buf.len() < RELAY_HDR + id_len
+                || buf.len() > RELAY_HDR + id_len + MAX_RELAY_FRAME
+            {
+                return;
+            }
+            let Ok(to) = std::str::from_utf8(&buf[RELAY_HDR..RELAY_HDR + id_len]) else {
+                return;
+            };
+            let Some(dst) = state.rooms.sender_of(room, to) else {
+                return;
+            };
+
+            // 复用帧结构：把「目标」字段改写为「来源」，载荷跟随。
+            let payload = &buf[RELAY_HDR + id_len..];
+            let mut out = Vec::with_capacity(RELAY_HDR + from.len() + payload.len());
+            out.push(1);
+            out.push(from.len() as u8);
+            out.extend_from_slice(from.as_bytes());
+            out.extend_from_slice(payload);
+            let _ = dst.send(crate::room::Out::Bin(out)).await;
+        }
+        // —— 版本 2：服务器扇出（try_send 丢帧）——
+        2 => {
+            let payload = &buf[1..];
+            if payload.is_empty() || payload.len() > MAX_RELAY_FRAME {
+                return;
+            }
+            state.rooms.fanout(room, from, payload);
+        }
+        _ => {}
+    }
 }

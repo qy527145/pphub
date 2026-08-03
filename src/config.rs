@@ -22,7 +22,9 @@ pub struct Config {
     /// 中继对外宣告的 IP。缺省自动探测本机网卡 IP（局域网部署足够）；
     /// 服务器位于 NAT 之后对公网服务时需显式指定公网 IP。
     pub public_ip: Option<String>,
-    /// 每个房间的成员上限（纯 Mesh 约束，默认 6）。
+    /// 每个房间的成员上限。数据始终全网状 P2P、媒体在大房间走服务器扇出，
+    /// 因此上限主要受全网状 DataChannel 连接数约束（每节点 N-1 条）；默认 32，
+    /// 可经 `PPHUB_MAX_PEERS` 调整。
     pub max_peers: usize,
 }
 
@@ -58,7 +60,7 @@ impl Config {
             max_peers: std::env::var("PPHUB_MAX_PEERS")
                 .ok()
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(100), // 提高到 100，支持分层和树状拓扑
+                .unwrap_or(32), // 全网状数据 + 大房间媒体扇出，默认支持几十人
         }
     }
 }
