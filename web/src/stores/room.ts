@@ -43,6 +43,8 @@ import {
   type PlayerRole,
   getGameMeta,
   canStartGame,
+  minPlayersOf,
+  maxPlayersOf,
 } from '@/core/games'
 import { tableManager } from '@/core/table-manager'
 import { inviteManager, type Invitation } from '@/core/invite-manager'
@@ -1708,6 +1710,8 @@ export const useRoomStore = defineStore('room', () => {
         if (table) {
           table.state = 'playing'
           table.startedAt = Date.now()
+          // 采用桌主冻结的座位表；旧端未携带时回退到当前玩家顺序。
+          table.roster = (msg as any).roster || [...table.players]
         }
         break
       }
@@ -1824,15 +1828,17 @@ export const useRoomStore = defineStore('room', () => {
       // —— 匹配消息 ——
       case 'match-request': {
         const gameType = (msg as any).gameType as GameType
-        if (!gameType || !myMatchingGame.value || myMatchingGame.value !== gameType) break
+        if (!gameType || myMatchingGame.value !== gameType) break
 
         console.log('[Matching] 收到匹配请求:', from, gameType)
 
-        // 双方几乎同时匹配时，两端都会互发 match-request。若都各自建桌并互相 match-found，
-        // 会导致两人加入了对方不同的桌子、始终碰不到一起。用 id 字典序做确定性仲裁：
-        // 只有较小 id 的一方担任「桌主」发出 match-found，另一方静待加入，避免分裂。
+        // 对称握手：id 较小者担任桌主，直接发 match-found；较大者回一条定向 match-request
+        // 触发对方（桌主）响应。这样无论谁先开始匹配、谁的 id 更大，都能收敛，
+        // 不再出现「先开始匹配的一方错过对端广播」导致的死锁。
         if (myId.value < from) {
           matchWith(from, gameType)
+        } else {
+          mesh?.sendTo(from, { kind: 'match-request', gameType })
         }
         break
       }
@@ -1864,6 +1870,20 @@ export const useRoomStore = defineStore('room', () => {
 
         if (myMatchingGame.value === gameType) {
           myMatchingGame.value = null
+
+          // 放弃自己为匹配临时建的空等待桌，避免残留幽灵桌占着大厅。
+          if (currentTableId.value && currentTableId.value !== tableId) {
+            const mine = gameTables.get(currentTableId.value)
+            if (
+              mine &&
+              mine.hostId === myId.value &&
+              mine.state === 'waiting' &&
+              mine.players.length <= 1 &&
+              mine.spectators.length === 0
+            ) {
+              leaveGameTable()
+            }
+          }
 
           // 优先使用桌号加入（更可靠）
           if (tableNumber) {
@@ -2492,13 +2512,14 @@ export const useRoomStore = defineStore('room', () => {
     table.tableNumber = tableNumber
     table.hasPassword = !!password
 
-    // 象棋：初始化开局协商配置（默认桌主执红/先手、局时 10 分、步时 60 秒，待双方确认）
+    // 象棋：预置默认开局配置（桌主执红/先手、局时 10 分、步时 60 秒）。
+    // 默认 agreed=true，快速匹配/创建后即可直接开局；仍可在等待区重新协商更改。
     if (gameType === 'xiangqi') {
       table.config = {
         redSeat: 0,
         gameTimeSec: 600,
         moveTimeSec: 60,
-        agreed: false,
+        agreed: true,
         proposal: null,
       }
     }
@@ -2559,15 +2580,32 @@ export const useRoomStore = defineStore('room', () => {
     return true
   }
 
+  /**
+   * 我能否在这张桌坐下/加入为玩家：
+   * - 等待中：有空位即可；
+   * - 对局中：仅「开局座位表里的原座位者」可回来续战（凭 roster 判定），陌生人只能旁观；
+   * - 已结束：不可。
+   */
+  function canTakeSeat(table: GameTable): boolean {
+    if (!table || table.state === 'finished') return false
+    if (table.players.includes(myId.value)) return false
+    const meta = getGameMeta(table.gameType)
+    const cap = meta ? maxPlayersOf(meta) : table.players.length
+    if (table.players.length >= cap) return false
+    if (table.state === 'playing') return !!table.roster?.includes(myId.value)
+    return true
+  }
+
   function joinGameTable(tableId: string, asSpectator: boolean): void {
     const table = gameTables.get(tableId)
     if (!table) return
 
-    // 如果桌子满了但是要旁观，仍然可以加入
-    const meta = getGameMeta(table.gameType)
-    if (!asSpectator && meta && table.players.length >= meta.playerCount) {
-      // 玩家位满了，自动改为旁观
-      asSpectator = true
+    // 已在座（如断线重连后重新进入自己的桌）：直接回到桌面即可。
+    if (!asSpectator && !table.players.includes(myId.value)) {
+      // 不满足入座条件（座位已满 / 非本人续战 / 已结束）时自动改为旁观。
+      if (!canTakeSeat(table)) {
+        asSpectator = true
+      }
     }
 
     if (asSpectator) {
@@ -2632,7 +2670,7 @@ export const useRoomStore = defineStore('room', () => {
     // 检查人数是否满足
     const meta = getGameMeta(table.gameType)
     if (!meta || !canStartGame(table.gameType, table.players.length)) {
-      lastError.value = `人数不足，需要 ${meta?.playerCount} 人`
+      lastError.value = meta ? `人数不足，至少需要 ${minPlayersOf(meta)} 人` : '无法开始游戏'
       return
     }
 
@@ -2642,17 +2680,23 @@ export const useRoomStore = defineStore('room', () => {
       return
     }
 
+    // 冻结开局座位表：对局中有人离席也不改变座位→执子映射，且离席者可凭原座位回来续战。
+    const roster = [...table.players]
+    table.roster = roster
     table.state = 'playing'
     table.startedAt = Date.now()
 
-    // 广播开始游戏消息
+    // 广播开始游戏消息（携带座位表，保证各端座位一致）
     mesh?.broadcast({
       kind: 'table-start',
       tableId,
+      roster,
     })
   }
 
   function sendGameMove(tableId: string, moveData: unknown): void {
+    // 本端也留存最新状态：出招方随后离席/重进时，凭 gameStates 即可恢复棋局。
+    gameStates.set(tableId, moveData)
     mesh?.broadcast({
       kind: 'game-move',
       tableId,
@@ -2730,7 +2774,18 @@ export const useRoomStore = defineStore('room', () => {
 
   function sitDownAtTable(tableId: string): void {
     const table = gameTables.get(tableId)
-    if (!table || table.state !== 'waiting') return
+    if (!table || table.state === 'finished') return
+
+    // 对局进行中只允许「原座位的人」回来续战（凭开局冻结的 roster 判定），
+    // 避免陌生人占走空位后因不在座位表里而无法执子。等待中则任何有空位者可坐。
+    const meta = getGameMeta(table.gameType)
+    const cap = meta ? maxPlayersOf(meta) : table.players.length
+    if (table.players.includes(myId.value)) return
+    if (table.state === 'playing') {
+      if (!table.roster?.includes(myId.value)) return
+    } else if (table.players.length >= cap) {
+      return
+    }
 
     // 从旁观者移到玩家
     table.spectators = table.spectators.filter((p) => p !== myId.value)
@@ -2853,7 +2908,7 @@ export const useRoomStore = defineStore('room', () => {
 
     // 找到有空位的桌子
     for (const table of waitingTables) {
-      if (table.players.length < meta.playerCount) {
+      if (table.players.length < maxPlayersOf(meta)) {
         console.log('[Matching] 找到等待桌:', table.tableId, table.tableNumber)
         joinGameTable(table.tableId, false)
         myMatchingGame.value = null
@@ -3072,6 +3127,7 @@ export const useRoomStore = defineStore('room', () => {
     sendGameMousePos,
     sitDownAtTable,
     standUpFromTable,
+    canTakeSeat,
     inviteToTable,
     acceptInvite,
     declineInvite,

@@ -10,8 +10,16 @@ export interface GameMeta {
   name: string
   description: string
   category: GameCategory
-  /** 需要的玩家人数（单机游戏为 1，对战游戏为具体人数） */
+  /**
+   * 需要的玩家人数。single=1，double=固定人数；
+   * multi 游戏以此为「最少开局人数」，实际上限见 maxPlayers。
+   */
   playerCount: number
+  /**
+   * multi 游戏的人数上限（座位上限）。缺省时等于 playerCount（即固定人数，如斗地主）。
+   * 你画我猜这类「人越多越好玩」的游戏据此放开到多个座位。
+   */
+  maxPlayers?: number
   /** 是否支持旁观 */
   spectatable: boolean
   /**
@@ -47,6 +55,12 @@ export interface GameTable {
   hasPassword?: boolean
   /** 玩家列表（peerId[]，按座位顺序） */
   players: string[]
+  /**
+   * 开局座位表：游戏开始时冻结一份 players 快照（下标 = 座位号）。
+   * 对局中有人离席时 players 会被压缩，但 roster 保持不变，
+   * 供棋类按稳定座位推导执子颜色，并让离席者凭原座位回来续战。
+   */
+  roster?: string[]
   /** 旁观者列表 */
   spectators: string[]
   /** 游戏开始时间戳 */
@@ -143,11 +157,12 @@ export const GAME_CATALOG: GameMeta[] = [
   {
     id: 'drawguess',
     name: '你画我猜',
-    description: '多人游戏，一人画其他人猜',
+    description: '多人游戏，轮流画画，其他人猜词',
     category: 'multi',
-    playerCount: 3,  // 最少3人，可更多
+    playerCount: 2, // 2 人起玩，人越多越热闹
+    maxPlayers: 8,
     spectatable: true,
-    shareCursor: true,
+    shareCursor: false, // 仅出题人作画（画笔已同步），无需再共享指针
     icon: '🎨',
   },
   {
@@ -177,6 +192,16 @@ export function getGameMeta(gameType: GameType): GameMeta | undefined {
   return GAME_CATALOG.find((g) => g.id === gameType)
 }
 
+/** 最少开局人数（multi 游戏为 playerCount，其它同理）。 */
+export function minPlayersOf(meta: GameMeta): number {
+  return meta.playerCount
+}
+
+/** 座位上限：multi 游戏可放开到 maxPlayers，缺省等于 playerCount（固定人数）。 */
+export function maxPlayersOf(meta: GameMeta): number {
+  return meta.maxPlayers ?? meta.playerCount
+}
+
 /** 检查玩家数量是否满足游戏要求 */
 export function canStartGame(gameType: GameType, playerCount: number): boolean {
   const meta = getGameMeta(gameType)
@@ -188,8 +213,8 @@ export function canStartGame(gameType: GameType, playerCount: number): boolean {
   // 双人游戏需要恰好2人
   if (meta.category === 'double') return playerCount === meta.playerCount
 
-  // 多人游戏需要至少达到最少人数
-  return playerCount >= meta.playerCount
+  // 多人游戏：达到最少人数且不超过座位上限
+  return playerCount >= minPlayersOf(meta) && playerCount <= maxPlayersOf(meta)
 }
 
 /** 生成游戏桌 ID */

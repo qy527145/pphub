@@ -2,13 +2,14 @@
 // 游戏桌视图 - 显示当前加入的游戏桌，包括游戏区域、聊天框、玩家列表等
 import { computed, ref } from 'vue'
 import { useRoomStore } from '@/stores/room'
-import { getGameMeta } from '@/core/games'
+import { getGameMeta, minPlayersOf, maxPlayersOf } from '@/core/games'
 import AppIcon from './AppIcon.vue'
 import PeerAvatar from './PeerAvatar.vue'
 import ChompGame from './ChompGame.vue'
 import GomokuGame from './GomokuGame.vue'
 import XiangqiGame from './XiangqiGame.vue'
 import DoudizhuGame from './DoudizhuGame.vue'
+import DrawGuessGame from './DrawGuessGame.vue'
 
 const store = useRoomStore()
 
@@ -21,6 +22,12 @@ const gameMeta = computed(() => {
   if (!currentTable.value) return null
   return getGameMeta(currentTable.value.gameType)
 })
+
+// 座位数：min=最少开局人数，max=座位上限（multi 游戏可放开到多个座位）。
+const seatMin = computed(() => (gameMeta.value ? minPlayersOf(gameMeta.value) : 0))
+const seatMax = computed(() => (gameMeta.value ? maxPlayersOf(gameMeta.value) : 0))
+// 是否人数可变（multi 且上限大于下限）——展示为 x/最少 起，而非固定分母。
+const flexSeats = computed(() => gameMeta.value?.category === 'multi' && seatMax.value > seatMin.value)
 
 const isHost = computed(() => {
   return currentTable.value?.hostId === store.myId
@@ -51,15 +58,15 @@ const canStart = computed(() => {
     }
     return true
   }
-  return playerCount >= meta.playerCount
+  // 多人游戏：达到最少人数且不超过座位上限
+  return playerCount >= minPlayersOf(meta) && playerCount <= maxPlayersOf(meta)
 })
 
 const canSitDown = computed(() => {
-  if (!currentTable.value || currentTable.value.state !== 'waiting') return false
-  if (isPlayer.value) return false
-  const meta = gameMeta.value
-  if (!meta) return false
-  return currentTable.value.players.length < meta.playerCount
+  // 等待中有空位可坐；对局进行中仅「原座位离席者」凭 roster 回来续战。
+  // 统一交给 store.canTakeSeat 判定，与游戏大厅保持同一套规则。
+  if (!currentTable.value) return false
+  return store.canTakeSeat(currentTable.value)
 })
 
 const chatInput = ref('')
@@ -163,7 +170,7 @@ const showInviteDialog = ref(false)
       <!-- 左侧：玩家列表和旁观者 -->
       <aside class="players-panel">
         <div class="panel-section">
-          <h3>玩家 ({{ currentTable.players.length }}/{{ gameMeta.playerCount }})</h3>
+          <h3>玩家 ({{ currentTable.players.length }}/{{ seatMax }})</h3>
           <div class="player-list">
             <div
               v-for="peerId in currentTable.players"
@@ -183,7 +190,7 @@ const showInviteDialog = ref(false)
 
             <!-- 空位 -->
             <div
-              v-for="i in Math.max(0, gameMeta.playerCount - currentTable.players.length)"
+              v-for="i in Math.max(0, seatMax - currentTable.players.length)"
               :key="`empty-${i}`"
               class="player-item empty"
             >
@@ -194,13 +201,17 @@ const showInviteDialog = ref(false)
             </div>
           </div>
 
-          <!-- 坐下/站起按钮 -->
-          <div v-if="currentTable.state === 'waiting'" class="seat-actions">
+          <!-- 坐下/站起按钮：等待中可坐可站；对局中仅离席原玩家可回座续战 -->
+          <div v-if="currentTable.state === 'waiting' || canSitDown" class="seat-actions">
             <button v-if="canSitDown" class="btn-sit" @click="sitDown">
               <AppIcon name="log-in" :size="16" />
-              坐下参与游戏
+              {{ currentTable.state === 'playing' ? '回到座位续战' : '坐下参与游戏' }}
             </button>
-            <button v-else-if="isPlayer && !isHost" class="btn-standup" @click="standUp">
+            <button
+              v-else-if="isPlayer && !isHost && currentTable.state === 'waiting'"
+              class="btn-standup"
+              @click="standUp"
+            >
               <AppIcon name="log-out" :size="16" />
               站起旁观
             </button>
@@ -237,8 +248,8 @@ const showInviteDialog = ref(false)
           </button>
           <p v-if="!canStart" class="start-hint">
             {{
-              currentTable.players.length < gameMeta.playerCount
-                ? `需要 ${gameMeta.playerCount} 名玩家`
+              currentTable.players.length < seatMin
+                ? `至少需要 ${seatMin} 名玩家${flexSeats ? `（最多 ${seatMax} 人）` : ''}`
                 : currentTable.gameType === 'xiangqi'
                   ? '等待双方协商确认开局设置'
                   : '等待玩家就绪'
@@ -253,6 +264,7 @@ const showInviteDialog = ref(false)
         <GomokuGame v-else-if="currentTable.gameType === 'gomoku'" :table="currentTable" />
         <XiangqiGame v-else-if="currentTable.gameType === 'xiangqi'" :table="currentTable" />
         <DoudizhuGame v-else-if="currentTable.gameType === 'doudizhu'" :table="currentTable" />
+        <DrawGuessGame v-else-if="currentTable.gameType === 'drawguess'" :table="currentTable" />
         <div v-else class="game-placeholder">
           <div v-if="currentTable.state === 'waiting'" class="placeholder-content">
             <div class="placeholder-icon">⏳</div>

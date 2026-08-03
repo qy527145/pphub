@@ -18,11 +18,36 @@ interface GomokuGameState {
   winner?: string
 }
 
-const gameState = ref<GomokuGameState>({
-  cells: Array(GOMOKU_SIZE * GOMOKU_SIZE).fill(0),
-  turn: 1,
-  players: [props.table.players[0] || '', props.table.players[1] || ''],
-  moves: 0,
+// 初始状态：若桌上已有同步棋局（旁观者入场 / 离席者回座），直接从中恢复棋盘，
+// 否则开一副空盘。座位→执子颜色一律以 seatPlayers 为准，不依赖此处 players。
+const existing = store.gameStates.get(props.table.tableId) as
+  | { cells?: number[]; turn?: 1 | 2; moves?: number; idx?: number; winLine?: number[]; winner?: string }
+  | undefined
+
+const gameState = ref<GomokuGameState>(
+  existing && existing.cells
+    ? {
+        cells: existing.cells,
+        turn: existing.turn ?? 1,
+        players: [props.table.players[0] || '', props.table.players[1] || ''],
+        moves: existing.moves ?? 0,
+        lastMove: existing.idx,
+        winLine: existing.winLine,
+        winner: existing.winner,
+      }
+    : {
+        cells: Array(GOMOKU_SIZE * GOMOKU_SIZE).fill(0),
+        turn: 1,
+        players: [props.table.players[0] || '', props.table.players[1] || ''],
+        moves: 0,
+      },
+)
+
+// 座位表：优先用开局冻结的 roster（对局中有人离席回座也不会错位），否则回退当前 players。
+const seatPlayers = computed<[string, string]>(() => {
+  const r =
+    props.table.roster && props.table.roster.length >= 2 ? props.table.roster : props.table.players
+  return [r[0] || '', r[1] || '']
 })
 
 // 监听远程走法
@@ -50,7 +75,7 @@ watch(() => props.table.state, (newState) => {
 })
 
 const myColor = computed(() => {
-  const idx = gameState.value.players.indexOf(store.myId)
+  const idx = seatPlayers.value.indexOf(store.myId)
   return idx === 0 ? 1 : idx === 1 ? 2 : null
 })
 
@@ -127,7 +152,7 @@ function makeMove(idx: number): void {
 }
 
 function getPlayerName(playerIdx: 0 | 1): string {
-  const peerId = gameState.value.players[playerIdx]
+  const peerId = seatPlayers.value[playerIdx]
   return store.displayName(peerId)
 }
 </script>

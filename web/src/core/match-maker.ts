@@ -2,7 +2,7 @@
 
 import type { GameTable, GameType } from './games'
 import { tableManager } from './table-manager'
-import { getGameMeta } from './games'
+import { getGameMeta, maxPlayersOf } from './games'
 
 export interface MatchRequest {
   peerId: string
@@ -44,7 +44,7 @@ export class MatchMaker {
 
     // 找到有空位的桌子
     for (const table of waitingTables) {
-      if (table.players.length < meta.playerCount) {
+      if (table.players.length < maxPlayersOf(meta)) {
         console.log('[MatchMaker] 找到等待桌:', table.tableId)
         onFound(table)
         return
@@ -157,7 +157,7 @@ export class MatchMaker {
     if (!meta) return
 
     // 如果桌子还有空位，通知队列中的第一个玩家
-    if (table.players.length < meta.playerCount) {
+    if (table.players.length < maxPlayersOf(meta)) {
       const request = queue[0]
       if (request && request.peerId !== table.hostId) {
         this.notifyMatch(request.peerId, table)

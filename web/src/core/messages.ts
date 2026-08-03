@@ -267,7 +267,7 @@ export type ControlMessage =
   | { kind: 'table-join'; tableId: string }
   | { kind: 'table-spectate'; tableId: string }
   | { kind: 'table-leave'; tableId: string }
-  | { kind: 'table-start'; tableId: string }
+  | { kind: 'table-start'; tableId: string; roster?: string[] }
   | { kind: 'table-sit'; tableId: string }
   | { kind: 'table-standup'; tableId: string }
   | { kind: 'table-invite'; tableId: string; gameName: string }

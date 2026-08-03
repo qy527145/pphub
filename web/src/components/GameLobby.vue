@@ -2,7 +2,7 @@
 // 游戏大厅 - QQ 游戏大厅风格：真实牌桌图形 + 快速匹配 + 待处理邀请
 import { computed, ref } from 'vue'
 import { useRoomStore } from '@/stores/room'
-import { GAME_CATALOG, getGameMeta, type GameType, type GameTable } from '@/core/games'
+import { GAME_CATALOG, getGameMeta, minPlayersOf, maxPlayersOf, type GameType, type GameTable, type GameMeta } from '@/core/games'
 import type { Invitation } from '@/core/invite-manager'
 import PeerAvatar from './PeerAvatar.vue'
 import GameTableView from './GameTable.vue'
@@ -114,7 +114,7 @@ function getTableStateText(table: GameTable): string {
   const meta = getGameMeta(table.gameType)
 
   if (table.state === 'waiting') {
-    return `等待中 ${playerCount}/${meta?.playerCount || '?'}`
+    return `等待中 ${playerCount}/${meta ? maxPlayersOf(meta) : '?'}`
   } else if (table.state === 'playing') {
     return `游戏中${spectatorCount > 0 ? ` · ${spectatorCount}人观战` : ''}`
   } else {
@@ -129,20 +129,28 @@ function getTableStateClass(table: GameTable): string {
 }
 
 function canJoinTable(table: GameTable): boolean {
-  if (table.state !== 'waiting') return false
-  const meta = getGameMeta(table.gameType)
-  return table.players.length < (meta?.playerCount || 999)
+  // 等待中的空位任何人可坐；对局进行中仅「原座位离席者」凭 roster 回来续战。
+  // 具体判定统一交给 store.canTakeSeat，避免大厅与桌内两处规则漂移。
+  return store.canTakeSeat(table)
 }
 
 // 玩家位已满或已开局的桌子，若支持旁观则可直接进入观战
 function canSpectateTable(table: GameTable): boolean {
   const meta = getGameMeta(table.gameType)
   if (!meta?.spectatable || table.state === 'finished') return false
-  return table.state === 'playing' || table.players.length >= (meta.playerCount || 999)
+  return table.state === 'playing' || table.players.length >= maxPlayersOf(meta)
 }
 
 function getPlayerNick(peerId: string): string {
   return store.displayName(peerId)
+}
+
+// 人数标签：单机=「单机」，固定人数=「N 人」，可变人数=「min-max 人」。
+function seatLabel(meta: GameMeta): string {
+  if (meta.category === 'single') return '单机'
+  const min = minPlayersOf(meta)
+  const max = maxPlayersOf(meta)
+  return max > min ? `${min}-${max} 人` : `${min} 人`
 }
 
 // —— 牌桌座位布局：绕桌一圈均匀分布，从底部开始 ——
@@ -152,7 +160,8 @@ interface Seat {
 }
 
 function seatsOf(table: GameTable): Seat[] {
-  const cap = getGameMeta(table.gameType)?.playerCount ?? table.players.length ?? 0
+  const meta = getGameMeta(table.gameType)
+  const cap = meta ? maxPlayersOf(meta) : (table.players.length ?? 0)
   return Array.from({ length: Math.max(cap, 1) }, (_, i) => {
     const peerId = table.players[i] ?? null
     return { peerId, isHost: peerId != null && peerId === table.hostId }
@@ -262,7 +271,7 @@ function declineInvite(inv: Invitation) {
             <span class="qm-icon">{{ game.icon }}</span>
             <span class="qm-info">
               <span class="qm-name">{{ game.name }}</span>
-              <span class="qm-players">{{ game.category === 'single' ? '单机' : `${game.playerCount} 人` }}</span>
+              <span class="qm-players">{{ seatLabel(game) }}</span>
             </span>
             <span class="qm-cta">
               <AppIcon :name="game.category === 'single' ? 'play' : 'zap'" :size="13" />
@@ -418,7 +427,7 @@ function declineInvite(inv: Invitation) {
             <div class="select-wrap">
               <select v-model="selectedGameType" class="game-select">
                 <option v-for="game in GAME_CATALOG" :key="game.id" :value="game.id">
-                  {{ game.icon }} {{ game.name }}（{{ game.playerCount }}人）
+                  {{ game.icon }} {{ game.name }}（{{ seatLabel(game) }}）
                 </option>
               </select>
               <AppIcon name="chevron-down" :size="16" class="select-arrow" />
@@ -430,7 +439,7 @@ function declineInvite(inv: Invitation) {
                 <h4>{{ selectedMeta.name }}</h4>
                 <p>{{ selectedMeta.description }}</p>
                 <div class="preview-meta">
-                  <span class="game-meta">{{ selectedMeta.playerCount }}人游戏</span>
+                  <span class="game-meta">{{ seatLabel(selectedMeta) }}游戏</span>
                   <span v-if="selectedMeta.spectatable" class="game-meta spectatable">可旁观</span>
                 </div>
               </div>

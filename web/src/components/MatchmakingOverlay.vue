@@ -3,14 +3,15 @@
 // 展示雷达搜索动画、已用时、座位逐个填充的进度。匹配到人后短暂显示「匹配成功」再揭开牌桌。
 import { computed, ref, watch, onUnmounted } from 'vue'
 import { useRoomStore } from '@/stores/room'
-import { getGameMeta } from '@/core/games'
+import { getGameMeta, minPlayersOf } from '@/core/games'
 import PeerAvatar from './PeerAvatar.vue'
 
 const store = useRoomStore()
 
 const active = computed(() => store.myMatchingGame !== null)
 const meta = computed(() => (store.myMatchingGame ? getGameMeta(store.myMatchingGame) : null))
-const cap = computed(() => meta.value?.playerCount ?? 0)
+// 匹配以「最少开局人数」为目标：坐满即成局（多人游戏如你画我猜达最少人数即可开打）。
+const cap = computed(() => (meta.value ? minPlayersOf(meta.value) : 0))
 
 // 匹配期间自己所在的等待桌（自建的公开桌）；据此显示已入座玩家。
 const table = computed(() => {

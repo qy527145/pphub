@@ -55,8 +55,11 @@ watch(
   { deep: true },
 )
 
+// 座位表：优先用开局冻结的 roster（对局中有人离席回座也不会错位执子），否则回退当前 players。
 const players = computed(() => {
-  return [props.table.players[0] || '', props.table.players[1] || '']
+  const r =
+    props.table.roster && props.table.roster.length >= 2 ? props.table.roster : props.table.players
+  return [r[0] || '', r[1] || '']
 })
 
 // 开局协商配置（table.config）。redSeat 决定谁执红/先手。
