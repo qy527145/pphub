@@ -4,8 +4,16 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 description = "免安装、纯浏览器的 P2P 直连协作应用（单二进制，前端嵌入）"
+repository = "https://github.com/qy527145/pphub"
+authors = ["wmymz"]
 # 前端产物 web/dist 编译期嵌入二进制；改动 web/ 后需 `npm --prefix web run build`。
 include = ["/src/**", "/build.rs", "/web/dist/**", "/README.md", "/LICENSE"]
+
+[package.metadata.wix]
+upgrade-guid = "E5E198BD-BC1D-40DC-A129-1F6D2F63A387"
+path-guid = "D6877C4E-92AC-4F5E-9E25-620EE6EFE38B"
+license = false
+eula = false
 
 [dependencies]
 axum = { version = "0.8", features = ["ws"] }
@@ -33,3 +41,8 @@ opt-level = 3
 lto = true
 codegen-units = 1
 strip = true
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
